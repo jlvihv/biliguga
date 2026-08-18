@@ -861,6 +861,7 @@ impl BiliGuga {
         let mut root = div()
             .w(px(414.))
             .h_full()
+            .flex_none()
             .flex()
             .flex_col()
             .bg(rgb(0x2f343e))
@@ -1092,6 +1093,7 @@ impl BiliGuga {
             .flex_1()
             .h_full()
             .overflow_y_scroll()
+            .overflow_x_hidden()
             .bg(rgb(0x3b414d))
             .child(
                 div().w_full().flex().flex_col().child(stage).child(
@@ -1104,18 +1106,22 @@ impl BiliGuga {
                         .gap_2()
                         .child(
                             div()
+                                .w_full()
                                 .text_xl()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(0xdce0e5))
+                                .text_ellipsis()
                                 .child(video.title.clone()),
                         )
                         .child(
                             div()
+                                .w_full()
                                 .flex()
                                 .items_center()
                                 .gap_3()
                                 .text_sm()
                                 .text_color(rgb(0xa9afbc))
+                                .text_ellipsis()
                                 .child(format!(
                                     "{}  ·  {}  ·  {}",
                                     video.uploader, video.stats, video.category
@@ -1123,8 +1129,10 @@ impl BiliGuga {
                         )
                         .child(
                             div()
+                                .w_full()
                                 .text_xs()
                                 .text_color(rgb(0x878a98))
+                                .text_ellipsis()
                                 .child(self.message.clone()),
                         ),
                 ),
