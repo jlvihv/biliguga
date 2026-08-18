@@ -428,6 +428,19 @@ fn run_mpv_session(
                     },
                 ];
                 if mpv_render_context_render(context, params.as_mut_ptr()) >= 0 {
+                    if !logged_hwdec {
+                        let hwdec = get_string_property(handle, "hwdec-current")
+                            .unwrap_or_else(|| "<unavailable>".into());
+                        if std::env::var_os("BILIGUGA_MEM_DEBUG").is_some()
+                            || std::env::var_os("BILIGUGA_MPV_DEBUG").is_some()
+                        {
+                            eprintln!(
+                                "[biliguga-mpv] hwdec-current={:?} render-path=software-buffer",
+                                hwdec
+                            );
+                        }
+                        logged_hwdec = true;
+                    }
                     let mut pixels = recycled_rx
                         .try_recv()
                         .ok()
@@ -455,19 +468,6 @@ fn run_mpv_session(
                     volume: get_double_property(handle, "volume").unwrap_or(100.),
                     speed: get_double_property(handle, "speed").unwrap_or(1.),
                 };
-                if !logged_hwdec && status.time_pos.is_finite() {
-                    let hwdec = get_string_property(handle, "hwdec-current")
-                        .unwrap_or_else(|| "unknown".into());
-                    if std::env::var_os("BILIGUGA_MEM_DEBUG").is_some()
-                        || std::env::var_os("BILIGUGA_MPV_DEBUG").is_some()
-                    {
-                        eprintln!(
-                            "[biliguga-mpv] hwdec-current={} render-path=software-buffer",
-                            hwdec
-                        );
-                    }
-                    logged_hwdec = true;
-                }
                 if status.paused {
                     render_enabled = false;
                 }
