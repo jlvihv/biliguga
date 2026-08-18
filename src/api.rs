@@ -276,7 +276,6 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid,
         cid: number(item.get("cid")),
-        progress: 0,
         title: text(item.get("title")),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         stats: format!(
@@ -331,7 +330,6 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("aid")),
         cid: 0,
-        progress: 0,
         title,
         uploader: clean_search_text(text(item.get("author"))),
         stats: format!(
@@ -628,7 +626,6 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(history.get("aid")).max(number(item.get("aid"))),
         cid: number(history.get("cid")),
-        progress: number(item.get("progress")).max(0),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("author_name")),
         stats: format!(
@@ -854,7 +851,6 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
         bvid,
         aid: text(archive.get("aid")).parse().unwrap_or_default(),
         cid: 0,
-        progress: 0,
         title: clean_search_text(text(archive.get("title"))),
         uploader: String::new(),
         stats: format!(
@@ -975,7 +971,6 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("aid")),
         cid: number(item.get("cid")),
-        progress: 0,
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         stats: format!(
@@ -1042,7 +1037,6 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("id")),
         cid: number(ugc.and_then(|ugc| ugc.get("first_cid"))),
-        progress: 0,
         title: clean_search_text(text(item.get("title"))),
         uploader: text(upper.and_then(|upper| upper.get("name"))),
         stats: format!(

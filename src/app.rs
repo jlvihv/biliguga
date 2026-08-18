@@ -77,8 +77,8 @@ struct BiliGuga {
     controls_visible: bool,
     controls_generation: u64,
     playing_video: Option<Video>,
-    resume_progress: Option<f64>,
-    resume_applied: bool,
+    cloud_resume_progress: Option<f64>,
+    cloud_resume_applied: bool,
     history_report_at: Instant,
     history_report_in_flight: bool,
     pending_cover_drops: Vec<Arc<RenderImage>>,
@@ -162,8 +162,8 @@ impl BiliGuga {
             controls_visible: false,
             controls_generation: 0,
             playing_video: None,
-            resume_progress: None,
-            resume_applied: false,
+            cloud_resume_progress: None,
+            cloud_resume_applied: false,
             history_report_at: Instant::now(),
             history_report_in_flight: false,
             pending_cover_drops: Vec::new(),
@@ -415,8 +415,8 @@ impl BiliGuga {
         self.selected = 0;
         self.playback = PlaybackState::Idle;
         self.playing_video = None;
-        self.resume_progress = None;
-        self.resume_applied = false;
+        self.cloud_resume_progress = None;
+        self.cloud_resume_applied = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1445,8 +1445,8 @@ impl BiliGuga {
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
         self.playing_video = None;
-        self.resume_progress = None;
-        self.resume_applied = false;
+        self.cloud_resume_progress = None;
+        self.cloud_resume_applied = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1491,8 +1491,8 @@ impl BiliGuga {
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
         self.playing_video = None;
-        self.resume_progress = None;
-        self.resume_applied = false;
+        self.cloud_resume_progress = None;
+        self.cloud_resume_applied = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1560,8 +1560,8 @@ impl BiliGuga {
         };
         self.pin_playing_video(&video);
         self.load_comments_for_current(cx);
-        self.resume_progress = (video.progress > 0).then_some(video.progress as f64);
-        self.resume_applied = false;
+        self.cloud_resume_progress = None;
+        self.cloud_resume_applied = false;
         self.history_report_at = Instant::now();
         self.playback = PlaybackState::Buffering;
         self.message = SharedString::from("正在向 B 站获取播放地址…");
@@ -1574,13 +1574,9 @@ impl BiliGuga {
             let result = cx
                 .background_spawn(async move {
                     let result = resolve_play_url(&video, cookie.as_deref())?;
-                    let progress = if video.progress > 0 {
-                        Some(video.progress)
-                    } else {
-                        let mut resolved_video = video.clone();
-                        resolved_video.cid = result.1;
-                        fetch_last_play_progress(&resolved_video, cookie.as_deref())
-                    };
+                    let mut resolved_video = video.clone();
+                    resolved_video.cid = result.1;
+                    let progress = fetch_last_play_progress(&resolved_video, cookie.as_deref());
                     Ok::<_, String>((result.0, result.1, progress))
                 })
                 .await;
@@ -1599,11 +1595,11 @@ impl BiliGuga {
                             playing_video.cid = cid;
                         }
                         if let Some(progress) = progress {
-                            app.resume_progress = Some(progress as f64);
+                            app.cloud_resume_progress = Some(progress as f64);
                         }
                         app.debug_memory("before-video-load");
                         app.player.load(url, app.volume, app.speed);
-                        app.resume_applied = false;
+                        app.cloud_resume_applied = false;
                         app.playback = PlaybackState::Buffering;
                         app.message = SharedString::from("已获取播放地址，libmpv 正在缓冲");
                         cx.notify();
@@ -2716,16 +2712,16 @@ pub(crate) fn launch() {
                             }
                             let status = app.player.status();
                             if app.playback != PlaybackState::Idle && status.time_pos.is_finite() {
-                                if !app.resume_applied {
-                                    let duration_ready = app.resume_progress.is_none()
+                                if !app.cloud_resume_applied {
+                                    let duration_ready = app.cloud_resume_progress.is_none()
                                         || (status.duration.is_finite() && status.duration > 0.);
                                     if duration_ready {
-                                        if let Some(progress) = app.resume_progress {
+                                        if let Some(progress) = app.cloud_resume_progress {
                                             if progress > 3. && progress < status.duration - 3. {
                                                 app.player.seek_seconds(progress);
                                             }
                                         }
-                                        app.resume_applied = true;
+                                        app.cloud_resume_applied = true;
                                     }
                                 }
                                 app.playback = if status.paused {
