@@ -76,6 +76,7 @@ struct BiliGuga {
     speed: f64,
     controls_visible: bool,
     controls_generation: u64,
+    player_fullscreen: bool,
     playing_video: Option<Video>,
     cloud_resume_progress: Option<f64>,
     cloud_resume_applied: bool,
@@ -161,6 +162,7 @@ impl BiliGuga {
             speed: 1.,
             controls_visible: false,
             controls_generation: 0,
+            player_fullscreen: false,
             playing_video: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
@@ -1670,6 +1672,21 @@ impl BiliGuga {
         cx.notify();
     }
 
+    fn toggle_player_fullscreen(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.player_fullscreen = !self.player_fullscreen;
+        self.controls_visible = true;
+        cx.notify();
+    }
+
+    fn toggle_screen_fullscreen(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        window.toggle_fullscreen();
+    }
+
     fn seek_percent(&mut self, percent: f64, cx: &mut Context<Self>) {
         self.player.seek_percent(percent);
         cx.notify();
@@ -2334,6 +2351,7 @@ impl BiliGuga {
         let mut stage = div()
             .w_full()
             .h(px(480.))
+            .when(self.player_fullscreen, |this| this.h_full())
             .overflow_hidden()
             .bg(rgb(0x000000))
             .flex()
@@ -2516,6 +2534,30 @@ impl BiliGuga {
                                 .text_xs()
                                 .child(format!("{:.2}x", self.speed))
                                 .on_click(cx.listener(Self::cycle_speed)),
+                        )
+                        .child(
+                            div()
+                                .id("player-window-fullscreen")
+                                .px_2()
+                                .py_1()
+                                .cursor_pointer()
+                                .text_xs()
+                                .child(if self.player_fullscreen {
+                                    "退出窗口全屏"
+                                } else {
+                                    "窗口全屏"
+                                })
+                                .on_click(cx.listener(Self::toggle_player_fullscreen)),
+                        )
+                        .child(
+                            div()
+                                .id("player-screen-fullscreen")
+                                .px_2()
+                                .py_1()
+                                .cursor_pointer()
+                                .text_xs()
+                                .child("屏幕全屏")
+                                .on_click(cx.listener(Self::toggle_screen_fullscreen)),
                         ),
                 );
             stage = stage.child(controls);
@@ -2524,8 +2566,10 @@ impl BiliGuga {
         div()
             .id("player-scroll")
             .flex_1()
+            .when(self.player_fullscreen, |this| this.w_full())
             .h_full()
-            .overflow_y_scroll()
+            .when(self.player_fullscreen, |this| this.overflow_hidden())
+            .when(!self.player_fullscreen, |this| this.overflow_y_scroll())
             .overflow_x_hidden()
             .bg(rgb(0x3b414d))
             .child(
@@ -2533,104 +2577,115 @@ impl BiliGuga {
                     .w_full()
                     .flex()
                     .flex_col()
+                    .when(self.player_fullscreen, |this| this.h_full())
                     .child(stage)
-                    .child(
-                        div()
-                            .w_full()
-                            .px_5()
-                            .py_4()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .text_xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0xdce0e5))
-                                    .text_ellipsis()
-                                    .child(video.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .text_sm()
-                                    .text_color(rgb(0xa9afbc))
-                                    .text_ellipsis()
-                                    .child(format!(
-                                        "{}  ·  {}  ·  {}",
-                                        video.uploader, video.stats, video.category
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .text_sm()
-                                    .text_color(rgb(0xa9afbc))
-                                    .child(
-                                        div()
-                                            .id("player-like")
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0x74ade8)))
-                                            .child("♡ 点赞")
-                                            .on_click(cx.listener(Self::like_current_video)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("player-coin")
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0x74ade8)))
-                                            .child("◇ 投币")
-                                            .on_click(cx.listener(Self::coin_current_video)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("player-favorite")
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0x74ade8)))
-                                            .child("收藏")
-                                            .on_click(cx.listener(Self::save_current_to_favorites)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("player-watch-later")
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0x74ade8)))
-                                            .child("稍后")
-                                            .on_click(
-                                                cx.listener(Self::save_current_to_watch_later),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .text_xs()
-                                    .text_color(rgb(0x878a98))
-                                    .text_ellipsis()
-                                    .child(self.message.clone()),
-                            ),
-                    )
-                    .child(self.render_comments(cx)),
+                    .when(!self.player_fullscreen, |this| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .px_5()
+                                .py_4()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_xl()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(0xdce0e5))
+                                        .text_ellipsis()
+                                        .child(video.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_sm()
+                                        .text_color(rgb(0xa9afbc))
+                                        .text_ellipsis()
+                                        .child(format!(
+                                            "{}  ·  {}  ·  {}",
+                                            video.uploader, video.stats, video.category
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_sm()
+                                        .text_color(rgb(0xa9afbc))
+                                        .child(
+                                            div()
+                                                .id("player-like")
+                                                .cursor_pointer()
+                                                .hover(|style| style.text_color(rgb(0x74ade8)))
+                                                .child("♡ 点赞")
+                                                .on_click(cx.listener(Self::like_current_video)),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("player-coin")
+                                                .cursor_pointer()
+                                                .hover(|style| style.text_color(rgb(0x74ade8)))
+                                                .child("◇ 投币")
+                                                .on_click(cx.listener(Self::coin_current_video)),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("player-favorite")
+                                                .cursor_pointer()
+                                                .hover(|style| style.text_color(rgb(0x74ade8)))
+                                                .child("收藏")
+                                                .on_click(
+                                                    cx.listener(Self::save_current_to_favorites),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("player-watch-later")
+                                                .cursor_pointer()
+                                                .hover(|style| style.text_color(rgb(0x74ade8)))
+                                                .child("稍后")
+                                                .on_click(
+                                                    cx.listener(Self::save_current_to_watch_later),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_xs()
+                                        .text_color(rgb(0x878a98))
+                                        .text_ellipsis()
+                                        .child(self.message.clone()),
+                                ),
+                        )
+                        .child(self.render_comments(cx))
+                    }),
             )
     }
 }
 
 impl Render for BiliGuga {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().flex().bg(rgb(0x3b414d)).child(
-            div()
-                .size_full()
-                .flex()
-                .child(self.render_sidebar(cx))
-                .child(self.render_feed(cx))
-                .child(self.render_player(cx)),
-        )
+        let mut root = div().size_full().flex().bg(rgb(0x3b414d));
+        if self.player_fullscreen {
+            root = root.child(self.render_player(cx));
+        } else {
+            root = root.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_feed(cx))
+                    .child(self.render_player(cx)),
+            );
+        }
+        root
     }
 }
 
