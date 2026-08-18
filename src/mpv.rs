@@ -74,7 +74,6 @@ const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 const FRAME_WIDTH: usize = 960;
 const FRAME_HEIGHT: usize = 540;
 const RETIRED_FRAME_LIMIT: usize = 3;
-const FRAME_CHANNEL_CAPACITY: usize = 1;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 enum PlayerCommand {
@@ -130,7 +129,7 @@ pub struct MpvPlayer {
 impl MpvPlayer {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel();
-        let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
+        let (frame_tx, frame_rx) = mpsc::sync_channel(2);
         let (recycled_tx, recycled_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::sync_channel(2);
         let worker = thread::Builder::new()
@@ -378,9 +377,8 @@ fn run_mpv_session(
         run_command(handle, &PlayerCommand::SetVolume(volume));
         run_command(handle, &PlayerCommand::SetSpeed(speed));
 
-        let buffer_len = FRAME_WIDTH * FRAME_HEIGHT * 4;
-        let mut render_buffer = take_frame_buffer(recycled_rx, buffer_len);
-        let format = CString::new("bgr0").unwrap();
+        let mut buffer = vec![0_u8; FRAME_WIDTH * FRAME_HEIGHT * 4];
+        let format = CString::new("rgb0").unwrap();
         let size = [FRAME_WIDTH as c_int, FRAME_HEIGHT as c_int];
         let stride = FRAME_WIDTH * 4;
         let mut render_enabled = true;
@@ -422,7 +420,7 @@ fn run_mpv_session(
                     },
                     MpvRenderParam {
                         type_: MPV_RENDER_PARAM_SW_POINTER,
-                        data: render_buffer.as_mut_ptr() as *mut c_void,
+                        data: buffer.as_mut_ptr() as *mut c_void,
                     },
                     MpvRenderParam {
                         type_: 0,
@@ -443,24 +441,19 @@ fn run_mpv_session(
                         }
                         logged_hwdec = true;
                     }
-                    // `bgr0` already matches GPUI's BGRA byte order. Only fill
-                    // the alpha byte; avoid a second full-frame copy and the
-                    // per-pixel red/blue channel swap used by `rgb0`.
-                    for alpha in render_buffer.iter_mut().skip(3).step_by(4) {
-                        *alpha = 255;
+                    let mut pixels = recycled_rx
+                        .try_recv()
+                        .ok()
+                        .filter(|pixels| pixels.len() == buffer.len())
+                        .unwrap_or_else(|| vec![0_u8; buffer.len()]);
+                    for (source, target) in buffer.chunks_exact(4).zip(pixels.chunks_exact_mut(4)) {
+                        target[0] = source[2];
+                        target[1] = source[1];
+                        target[2] = source[0];
+                        target[3] = 255;
                     }
-                    match frame_tx.try_send(FramePacket {
-                        pixels: render_buffer,
-                    }) {
-                        Ok(()) => {
-                            render_buffer = take_frame_buffer(recycled_rx, buffer_len);
-                        }
-                        Err(TrySendError::Full(packet)) => {
-                            // The UI is behind. Keep the just-rendered buffer
-                            // and let the next render overwrite it instead of
-                            // growing a queue or waiting for the consumer.
-                            render_buffer = packet.pixels;
-                        }
+                    match frame_tx.try_send(FramePacket { pixels }) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
                         Err(TrySendError::Disconnected(_)) => {
                             break 'playback SessionExit::Stop;
                         }
@@ -494,14 +487,6 @@ fn run_mpv_session(
         crate::allocator::trim();
         exit
     }
-}
-
-fn take_frame_buffer(recycled_rx: &Receiver<Vec<u8>>, len: usize) -> Vec<u8> {
-    recycled_rx
-        .try_recv()
-        .ok()
-        .filter(|pixels| pixels.len() == len)
-        .unwrap_or_else(|| vec![0_u8; len])
 }
 
 unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
