@@ -1,4 +1,4 @@
-use crate::model::Video;
+use crate::model::{DynamicPost, Video};
 use gpui::RenderImage;
 use image::Frame;
 use md5::{Digest, Md5};
@@ -533,6 +533,170 @@ pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
         .enumerate()
         .filter_map(|(index, item)| parse_history_video(item, index))
         .collect())
+}
+
+pub(crate) struct DynamicPage {
+    pub(crate) items: Vec<DynamicPost>,
+    pub(crate) offset: String,
+    pub(crate) has_more: bool,
+}
+
+fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
+    let bvid = text(archive.get("bvid"));
+    if bvid.is_empty() {
+        return None;
+    }
+    let stat = archive.get("stat");
+    Some(Video {
+        bvid,
+        aid: text(archive.get("aid")).parse().unwrap_or_default(),
+        cid: 0,
+        title: clean_search_text(text(archive.get("title"))),
+        uploader: String::new(),
+        stats: format!(
+            "{}播放  ·  {}弹幕",
+            text(stat.and_then(|stat| stat.get("play"))),
+            text(stat.and_then(|stat| stat.get("danmaku")))
+        ),
+        duration: {
+            let value = text(archive.get("duration_text"));
+            if value.is_empty() {
+                "--:--".into()
+            } else {
+                value
+            }
+        },
+        cover: https_url(text(archive.get("cover"))),
+        cover_image: None,
+        accent: 0x3e4654,
+        category: "动态视频".into(),
+    })
+}
+
+fn parse_dynamic_item(item: &Value, index: usize) -> Option<DynamicPost> {
+    if item.get("visible").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    let modules = item.get("modules").unwrap_or(&Value::Null);
+    let author_module = modules.get("module_author").unwrap_or(&Value::Null);
+    let content_module = modules.get("module_dynamic").unwrap_or(&Value::Null);
+    let author = text(author_module.get("name"));
+    let pub_time = text(author_module.get("pub_time"));
+    let own_text = clean_search_text(text(
+        content_module.get("desc").and_then(|desc| desc.get("text")),
+    ));
+    let major = content_module.get("major").unwrap_or(&Value::Null);
+    let major_type = text(major.get("type"));
+    let video = parse_dynamic_archive(
+        major
+            .get("archive")
+            .or_else(|| major.get("pgc"))
+            .or_else(|| {
+                major
+                    .get("ugc_season")
+                    .and_then(|season| season.get("archive"))
+            })
+            .unwrap_or(&Value::Null),
+    );
+    let kind = match major_type.as_str() {
+        "MAJOR_TYPE_ARCHIVE" => "视频动态",
+        "MAJOR_TYPE_DRAW" | "MAJOR_TYPE_OPUS" => "图文动态",
+        "MAJOR_TYPE_LIVE_RCMD" => "直播动态",
+        _ if text(item.get("type")) == "DYNAMIC_TYPE_FORWARD" => "转发动态",
+        _ => "文字动态",
+    }
+    .to_string();
+    let content_text = if text(item.get("type")) == "DYNAMIC_TYPE_FORWARD" {
+        let original = item.get("orig").unwrap_or(&Value::Null);
+        let original_modules = original.get("modules").unwrap_or(&Value::Null);
+        let original_author = text(
+            original_modules
+                .get("module_author")
+                .and_then(|author| author.get("name")),
+        );
+        let original_text = clean_search_text(text(
+            original_modules
+                .get("module_dynamic")
+                .and_then(|dynamic| dynamic.get("desc"))
+                .and_then(|desc| desc.get("text")),
+        ));
+        match (own_text.is_empty(), original_text.is_empty()) {
+            (true, true) => format!("转发自 {original_author}"),
+            (true, false) => format!("转发自 {original_author}：{original_text}"),
+            (_, true) => own_text,
+            (_, false) => format!("{own_text}\n↳ {original_author}：{original_text}"),
+        }
+    } else {
+        own_text
+    };
+    if item.get("id_str").is_none() || (content_text.is_empty() && video.is_none()) {
+        return None;
+    }
+    let mut video = video;
+    if let Some(video) = &mut video {
+        video.uploader = author.clone();
+        video.accent = accent_for(index);
+    }
+    Some(DynamicPost {
+        id: text(item.get("id_str")),
+        author,
+        pub_time,
+        text: content_text,
+        kind,
+        video,
+        video_index: None,
+    })
+}
+
+pub(crate) fn fetch_dynamic_feed(cookie: &str, offset: &str) -> Result<DynamicPage, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")
+            .header("Referer", "https://t.bilibili.com/")
+            .query(&[
+                ("type", "all"),
+                ("offset", offset),
+                ("update_baseline", ""),
+                ("page", "1"),
+                ("features", "itemOpusStyle,listOnlyfans"),
+                ("timezone_offset", "-480"),
+                ("platform", "web"),
+                ("web_location", "333.1365"),
+            ]),
+        Some(cookie),
+    )
+    .send()
+    .map_err(|error| format!("请求动态失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析动态失败：{error}"))?;
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "动态"));
+    }
+    let data = response
+        .get("data")
+        .ok_or_else(|| "动态接口没有返回数据".to_string())?;
+    let items = data
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "动态接口没有返回列表".to_string())?
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| parse_dynamic_item(item, index))
+        .collect();
+    Ok(DynamicPage {
+        items,
+        offset: text(data.get("offset")),
+        has_more: data
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 fn api_error(response: &Value, operation: &str) -> String {
