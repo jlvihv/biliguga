@@ -31,7 +31,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HOME_PAGE_SIZE: usize = 12;
 const HOME_MAX_ITEMS: usize = 120;
 const HOME_PREFETCH_ITEMS: usize = 4;
 const VIDEO_ROW_HEIGHT: f32 = 76.;
@@ -214,8 +213,7 @@ impl BiliGuga {
             return;
         }
         let excess = self.videos.len() - HOME_MAX_ITEMS;
-        let remove_count = ((excess + HOME_PAGE_SIZE - 1) / HOME_PAGE_SIZE * HOME_PAGE_SIZE)
-            .min(self.videos.len());
+        let remove_count = excess.min(self.videos.len());
         let removed: Vec<_> = self.videos.drain(..remove_count).collect();
         for mut video in removed {
             if let Some(image) = video.cover_image.take() {
@@ -282,7 +280,8 @@ impl BiliGuga {
                 app.home_scroll_requested = false;
                 match result {
                     Ok(videos) => {
-                        let received = videos.len();
+                        let has_more = videos.has_more;
+                        let videos = videos.videos;
                         let old_len = app.videos.len();
                         if reset {
                             app.videos = videos;
@@ -296,7 +295,7 @@ impl BiliGuga {
                         app.home_page = page;
                         app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
                         let added = app.videos.len().saturating_sub(old_len);
-                        app.home_has_more = received >= HOME_PAGE_SIZE && (reset || added > 0);
+                        app.home_has_more = has_more && (reset || added > 0);
                         app.trim_home_items();
                         app.message = SharedString::from(format!(
                             "为你推荐 · 已加载 {} 个视频",
@@ -2692,12 +2691,14 @@ pub(crate) fn launch() {
                 app.loading = false;
                 match result {
                     Ok(videos) => {
-                        app.message =
-                            SharedString::from(format!("已加载 {} 个真实视频", videos.len()));
+                        app.message = SharedString::from(format!(
+                            "已加载 {} 个真实视频",
+                            videos.videos.len()
+                        ));
                         app.home_page = 1;
-                        app.home_has_more = videos.len() >= HOME_PAGE_SIZE;
+                        app.home_has_more = videos.has_more;
                         app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
-                        app.videos = videos;
+                        app.videos = videos.videos;
                         app.start_cover_loading(cx);
                     }
                     Err(error) => {

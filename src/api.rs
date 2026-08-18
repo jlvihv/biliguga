@@ -55,6 +55,13 @@ const MIXIN_KEY_TABLE: [usize; 64] = [
     54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
 ];
 
+const RECOMMENDATION_PAGE_SIZE: usize = 20;
+
+pub(crate) struct RecommendationPage {
+    pub(crate) videos: Vec<Video>,
+    pub(crate) has_more: bool,
+}
+
 fn text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(value)) => value.clone(),
@@ -384,7 +391,7 @@ fn wbi_sign(
 pub(crate) fn fetch_recommendations(
     page: usize,
     cookie: Option<&str>,
-) -> Result<Vec<Video>, String> {
+) -> Result<RecommendationPage, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -430,7 +437,7 @@ pub(crate) fn fetch_recommendations(
     params.insert("brush".into(), page.max(1).to_string());
     params.insert("fresh_type".into(), "4".into());
     params.insert("homepage_ver".into(), "1".into());
-    params.insert("ps".into(), "12".into());
+    params.insert("ps".into(), RECOMMENDATION_PAGE_SIZE.to_string());
     let signed = wbi_sign(&params, &img_key, &sub_key);
     let response: Value = with_cookie(
         client
@@ -463,7 +470,10 @@ pub(crate) fn fetch_recommendations(
     if videos.is_empty() {
         Err("推荐接口返回了空列表".into())
     } else {
-        Ok(videos)
+        Ok(RecommendationPage {
+            videos,
+            has_more: items.len() >= RECOMMENDATION_PAGE_SIZE,
+        })
     }
 }
 
