@@ -272,6 +272,7 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("aid")),
         cid: number(item.get("cid")),
+        progress: 0,
         title: text(item.get("title")),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         stats: format!(
@@ -326,6 +327,7 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("aid")),
         cid: 0,
+        progress: 0,
         title,
         uploader: clean_search_text(text(item.get("author"))),
         stats: format!(
@@ -622,6 +624,7 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(history.get("aid")).max(number(item.get("aid"))),
         cid: number(history.get("cid")),
+        progress: number(item.get("progress")).max(0),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("author_name")),
         stats: format!(
@@ -674,6 +677,115 @@ pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
         .collect())
 }
 
+pub(crate) fn report_video_progress(
+    cookie: &str,
+    aid: i64,
+    cid: i64,
+    progress: f64,
+) -> Result<(), String> {
+    if aid <= 0 || cid <= 0 {
+        return Err("视频缺少有效的 AV 号或 CID".into());
+    }
+    let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let progress = progress.max(0.).floor() as i64;
+    let response: Value = with_cookie(
+        client
+            .post("https://api.bilibili.com/x/v2/history/report")
+            .header("Referer", "https://www.bilibili.com/"),
+        Some(cookie),
+    )
+    .form(&[
+        ("aid", aid.to_string()),
+        ("cid", cid.to_string()),
+        ("progress", progress.to_string()),
+        ("platform", "web".to_string()),
+        ("csrf", csrf),
+    ])
+    .send()
+    .map_err(|error| format!("上报观看进度失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析观看进度响应失败：{error}"))?;
+    if number(response.get("code")) == 0 {
+        Ok(())
+    } else {
+        Err(api_error(&response, "观看进度上报"))
+    }
+}
+
+pub(crate) fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> Option<i64> {
+    if video.aid <= 0 || video.cid <= 0 || cookie.is_none() {
+        return None;
+    }
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let nav: Value = with_cookie(
+        client.get("https://api.bilibili.com/x/web-interface/nav"),
+        cookie,
+    )
+    .send()
+    .ok()?
+    .json()
+    .ok()?;
+    let wbi_img = nav.get("data")?.get("wbi_img")?;
+    let img_key = text(wbi_img.get("img_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let sub_key = text(wbi_img.get("sub_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if img_key.is_empty() || sub_key.is_empty() {
+        return None;
+    }
+    let mut params = BTreeMap::new();
+    params.insert("aid".into(), video.aid.to_string());
+    params.insert("bvid".into(), video.bvid.clone());
+    params.insert("cid".into(), video.cid.to_string());
+    params.insert("web_location".into(), "1315873".into());
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/player/wbi/v2")
+            .header(
+                "Referer",
+                format!("https://www.bilibili.com/video/{}", video.bvid),
+            ),
+        cookie,
+    )
+    .query(&wbi_sign(&params, &img_key, &sub_key))
+    .send()
+    .ok()?
+    .json()
+    .ok()?;
+    (number(response.get("code")) == 0)
+        .then(|| {
+            number(
+                response
+                    .get("data")
+                    .and_then(|data| data.get("last_play_time")),
+            )
+        })
+        .filter(|progress| *progress > 0)
+}
+
 fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
     let bvid = text(archive.get("bvid"));
     if bvid.is_empty() {
@@ -684,6 +796,7 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
         bvid,
         aid: text(archive.get("aid")).parse().unwrap_or_default(),
         cid: 0,
+        progress: 0,
         title: clean_search_text(text(archive.get("title"))),
         uploader: String::new(),
         stats: format!(
@@ -804,6 +917,7 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("aid")),
         cid: number(item.get("cid")),
+        progress: 0,
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         stats: format!(
@@ -870,6 +984,7 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
         bvid,
         aid: number(item.get("id")),
         cid: number(ugc.and_then(|ugc| ugc.get("first_cid"))),
+        progress: 0,
         title: clean_search_text(text(item.get("title"))),
         uploader: text(upper.and_then(|upper| upper.get("name"))),
         stats: format!(
@@ -1271,7 +1386,10 @@ mod tests {
     }
 }
 
-pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_play_url(
+    video: &Video,
+    cookie: Option<&str>,
+) -> Result<(String, i64), String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(3))
@@ -1361,7 +1479,7 @@ pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<St
                     {
                         Ok(response) if number(response.get("code")) == 0 => {
                             if let Some(url) = first_durl(&response) {
-                                return Ok(url);
+                                return Ok((url, cid));
                             }
                             errors.push("WBI 接口没有返回 MP4 地址".to_string());
                         }
@@ -1395,7 +1513,7 @@ pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<St
     {
         Ok(response) if number(response.get("code")) == 0 => {
             if let Some(url) = first_durl(&response) {
-                return Ok(url);
+                return Ok((url, cid));
             }
             errors.push("旧播放接口没有返回 MP4 地址".to_string());
         }

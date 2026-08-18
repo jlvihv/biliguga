@@ -1,9 +1,9 @@
 use crate::{
     api::{
         add_to_favorites, add_to_watch_later, coin_video, download_avatar, fetch_comments,
-        fetch_dynamic_feed, fetch_favorites, fetch_history, fetch_recommendations,
-        fetch_search_results, fetch_watch_later, format_time, like_video, queue_cover_download,
-        resolve_play_url,
+        fetch_dynamic_feed, fetch_favorites, fetch_history, fetch_last_play_progress,
+        fetch_recommendations, fetch_search_results, fetch_watch_later, format_time, like_video,
+        queue_cover_download, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
     model::{Comment, LOADING_VIDEO, Video},
@@ -77,6 +77,10 @@ struct BiliGuga {
     controls_visible: bool,
     controls_generation: u64,
     playing_video: Option<Video>,
+    resume_progress: Option<f64>,
+    resume_applied: bool,
+    history_report_at: Instant,
+    history_report_in_flight: bool,
     pending_cover_drops: Vec<Arc<RenderImage>>,
     comments: Vec<Comment>,
     comments_for: String,
@@ -158,6 +162,10 @@ impl BiliGuga {
             controls_visible: false,
             controls_generation: 0,
             playing_video: None,
+            resume_progress: None,
+            resume_applied: false,
+            history_report_at: Instant::now(),
+            history_report_in_flight: false,
             pending_cover_drops: Vec::new(),
             comments: Vec::new(),
             comments_for: String::new(),
@@ -353,12 +361,51 @@ impl BiliGuga {
         }
     }
 
-    fn stop_current_playback(&mut self, window: &mut Window) {
+    fn queue_history_report(&mut self, cx: &mut Context<Self>) {
+        if self.history_report_in_flight || self.session.is_none() {
+            return;
+        }
+        let Some(video) = self.selected_video_ref().cloned() else {
+            return;
+        };
+        let status = self.player.status();
+        if !status.time_pos.is_finite() || video.aid <= 0 || video.cid <= 0 {
+            return;
+        }
+        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
+            return;
+        };
+        self.history_report_in_flight = true;
+        self.history_report_at = Instant::now();
+        let progress = status.time_pos.max(0.);
+        let aid = video.aid;
+        let cid = video.cid;
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { report_video_progress(&cookie, aid, cid, progress) })
+                .await;
+            view.update(cx, |app, _| {
+                app.history_report_in_flight = false;
+                if let Err(error) = result {
+                    if std::env::var_os("BILIGUGA_API_DEBUG").is_some() {
+                        eprintln!("[biliguga-history] {error}");
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn stop_current_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.queue_history_report(cx);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.selected = 0;
         self.playback = PlaybackState::Idle;
         self.playing_video = None;
+        self.resume_progress = None;
+        self.resume_applied = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -477,13 +524,13 @@ impl BiliGuga {
         self.load_comments_page(cx, false);
     }
 
-    fn leave_current_tab(&mut self, window: &mut Window) {
+    fn leave_current_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.debug_memory("before-tab-leave");
         if self.active_tab == AppTab::Home {
             self.home_generation = self.home_generation.wrapping_add(1);
             self.home_loading = false;
         }
-        self.stop_current_playback(window);
+        self.stop_current_playback(window, cx);
         self.reset_cover_loading();
         self.reset_comments();
         self.debug_memory("after-tab-leave");
@@ -610,7 +657,7 @@ impl BiliGuga {
 
     fn show_home(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab != AppTab::Home {
-            self.leave_current_tab(window);
+            self.leave_current_tab(window, cx);
             self.active_tab = AppTab::Home;
             self.message = SharedString::from("首页推荐");
             let current_mid = self.session.as_ref().map(|session| session.mid);
@@ -629,7 +676,7 @@ impl BiliGuga {
 
     fn show_search(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab != AppTab::Search {
-            self.leave_current_tab(window);
+            self.leave_current_tab(window, cx);
             self.active_tab = AppTab::Search;
             self.message = if self.search_results.is_empty() {
                 SharedString::from("输入关键词搜索视频")
@@ -642,7 +689,7 @@ impl BiliGuga {
     }
 
     fn show_dynamic(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window);
+        self.leave_current_tab(window, cx);
         self.active_tab = AppTab::Dynamic;
         if self.session.is_none() {
             self.message = SharedString::from("请先登录后查看动态");
@@ -715,7 +762,7 @@ impl BiliGuga {
     }
 
     fn show_history(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window);
+        self.leave_current_tab(window, cx);
         self.active_tab = AppTab::History;
         if self.session.is_none() {
             self.message = SharedString::from("请先登录后查看观看历史");
@@ -778,7 +825,7 @@ impl BiliGuga {
     }
 
     fn show_watch_later(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window);
+        self.leave_current_tab(window, cx);
         self.active_tab = AppTab::WatchLater;
         if self.session.is_none() {
             self.message = SharedString::from("请先登录后查看稍后再看");
@@ -842,7 +889,7 @@ impl BiliGuga {
     }
 
     fn show_favorites(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window);
+        self.leave_current_tab(window, cx);
         self.active_tab = AppTab::Favorites;
         if self.session.is_none() {
             self.message = SharedString::from("请先登录后查看收藏夹");
@@ -907,7 +954,7 @@ impl BiliGuga {
 
     fn show_login(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab != AppTab::Login {
-            self.leave_current_tab(window);
+            self.leave_current_tab(window, cx);
             self.active_tab = AppTab::Login;
             self.message = SharedString::from("登录账号后可使用更多 B 站功能");
             cx.notify();
@@ -1382,9 +1429,13 @@ impl BiliGuga {
         self.search_results.clear();
         self.reset_cover_loading();
         self.selected = 0;
+        self.queue_history_report(cx);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
+        self.playing_video = None;
+        self.resume_progress = None;
+        self.resume_applied = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1424,9 +1475,13 @@ impl BiliGuga {
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.reset(cx));
         self.reset_cover_loading();
+        self.queue_history_report(cx);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
+        self.playing_video = None;
+        self.resume_progress = None;
+        self.resume_applied = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1459,6 +1514,7 @@ impl BiliGuga {
             return;
         }
         self.debug_memory("before-video-switch");
+        self.queue_history_report(cx);
         self.selected = index;
         self.pin_playing_video(&video);
         let frames = self.player.stop_playback();
@@ -1493,6 +1549,9 @@ impl BiliGuga {
         };
         self.pin_playing_video(&video);
         self.load_comments_for_current(cx);
+        self.resume_progress = (video.progress > 0).then_some(video.progress as f64);
+        self.resume_applied = false;
+        self.history_report_at = Instant::now();
         self.playback = PlaybackState::Buffering;
         self.message = SharedString::from("正在向 B 站获取播放地址…");
         cx.notify();
@@ -1502,10 +1561,20 @@ impl BiliGuga {
         let playback_request = self.playback_request;
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { resolve_play_url(&video, cookie.as_deref()) })
+                .background_spawn(async move {
+                    let result = resolve_play_url(&video, cookie.as_deref())?;
+                    let progress = if video.progress > 0 {
+                        Some(video.progress)
+                    } else {
+                        let mut resolved_video = video.clone();
+                        resolved_video.cid = result.1;
+                        fetch_last_play_progress(&resolved_video, cookie.as_deref())
+                    };
+                    Ok::<_, String>((result.0, result.1, progress))
+                })
                 .await;
             let message = match result {
-                Ok(url) => {
+                Ok((url, cid, progress)) => {
                     view.update(cx, |app, cx| {
                         if app.playback_request != playback_request
                             || app
@@ -1515,8 +1584,15 @@ impl BiliGuga {
                         {
                             return;
                         }
+                        if let Some(playing_video) = app.playing_video.as_mut() {
+                            playing_video.cid = cid;
+                        }
+                        if let Some(progress) = progress {
+                            app.resume_progress = Some(progress as f64);
+                        }
                         app.debug_memory("before-video-load");
                         app.player.load(url, app.volume, app.speed);
+                        app.resume_applied = false;
                         app.playback = PlaybackState::Buffering;
                         app.message = SharedString::from("已获取播放地址，libmpv 正在缓冲");
                         cx.notify();
@@ -1542,6 +1618,7 @@ impl BiliGuga {
     fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         match self.playback {
             PlaybackState::Playing => {
+                self.queue_history_report(cx);
                 self.player.set_pause(true);
                 self.playback = PlaybackState::Paused;
                 self.message = SharedString::from("已暂停");
@@ -2628,6 +2705,18 @@ pub(crate) fn launch() {
                             }
                             let status = app.player.status();
                             if app.playback != PlaybackState::Idle && status.time_pos.is_finite() {
+                                if !app.resume_applied {
+                                    let duration_ready = app.resume_progress.is_none()
+                                        || (status.duration.is_finite() && status.duration > 0.);
+                                    if duration_ready {
+                                        if let Some(progress) = app.resume_progress {
+                                            if progress > 3. && progress < status.duration - 3. {
+                                                app.player.seek_seconds(progress);
+                                            }
+                                        }
+                                        app.resume_applied = true;
+                                    }
+                                }
                                 app.playback = if status.paused {
                                     PlaybackState::Paused
                                 } else {
@@ -2638,6 +2727,11 @@ pub(crate) fn launch() {
                                 }
                                 if status.speed.is_finite() {
                                     app.speed = status.speed.max(0.1);
+                                }
+                                if app.playback == PlaybackState::Playing
+                                    && app.history_report_at.elapsed() >= Duration::from_secs(15)
+                                {
+                                    app.queue_history_report(cx);
                                 }
                             }
                             let expired_frames = app.player.take_expired_frames();

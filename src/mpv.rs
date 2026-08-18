@@ -88,6 +88,7 @@ enum PlayerCommand {
     SetVolume(f64),
     SetSpeed(f64),
     SeekPercent(f64),
+    SeekSeconds(f64),
     Stop,
 }
 
@@ -176,6 +177,12 @@ impl MpvPlayer {
 
     pub fn seek_percent(&self, percent: f64) {
         let _ = self.commands.send(PlayerCommand::SeekPercent(percent));
+    }
+
+    pub fn seek_seconds(&self, seconds: f64) {
+        let _ = self
+            .commands
+            .send(PlayerCommand::SeekSeconds(seconds.max(0.)));
     }
 
     pub fn poll_frame(&mut self) {
@@ -304,7 +311,8 @@ fn run_mpv(
             | PlayerCommand::SetPause(_)
             | PlayerCommand::SetVolume(_)
             | PlayerCommand::SetSpeed(_)
-            | PlayerCommand::SeekPercent(_) => {}
+            | PlayerCommand::SeekPercent(_)
+            | PlayerCommand::SeekSeconds(_) => {}
         }
     }
 }
@@ -400,7 +408,8 @@ fn run_mpv_session(
                     }
                     command @ (PlayerCommand::SetVolume(_)
                     | PlayerCommand::SetSpeed(_)
-                    | PlayerCommand::SeekPercent(_)) => run_command(handle, &command),
+                    | PlayerCommand::SeekPercent(_)
+                    | PlayerCommand::SeekSeconds(_)) => run_command(handle, &command),
                 }
             }
 
@@ -515,6 +524,9 @@ unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
         PlayerCommand::SetSpeed(speed) => format!("set speed {:.2}", speed.max(0.1)),
         PlayerCommand::SeekPercent(percent) => {
             format!("seek {:.3} absolute-percent", percent.clamp(0., 1.) * 100.)
+        }
+        PlayerCommand::SeekSeconds(seconds) => {
+            format!("seek {:.3} absolute", seconds.max(0.))
         }
         PlayerCommand::Load { .. } | PlayerCommand::StopPlayback | PlayerCommand::Stop => return,
     };
