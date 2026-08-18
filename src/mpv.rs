@@ -3,7 +3,7 @@ use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 use std::{
     collections::VecDeque,
-    ffi::CString,
+    ffi::{CStr, CString},
     os::raw::{c_char, c_double, c_int, c_void},
     ptr,
     sync::{
@@ -47,6 +47,7 @@ unsafe extern "C" {
         format: c_int,
         data: *mut c_void,
     ) -> c_int;
+    fn mpv_free(data: *mut c_void);
     fn mpv_wait_event(handle: *mut MpvHandle, timeout: c_double) -> *mut c_void;
     fn mpv_render_context_create(
         context: *mut *mut MpvRenderContext,
@@ -68,6 +69,7 @@ const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
 const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
 const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_DOUBLE: c_int = 5;
+const MPV_FORMAT_STRING: c_int = 1;
 const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 const FRAME_WIDTH: usize = 960;
 const FRAME_HEIGHT: usize = 540;
@@ -329,7 +331,7 @@ fn run_mpv_session(
         }
 
         set_option(handle, "vo", "libmpv");
-        set_option(handle, "hwdec", "no");
+        set_option(handle, "hwdec", "auto-safe");
         set_option(handle, "vd-lavc-threads", "4");
         set_option(handle, "cache", "yes");
         set_option(handle, "cache-secs", "3");
@@ -381,6 +383,7 @@ fn run_mpv_session(
         let stride = FRAME_WIDTH * 4;
         let mut render_enabled = true;
         let mut last_status = Instant::now();
+        let mut logged_hwdec = false;
         let exit = 'playback: loop {
             while let Ok(command) = command_rx.try_recv() {
                 match command {
@@ -452,6 +455,19 @@ fn run_mpv_session(
                     volume: get_double_property(handle, "volume").unwrap_or(100.),
                     speed: get_double_property(handle, "speed").unwrap_or(1.),
                 };
+                if !logged_hwdec && status.time_pos.is_finite() {
+                    let hwdec = get_string_property(handle, "hwdec-current")
+                        .unwrap_or_else(|| "unknown".into());
+                    if std::env::var_os("BILIGUGA_MEM_DEBUG").is_some()
+                        || std::env::var_os("BILIGUGA_MPV_DEBUG").is_some()
+                    {
+                        eprintln!(
+                            "[biliguga-mpv] hwdec-current={} render-path=software-buffer",
+                            hwdec
+                        );
+                    }
+                    logged_hwdec = true;
+                }
                 if status.paused {
                     render_enabled = false;
                 }
@@ -520,6 +536,27 @@ unsafe fn get_flag_property(handle: *mut MpvHandle, name: &str) -> Option<bool> 
         )
     };
     (result >= 0).then_some(value != 0)
+}
+
+unsafe fn get_string_property(handle: *mut MpvHandle, name: &str) -> Option<String> {
+    let name = CString::new(name).ok()?;
+    let mut value = ptr::null_mut::<c_char>();
+    let result = unsafe {
+        mpv_get_property(
+            handle,
+            name.as_ptr(),
+            MPV_FORMAT_STRING,
+            &mut value as *mut *mut c_char as *mut c_void,
+        )
+    };
+    if result < 0 || value.is_null() {
+        return None;
+    }
+    let result = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
+    unsafe {
+        mpv_free(value.cast());
+    }
+    Some(result)
 }
 
 unsafe fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
