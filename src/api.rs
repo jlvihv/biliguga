@@ -1,0 +1,593 @@
+use crate::model::Video;
+use gpui::RenderImage;
+use image::Frame;
+use md5::{Digest, Md5};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use reqwest::blocking::Client;
+use serde_json::Value;
+use smallvec::SmallVec;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+const WBI_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+const MIXIN_KEY_TABLE: [usize; 64] = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
+    28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25,
+    54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+
+fn text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => value.to_string().trim_matches('"').to_string(),
+        None => String::new(),
+    }
+}
+
+fn number(value: Option<&Value>) -> i64 {
+    value
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or_default()
+}
+
+fn compact_number(value: i64) -> String {
+    if value >= 100_000_000 {
+        format!("{:.1}亿", value as f64 / 100_000_000.0)
+    } else if value >= 10_000 {
+        format!("{:.1}万", value as f64 / 10_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn duration(value: Option<&Value>) -> String {
+    let seconds = number(value);
+    if seconds <= 0 {
+        return "--:--".into();
+    }
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+pub(crate) fn format_time(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0. {
+        return "--:--".into();
+    }
+    let seconds = seconds as u64;
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn accent_for(index: usize) -> u32 {
+    [0x3e4654, 0x39455a, 0x4b4240, 0x4c4255, 0x354c4a, 0x46503d][index % 6]
+}
+
+fn https_url(value: String) -> String {
+    if value.starts_with("//") {
+        format!("https:{value}")
+    } else if value.starts_with("http://") {
+        value.replacen("http://", "https://", 1)
+    } else {
+        value
+    }
+}
+
+pub(crate) fn download_cover(client: &Client, url: &str) -> Option<Arc<RenderImage>> {
+    if url.is_empty() {
+        return None;
+    }
+    let response = client
+        .get(url)
+        .header("Referer", "https://www.bilibili.com/")
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().ok()?;
+    let mut rgba = image::load_from_memory(&bytes).ok()?.into_rgba8();
+    for pixel in rgba.pixels_mut() {
+        let [red, green, blue, alpha] = pixel.0;
+        pixel.0 = [blue, green, red, alpha];
+    }
+    Some(Arc::new(RenderImage::new(SmallVec::from_elem(
+        Frame::new(rgba),
+        1,
+    ))))
+}
+
+fn parse_video(item: &Value, index: usize) -> Option<Video> {
+    let bvid = text(item.get("bvid"));
+    if bvid.is_empty() {
+        return None;
+    }
+    let view = number(item.get("stat").and_then(|stat| stat.get("view")));
+    let danmaku = number(item.get("stat").and_then(|stat| stat.get("danmaku")));
+    Some(Video {
+        bvid,
+        cid: number(item.get("cid")),
+        title: text(item.get("title")),
+        uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
+        stats: format!(
+            "{}播放  ·  {}弹幕",
+            compact_number(view),
+            compact_number(danmaku)
+        ),
+        duration: duration(item.get("duration")),
+        cover: https_url(text(item.get("pic"))),
+        cover_image: None,
+        accent: accent_for(index),
+        category: text(item.get("tname")),
+    })
+}
+
+fn clean_search_text(value: String) -> String {
+    let mut plain = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => plain.push(ch),
+            _ => {}
+        }
+    }
+    plain
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
+    let mut bvid = text(item.get("bvid"));
+    if bvid.is_empty() {
+        bvid = text(item.get("arcurl"))
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string();
+    }
+    if bvid.is_empty() {
+        return None;
+    }
+    let title = clean_search_text(text(item.get("title")));
+    let play = clean_search_text(text(item.get("play")));
+    let danmaku = clean_search_text(text(item.get("video_review")));
+    let duration = clean_search_text(text(item.get("duration")));
+    Some(Video {
+        bvid,
+        cid: 0,
+        title,
+        uploader: clean_search_text(text(item.get("author"))),
+        stats: format!(
+            "{}播放  ·  {}弹幕",
+            if play.is_empty() { "0" } else { &play },
+            if danmaku.is_empty() { "0" } else { &danmaku }
+        ),
+        duration: if duration.is_empty() {
+            "--:--".into()
+        } else {
+            duration
+        },
+        cover: https_url(text(item.get("pic"))),
+        cover_image: None,
+        accent: accent_for(index),
+        category: clean_search_text(text(item.get("typename"))),
+    })
+}
+
+fn encode_wbi_value(value: &str) -> String {
+    utf8_percent_encode(value, WBI_ENCODE_SET).to_string()
+}
+
+fn wbi_sign(
+    params: &BTreeMap<String, String>,
+    img_key: &str,
+    sub_key: &str,
+) -> BTreeMap<String, String> {
+    let mut mixin_source = String::with_capacity(img_key.len() + sub_key.len());
+    mixin_source.push_str(img_key);
+    mixin_source.push_str(sub_key);
+    let mixin: String = MIXIN_KEY_TABLE
+        .iter()
+        .filter_map(|index| mixin_source.as_bytes().get(*index).copied())
+        .map(char::from)
+        .take(32)
+        .collect();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let mut signed = params.clone();
+    signed.insert("wts".into(), now);
+    let query = signed
+        .iter()
+        .map(|(key, value)| {
+            let filtered = value
+                .chars()
+                .filter(|ch| !"!'()*".contains(*ch))
+                .collect::<String>();
+            format!("{key}={}", encode_wbi_value(&filtered))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut digest = Md5::new();
+    digest.update(format!("{query}{mixin}"));
+    signed.insert("w_rid".into(), format!("{:x}", digest.finalize()));
+    signed
+}
+
+pub(crate) fn fetch_recommendations() -> Result<Vec<Video>, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let nav: Value = client
+        .get("https://api.bilibili.com/x/web-interface/nav")
+        .send()
+        .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
+    let wbi_img = nav
+        .get("data")
+        .and_then(|data| data.get("wbi_img"))
+        .ok_or_else(|| "B 站没有返回 WBI 密钥".to_string())?;
+    let img_key = text(wbi_img.get("img_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let sub_key = text(wbi_img.get("sub_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if img_key.is_empty() || sub_key.is_empty() {
+        return Err("B 站 WBI 密钥为空".into());
+    }
+
+    let mut params = BTreeMap::new();
+    params.insert("feed_version".into(), "V8".into());
+    params.insert("fresh_idx".into(), "1".into());
+    params.insert("fresh_type".into(), "4".into());
+    params.insert("homepage_ver".into(), "1".into());
+    params.insert("ps".into(), "12".into());
+    let signed = wbi_sign(&params, &img_key, &sub_key);
+    let response: Value = client
+        .get("https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd")
+        .header("Referer", "https://www.bilibili.com/")
+        .query(&signed)
+        .send()
+        .map_err(|error| format!("请求推荐流失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析推荐流失败：{error}"))?;
+    let code = number(response.get("code"));
+    if code != 0 {
+        return Err(format!(
+            "推荐接口返回错误 {code}：{}",
+            text(response.get("message"))
+        ));
+    }
+    let items = response
+        .get("data")
+        .and_then(|data| data.get("item"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "推荐接口没有返回视频列表".to_string())?;
+    let videos = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| parse_video(item, index))
+        .collect::<Vec<_>>();
+    if videos.is_empty() {
+        Err("推荐接口返回了空列表".into())
+    } else {
+        Ok(videos)
+    }
+}
+
+fn parse_search_result_list(response: &Value) -> Vec<Video> {
+    let direct = response
+        .get("data")
+        .and_then(|data| data.get("result"))
+        .and_then(Value::as_array);
+    if let Some(items) = direct {
+        let videos = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| parse_search_video(item, index))
+            .collect::<Vec<_>>();
+        if !videos.is_empty() {
+            return videos;
+        }
+        if let Some(items) = items.iter().find_map(|item| {
+            (text(item.get("result_type")) == "video")
+                .then(|| item.get("data"))
+                .flatten()
+                .and_then(Value::as_array)
+        }) {
+            return items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| parse_search_video(item, index))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let nav: Value = client
+        .get("https://api.bilibili.com/x/web-interface/nav")
+        .send()
+        .map_err(|error| format!("获取搜索 WBI 密钥失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析搜索 WBI 密钥失败：{error}"))?;
+    let wbi_img = nav
+        .get("data")
+        .and_then(|data| data.get("wbi_img"))
+        .ok_or_else(|| "B 站没有返回搜索 WBI 密钥".to_string())?;
+    let img_key = text(wbi_img.get("img_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let sub_key = text(wbi_img.get("sub_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if img_key.is_empty() || sub_key.is_empty() {
+        return Err("B 站搜索 WBI 密钥为空".into());
+    }
+
+    let mut params = BTreeMap::new();
+    params.insert("keyword".into(), keyword.into());
+    params.insert("search_type".into(), "video".into());
+    params.insert("order".into(), "totalrank".into());
+    params.insert("duration".into(), "0".into());
+    params.insert("tids".into(), "0".into());
+    params.insert("page".into(), "1".into());
+    params.insert("page_size".into(), "20".into());
+    params.insert("platform".into(), "pc".into());
+    params.insert("web_location".into(), "1430654".into());
+    let signed = wbi_sign(&params, &img_key, &sub_key);
+    let response: Value = client
+        .get("https://api.bilibili.com/x/web-interface/wbi/search/type")
+        .header("Origin", "https://search.bilibili.com")
+        .header("Referer", "https://search.bilibili.com/")
+        .query(&signed)
+        .send()
+        .map_err(|error| format!("请求 B 站搜索失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析 B 站搜索结果失败：{error}"))?;
+    let code = number(response.get("code"));
+    let videos = if code == 0 {
+        parse_search_result_list(&response)
+    } else {
+        Vec::new()
+    };
+    if !videos.is_empty() {
+        return Ok(videos);
+    }
+
+    let mut fallback_params = BTreeMap::new();
+    fallback_params.insert("keyword".into(), keyword.into());
+    fallback_params.insert("page".into(), "1".into());
+    fallback_params.insert("page_size".into(), "20".into());
+    fallback_params.insert("platform".into(), "pc".into());
+    fallback_params.insert("web_location".into(), "1430654".into());
+    let fallback_response: Value = client
+        .get("https://api.bilibili.com/x/web-interface/wbi/search/all/v2")
+        .header("Origin", "https://search.bilibili.com")
+        .header("Referer", "https://search.bilibili.com/")
+        .query(&wbi_sign(&fallback_params, &img_key, &sub_key))
+        .send()
+        .map_err(|error| format!("请求 B 站综合搜索失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析 B 站综合搜索结果失败：{error}"))?;
+    if number(fallback_response.get("code")) != 0 {
+        return Err(format!(
+            "搜索接口返回错误 {code}：{}",
+            text(response.get("message"))
+        ));
+    }
+    let videos = parse_search_result_list(&fallback_response);
+    if videos.is_empty() {
+        Err("没有找到相关视频".into())
+    } else {
+        Ok(videos)
+    }
+}
+
+pub(crate) fn resolve_play_url(video: &Video) -> Result<String, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let mut cid = video.cid;
+    if cid == 0 {
+        let detail: Value = client
+            .get("https://api.bilibili.com/x/web-interface/view")
+            .header(
+                "Referer",
+                format!("https://www.bilibili.com/video/{}", video.bvid),
+            )
+            .query(&[("bvid", video.bvid.as_str())])
+            .send()
+            .map_err(|error| format!("获取视频详情失败：{error}"))?
+            .json()
+            .map_err(|error| format!("解析视频详情失败：{error}"))?;
+        if number(detail.get("code")) != 0 {
+            return Err(format!(
+                "视频详情接口返回错误 {}：{}",
+                number(detail.get("code")),
+                text(detail.get("message"))
+            ));
+        }
+        cid = number(detail.get("data").and_then(|data| data.get("cid")));
+    }
+    if cid == 0 {
+        return Err("视频没有可用的 CID".into());
+    }
+
+    let mut params = BTreeMap::new();
+    params.insert("bvid".into(), video.bvid.clone());
+    params.insert("cid".into(), cid.to_string());
+    params.insert("qn".into(), "64".into());
+    params.insert("fnval".into(), "1".into());
+    params.insert("fnver".into(), "0".into());
+    params.insert("fourk".into(), "1".into());
+    params.insert("platform".into(), "html5".into());
+    params.insert("high_quality".into(), "1".into());
+    params.insert("web_location".into(), "1315873".into());
+
+    let referer = format!("https://www.bilibili.com/video/{}", video.bvid);
+    let mut errors = Vec::new();
+
+    // WBI 是当前接口，但接口策略会变化，所以失败时继续尝试旧接口。
+    match client
+        .get("https://api.bilibili.com/x/web-interface/nav")
+        .send()
+        .and_then(|response| response.json::<Value>())
+    {
+        Ok(nav) => {
+            if let Some(wbi_img) = nav.get("data").and_then(|data| data.get("wbi_img")) {
+                let img_key = text(wbi_img.get("img_url"))
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let sub_key = text(wbi_img.get("sub_url"))
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !img_key.is_empty() && !sub_key.is_empty() {
+                    match client
+                        .get("https://api.bilibili.com/x/player/wbi/playurl")
+                        .header("Referer", &referer)
+                        .query(&wbi_sign(&params, &img_key, &sub_key))
+                        .send()
+                        .and_then(|response| response.json::<Value>())
+                    {
+                        Ok(response) if number(response.get("code")) == 0 => {
+                            if let Some(url) = first_durl(&response) {
+                                return Ok(url);
+                            }
+                            errors.push("WBI 接口没有返回 MP4 地址".to_string());
+                        }
+                        Ok(response) => errors.push(format!(
+                            "WBI 播放接口返回错误 {}：{}",
+                            number(response.get("code")),
+                            text(response.get("message"))
+                        )),
+                        Err(error) => errors.push(format!("WBI 播放请求失败：{error}")),
+                    }
+                } else {
+                    errors.push("播放 WBI 密钥为空".to_string());
+                }
+            } else {
+                errors.push("B 站没有返回播放 WBI 密钥".to_string());
+            }
+        }
+        Err(error) => errors.push(format!("获取播放 WBI 密钥失败：{error}")),
+    }
+
+    // 部分视频或未登录请求会拒绝 WBI 播放接口，旧接口仍可返回 MP4。
+    match client
+        .get("https://api.bilibili.com/x/player/playurl")
+        .header("Referer", &referer)
+        .query(&params)
+        .send()
+        .and_then(|response| response.json::<Value>())
+    {
+        Ok(response) if number(response.get("code")) == 0 => {
+            if let Some(url) = first_durl(&response) {
+                return Ok(url);
+            }
+            errors.push("旧播放接口没有返回 MP4 地址".to_string());
+        }
+        Ok(response) => errors.push(format!(
+            "旧播放接口返回错误 {}：{}",
+            number(response.get("code")),
+            text(response.get("message"))
+        )),
+        Err(error) => errors.push(format!("旧播放请求失败：{error}")),
+    }
+
+    Err(format!("无法获取播放地址：{}", errors.join("；")))
+}
+
+fn first_durl(response: &Value) -> Option<String> {
+    response
+        .get("data")
+        .and_then(|data| data.get("durl"))
+        .and_then(Value::as_array)
+        .and_then(|durl| durl.first())
+        .map(|durl| text(durl.get("url")))
+        .filter(|url| !url.is_empty())
+}
