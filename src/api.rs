@@ -3,7 +3,7 @@ use gpui::RenderImage;
 use image::Frame;
 use md5::{Digest, Md5};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::{
@@ -54,6 +54,14 @@ fn text(value: Option<&Value>) -> String {
         Some(Value::String(value)) => value.clone(),
         Some(value) => value.to_string().trim_matches('"').to_string(),
         None => String::new(),
+    }
+}
+
+fn with_cookie(request: RequestBuilder, cookie: Option<&str>) -> RequestBuilder {
+    if let Some(cookie) = cookie.filter(|cookie| !cookie.is_empty()) {
+        request.header("Cookie", cookie)
+    } else {
+        request
     }
 }
 
@@ -454,7 +462,7 @@ pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> 
     }
 }
 
-pub(crate) fn resolve_play_url(video: &Video) -> Result<String, String> {
+pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<String, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(3))
@@ -464,17 +472,20 @@ pub(crate) fn resolve_play_url(video: &Video) -> Result<String, String> {
 
     let mut cid = video.cid;
     if cid == 0 {
-        let detail: Value = client
-            .get("https://api.bilibili.com/x/web-interface/view")
-            .header(
-                "Referer",
-                format!("https://www.bilibili.com/video/{}", video.bvid),
-            )
-            .query(&[("bvid", video.bvid.as_str())])
-            .send()
-            .map_err(|error| format!("获取视频详情失败：{error}"))?
-            .json()
-            .map_err(|error| format!("解析视频详情失败：{error}"))?;
+        let detail: Value = with_cookie(
+            client
+                .get("https://api.bilibili.com/x/web-interface/view")
+                .header(
+                    "Referer",
+                    format!("https://www.bilibili.com/video/{}", video.bvid),
+                )
+                .query(&[("bvid", video.bvid.as_str())]),
+            cookie,
+        )
+        .send()
+        .map_err(|error| format!("获取视频详情失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析视频详情失败：{error}"))?;
         if number(detail.get("code")) != 0 {
             return Err(format!(
                 "视频详情接口返回错误 {}：{}",
@@ -503,10 +514,12 @@ pub(crate) fn resolve_play_url(video: &Video) -> Result<String, String> {
     let mut errors = Vec::new();
 
     // WBI 是当前接口，但接口策略会变化，所以失败时继续尝试旧接口。
-    match client
-        .get("https://api.bilibili.com/x/web-interface/nav")
-        .send()
-        .and_then(|response| response.json::<Value>())
+    match with_cookie(
+        client.get("https://api.bilibili.com/x/web-interface/nav"),
+        cookie,
+    )
+    .send()
+    .and_then(|response| response.json::<Value>())
     {
         Ok(nav) => {
             if let Some(wbi_img) = nav.get("data").and_then(|data| data.get("wbi_img")) {
@@ -527,12 +540,15 @@ pub(crate) fn resolve_play_url(video: &Video) -> Result<String, String> {
                     .unwrap_or("")
                     .to_string();
                 if !img_key.is_empty() && !sub_key.is_empty() {
-                    match client
-                        .get("https://api.bilibili.com/x/player/wbi/playurl")
-                        .header("Referer", &referer)
-                        .query(&wbi_sign(&params, &img_key, &sub_key))
-                        .send()
-                        .and_then(|response| response.json::<Value>())
+                    match with_cookie(
+                        client
+                            .get("https://api.bilibili.com/x/player/wbi/playurl")
+                            .header("Referer", &referer)
+                            .query(&wbi_sign(&params, &img_key, &sub_key)),
+                        cookie,
+                    )
+                    .send()
+                    .and_then(|response| response.json::<Value>())
                     {
                         Ok(response) if number(response.get("code")) == 0 => {
                             if let Some(url) = first_durl(&response) {
@@ -558,12 +574,15 @@ pub(crate) fn resolve_play_url(video: &Video) -> Result<String, String> {
     }
 
     // 部分视频或未登录请求会拒绝 WBI 播放接口，旧接口仍可返回 MP4。
-    match client
-        .get("https://api.bilibili.com/x/player/playurl")
-        .header("Referer", &referer)
-        .query(&params)
-        .send()
-        .and_then(|response| response.json::<Value>())
+    match with_cookie(
+        client
+            .get("https://api.bilibili.com/x/player/playurl")
+            .header("Referer", &referer)
+            .query(&params),
+        cookie,
+    )
+    .send()
+    .and_then(|response| response.json::<Value>())
     {
         Ok(response) if number(response.get("code")) == 0 => {
             if let Some(url) = first_durl(&response) {

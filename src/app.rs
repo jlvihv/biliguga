@@ -2,17 +2,19 @@ use crate::{
     api::{
         download_cover, fetch_recommendations, fetch_search_results, format_time, resolve_play_url,
     },
+    login::{self, PollResult, UserSession},
     model::{LOADING_VIDEO, Video},
     mpv,
     search_input::{SearchInput, bind_search_keys},
 };
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DispatchPhase, Entity, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, SharedString, Timer, Window, WindowBounds,
-    WindowOptions, canvas, div, img, prelude::*, px, relative, rgb, size, uniform_list,
+    MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage, SharedString, Timer, Window,
+    WindowBounds, WindowOptions, canvas, div, img, prelude::*, px, relative, rgb, size,
+    uniform_list,
 };
 use reqwest::blocking::Client;
-use std::{ops::Range, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 struct BiliGuga {
     search_input: Entity<SearchInput>,
@@ -22,6 +24,12 @@ struct BiliGuga {
     search_results: Vec<Video>,
     selected: usize,
     loading: bool,
+    session: Option<UserSession>,
+    login_image: Option<Arc<RenderImage>>,
+    login_key: Option<String>,
+    login_loading: bool,
+    login_status: SharedString,
+    login_generation: u64,
     playback: PlaybackState,
     playback_request: u64,
     volume: f64,
@@ -36,6 +44,7 @@ struct BiliGuga {
 enum AppTab {
     Home,
     Search,
+    Login,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +57,11 @@ enum PlaybackState {
 
 impl BiliGuga {
     fn new(cx: &mut Context<Self>) -> Self {
+        let session = login::load_session();
+        let login_status = session
+            .as_ref()
+            .map(|session| format!("已登录：{}", session.username))
+            .unwrap_or_else(|| "使用哔哩哔哩 App 扫码登录".into());
         Self {
             search_input: cx.new(SearchInput::new),
             search_query: String::new(),
@@ -56,6 +70,12 @@ impl BiliGuga {
             search_results: Vec::new(),
             selected: 0,
             loading: true,
+            session,
+            login_image: None,
+            login_key: None,
+            login_loading: false,
+            login_status: SharedString::from(login_status),
+            login_generation: 0,
             playback: PlaybackState::Idle,
             playback_request: 0,
             volume: 100.,
@@ -71,6 +91,7 @@ impl BiliGuga {
         match self.active_tab {
             AppTab::Home => &self.videos,
             AppTab::Search => &self.search_results,
+            AppTab::Login => &self.videos,
         }
     }
 
@@ -78,6 +99,7 @@ impl BiliGuga {
         match self.active_tab {
             AppTab::Home => &mut self.videos,
             AppTab::Search => &mut self.search_results,
+            AppTab::Login => &mut self.videos,
         }
     }
 
@@ -110,6 +132,151 @@ impl BiliGuga {
             };
             cx.notify();
         }
+    }
+
+    fn show_login(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab != AppTab::Login {
+            self.active_tab = AppTab::Login;
+            self.stop_current_playback();
+            self.message = SharedString::from("登录账号后可使用更多 B 站功能");
+            cx.notify();
+        }
+        if self.session.is_none() && self.login_image.is_none() && !self.login_loading {
+            self.start_login(cx);
+        }
+    }
+
+    fn start_login(&mut self, cx: &mut Context<Self>) {
+        if self.login_loading {
+            return;
+        }
+        self.login_generation = self.login_generation.wrapping_add(1);
+        let generation = self.login_generation;
+        self.login_loading = true;
+        self.login_image = None;
+        self.login_key = None;
+        self.login_status = SharedString::from("正在获取登录二维码…");
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let qr = cx.background_spawn(async { login::fetch_qr_code() }).await;
+            let qr = match qr {
+                Ok(qr) => qr,
+                Err(error) => {
+                    view.update(cx, |app, cx| {
+                        if app.login_generation == generation {
+                            app.login_loading = false;
+                            app.login_status = SharedString::from(format!("登录失败：{error}"));
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let key = qr.key.clone();
+            let active = view
+                .update(cx, |app, cx| {
+                    if app.login_generation != generation {
+                        return false;
+                    }
+                    app.login_image = Some(qr.image);
+                    app.login_key = Some(key.clone());
+                    app.login_status = SharedString::from("请使用哔哩哔哩 App 扫码");
+                    cx.notify();
+                    true
+                })
+                .ok()
+                .unwrap_or(false);
+            if !active {
+                return;
+            }
+
+            loop {
+                Timer::after(Duration::from_secs(2)).await;
+                let active = view
+                    .update(cx, |app, _| app.login_generation == generation)
+                    .ok()
+                    .unwrap_or(false);
+                if !active {
+                    return;
+                }
+                let poll_key = key.clone();
+                let result = cx
+                    .background_spawn(async move { login::poll_qr_code(&poll_key) })
+                    .await;
+                match result {
+                    Ok(PollResult::Waiting) => {}
+                    Ok(PollResult::Scanned) => {
+                        view.update(cx, |app, cx| {
+                            if app.login_generation == generation {
+                                app.login_status = SharedString::from("已扫码，请在手机上确认登录");
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                    Ok(PollResult::Expired) => {
+                        view.update(cx, |app, cx| {
+                            if app.login_generation == generation {
+                                app.login_loading = false;
+                                app.login_status = SharedString::from("二维码已过期，请点击刷新");
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
+                    Ok(PollResult::LoggedIn(session)) => {
+                        let save_error = login::save_session(&session).err();
+                        view.update(cx, |app, cx| {
+                            if app.login_generation == generation {
+                                app.session = Some(session.clone());
+                                app.login_loading = false;
+                                app.login_image = None;
+                                app.login_key = None;
+                                app.login_status =
+                                    SharedString::from(if let Some(error) = save_error {
+                                        format!("登录成功，但保存登录状态失败：{error}")
+                                    } else {
+                                        format!("登录成功：{}", session.username)
+                                    });
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
+                    Err(error) => {
+                        view.update(cx, |app, cx| {
+                            if app.login_generation == generation {
+                                app.login_status =
+                                    SharedString::from(format!("等待登录确认（{error}）"));
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn refresh_login(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.login_loading {
+            return;
+        }
+        self.start_login(cx);
+    }
+
+    fn logout(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        login::clear_session();
+        self.session = None;
+        self.login_image = None;
+        self.login_key = None;
+        self.login_status = SharedString::from("已退出登录");
+        cx.notify();
     }
 
     fn start_cover_loading(&self, cx: &mut Context<Self>) {
@@ -297,11 +464,12 @@ impl BiliGuga {
         self.message = SharedString::from("正在向 B 站获取播放地址…");
         cx.notify();
         let video_bvid = video.bvid.clone();
+        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
         self.playback_request = self.playback_request.wrapping_add(1);
         let playback_request = self.playback_request;
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { resolve_play_url(&video) })
+                .background_spawn(async move { resolve_play_url(&video, cookie.as_deref()) })
                 .await;
             let message = match result {
                 Ok(url) => {
@@ -429,6 +597,16 @@ impl BiliGuga {
                 self.active_tab == AppTab::Search,
                 cx.listener(Self::show_search),
             ))
+            .child(clickable_sidebar_item(
+                "◉",
+                if self.session.is_some() {
+                    "账号"
+                } else {
+                    "登录"
+                },
+                self.active_tab == AppTab::Login,
+                cx.listener(Self::show_login),
+            ))
     }
 
     fn render_video_card(
@@ -480,7 +658,93 @@ impl BiliGuga {
             })
     }
 
-    fn render_feed(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_login(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut panel = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .text_center();
+        if let Some(image) = &self.login_image {
+            panel = panel.child(img(image.clone()).w(px(240.)).h(px(240.)));
+        } else {
+            panel = panel.child(div().text_sm().text_color(rgb(0xa9afbc)).child(
+                if self.login_loading {
+                    "正在准备登录…"
+                } else {
+                    "点击刷新获取二维码"
+                },
+            ));
+        }
+        panel = panel.child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xa9afbc))
+                .child(self.login_status.clone()),
+        );
+
+        if let Some(session) = &self.session {
+            panel = panel
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x878a98))
+                        .child(format!("{} · UID {}", session.username, session.mid)),
+                )
+                .child(
+                    div()
+                        .id("logout")
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(0xd07277))
+                        .bg(rgb(0x363c46))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x454a56)))
+                        .child("退出登录")
+                        .on_click(cx.listener(Self::logout)),
+                );
+        } else if !self.login_loading {
+            panel = panel.child(
+                div()
+                    .id("refresh-login")
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0x74ade8))
+                    .bg(rgb(0x363c46))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x454a56)))
+                    .child("刷新二维码")
+                    .on_click(cx.listener(Self::refresh_login)),
+            );
+        }
+
+        div()
+            .w(px(414.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x2f343e))
+            .child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_2()
+                    .text_xl()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xdce0e5))
+                    .child("登录"),
+            )
+            .child(panel)
+    }
+
+    fn render_feed(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.active_tab == AppTab::Login {
+            return self.render_login(cx);
+        }
         let is_search = self.active_tab == AppTab::Search;
         let search_input = self.search_input.clone();
         let mut feed = div().id("feed-scroll").flex_1().overflow_x_hidden();
