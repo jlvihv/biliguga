@@ -266,11 +266,15 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
     if bvid.is_empty() {
         return None;
     }
+    // 推荐接口使用 `id` 表示 AV 号，详情/其它接口通常使用 `aid`。
+    // 两者都兼容，否则推荐流中的视频无法上报观看记录和续播进度。
+    let aid = number(item.get("aid"));
+    let aid = if aid > 0 { aid } else { number(item.get("id")) };
     let view = number(item.get("stat").and_then(|stat| stat.get("view")));
     let danmaku = number(item.get("stat").and_then(|stat| stat.get("danmaku")));
     Some(Video {
         bvid,
-        aid: number(item.get("aid")),
+        aid,
         cid: number(item.get("cid")),
         progress: 0,
         title: text(item.get("title")),
@@ -1417,7 +1421,28 @@ pub(crate) fn fetch_comments(
 
 #[cfg(test)]
 mod tests {
-    use super::thumbnail_url;
+    use super::{parse_video, thumbnail_url};
+    use serde_json::json;
+
+    #[test]
+    fn recommendation_id_is_used_as_video_aid() {
+        let video = parse_video(
+            &json!({
+                "id": 123456,
+                "bvid": "BV1xx411c7mD",
+                "cid": 789,
+                "title": "test",
+                "pic": "//example.com/cover.jpg",
+                "duration": 60,
+                "owner": {"name": "tester"},
+                "stat": {"view": 1, "danmaku": 2}
+            }),
+            0,
+        )
+        .expect("recommendation item should parse");
+
+        assert_eq!(video.aid, 123456);
+    }
 
     #[test]
     fn bilibili_thumbnail_url_requests_small_cdn_image() {
