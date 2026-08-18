@@ -835,11 +835,12 @@ pub(crate) fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> O
     .ok()?;
     (number(response.get("code")) == 0)
         .then(|| {
+            // B 站 player 接口返回毫秒，播放器和历史上报使用秒。
             number(
                 response
                     .get("data")
                     .and_then(|data| data.get("last_play_time")),
-            )
+            ) / 1000
         })
         .filter(|progress| *progress > 0)
 }
