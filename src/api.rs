@@ -718,6 +718,60 @@ pub(crate) fn report_video_progress(
     }
 }
 
+pub(crate) fn report_video_heartbeat(
+    cookie: &str,
+    video: &Video,
+    progress: f64,
+    play_type: i64,
+) -> Result<(), String> {
+    if video.aid <= 0 || video.cid <= 0 {
+        return Err("视频缺少有效的 AV 号或 CID".into());
+    }
+    let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let progress = progress.max(0.).floor() as i64;
+    let start_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(progress as u64);
+    let response: Value = with_cookie(
+        client
+            .post("https://api.bilibili.com/x/click-interface/web/heartbeat")
+            .header(
+                "Referer",
+                format!("https://www.bilibili.com/video/{}", video.bvid),
+            ),
+        Some(cookie),
+    )
+    .form(&[
+        ("aid", video.aid.to_string()),
+        ("bvid", video.bvid.clone()),
+        ("cid", video.cid.to_string()),
+        ("played_time", progress.to_string()),
+        ("realtime", progress.to_string()),
+        ("start_ts", start_ts.to_string()),
+        ("type", "3".to_string()),
+        ("dt", "2".to_string()),
+        ("play_type", play_type.to_string()),
+        ("csrf", csrf),
+    ])
+    .send()
+    .map_err(|error| format!("上报播放心跳失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析播放心跳响应失败：{error}"))?;
+    if number(response.get("code")) == 0 {
+        Ok(())
+    } else {
+        Err(api_error(&response, "播放心跳上报"))
+    }
+}
+
 pub(crate) fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> Option<i64> {
     if video.aid <= 0 || video.cid <= 0 || cookie.is_none() {
         return None;

@@ -3,7 +3,7 @@ use crate::{
         add_to_favorites, add_to_watch_later, coin_video, download_avatar, fetch_comments,
         fetch_dynamic_feed, fetch_favorites, fetch_history, fetch_last_play_progress,
         fetch_recommendations, fetch_search_results, fetch_watch_later, format_time, like_video,
-        queue_cover_download, report_video_progress, resolve_play_url,
+        queue_cover_download, report_video_heartbeat, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
     model::{Comment, LOADING_VIDEO, Video},
@@ -361,7 +361,7 @@ impl BiliGuga {
         }
     }
 
-    fn queue_history_report(&mut self, cx: &mut Context<Self>) {
+    fn queue_history_report(&mut self, cx: &mut Context<Self>, play_type: i64) {
         if self.history_report_in_flight || self.session.is_none() {
             return;
         }
@@ -380,13 +380,24 @@ impl BiliGuga {
         let progress = status.time_pos.max(0.);
         let aid = video.aid;
         let cid = video.cid;
+        let heartbeat_video = video.clone();
         cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move { report_video_progress(&cookie, aid, cid, progress) })
+            let (heartbeat_result, progress_result) = cx
+                .background_spawn(async move {
+                    let heartbeat =
+                        report_video_heartbeat(&cookie, &heartbeat_video, progress, play_type);
+                    let progress_result = report_video_progress(&cookie, aid, cid, progress);
+                    (heartbeat, progress_result)
+                })
                 .await;
             view.update(cx, |app, _| {
                 app.history_report_in_flight = false;
-                if let Err(error) = result {
+                if let Err(error) = heartbeat_result {
+                    if std::env::var_os("BILIGUGA_API_DEBUG").is_some() {
+                        eprintln!("[biliguga-history] {error}");
+                    }
+                }
+                if let Err(error) = progress_result {
                     if std::env::var_os("BILIGUGA_API_DEBUG").is_some() {
                         eprintln!("[biliguga-history] {error}");
                     }
@@ -398,7 +409,7 @@ impl BiliGuga {
     }
 
     fn stop_current_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.queue_history_report(cx);
+        self.queue_history_report(cx, 2);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.selected = 0;
@@ -1429,7 +1440,7 @@ impl BiliGuga {
         self.search_results.clear();
         self.reset_cover_loading();
         self.selected = 0;
-        self.queue_history_report(cx);
+        self.queue_history_report(cx, 2);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
@@ -1475,7 +1486,7 @@ impl BiliGuga {
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.reset(cx));
         self.reset_cover_loading();
-        self.queue_history_report(cx);
+        self.queue_history_report(cx, 2);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
@@ -1514,7 +1525,7 @@ impl BiliGuga {
             return;
         }
         self.debug_memory("before-video-switch");
-        self.queue_history_report(cx);
+        self.queue_history_report(cx, 2);
         self.selected = index;
         self.pin_playing_video(&video);
         let frames = self.player.stop_playback();
@@ -1618,7 +1629,7 @@ impl BiliGuga {
     fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         match self.playback {
             PlaybackState::Playing => {
-                self.queue_history_report(cx);
+                self.queue_history_report(cx, 2);
                 self.player.set_pause(true);
                 self.playback = PlaybackState::Paused;
                 self.message = SharedString::from("已暂停");
@@ -2731,7 +2742,7 @@ pub(crate) fn launch() {
                                 if app.playback == PlaybackState::Playing
                                     && app.history_report_at.elapsed() >= Duration::from_secs(15)
                                 {
-                                    app.queue_history_report(cx);
+                                    app.queue_history_report(cx, 0);
                                 }
                             }
                             let expired_frames = app.player.take_expired_frames();
