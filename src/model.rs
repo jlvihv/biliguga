@@ -16,17 +16,6 @@ pub(crate) struct Video {
     pub(crate) category: String,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DynamicPost {
-    pub(crate) id: String,
-    pub(crate) author: String,
-    pub(crate) pub_time: String,
-    pub(crate) text: String,
-    pub(crate) kind: String,
-    pub(crate) video: Option<Video>,
-    pub(crate) video_index: Option<usize>,
-}
-
 pub(crate) static LOADING_VIDEO: Video = Video {
     bvid: String::new(),
     aid: 0,

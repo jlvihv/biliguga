@@ -5,7 +5,7 @@ use crate::{
         fetch_watch_later, format_time, like_video, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
-    model::{DynamicPost, LOADING_VIDEO, Video},
+    model::{LOADING_VIDEO, Video},
     mpv,
     search_input::{SearchInput, bind_search_keys},
 };
@@ -27,7 +27,6 @@ struct BiliGuga {
     history: Vec<Video>,
     watch_later: Vec<Video>,
     favorites: Vec<Video>,
-    dynamic_items: Vec<DynamicPost>,
     dynamic_videos: Vec<Video>,
     selected: usize,
     loading: bool,
@@ -35,8 +34,6 @@ struct BiliGuga {
     watch_later_loading: bool,
     favorites_loading: bool,
     dynamic_loading: bool,
-    dynamic_offset: String,
-    dynamic_has_more: bool,
     session: Option<UserSession>,
     account_avatar: Option<Arc<RenderImage>>,
     login_image: Option<Arc<RenderImage>>,
@@ -89,7 +86,6 @@ impl BiliGuga {
             history: Vec::new(),
             watch_later: Vec::new(),
             favorites: Vec::new(),
-            dynamic_items: Vec::new(),
             dynamic_videos: Vec::new(),
             selected: 0,
             loading: true,
@@ -97,8 +93,6 @@ impl BiliGuga {
             watch_later_loading: false,
             favorites_loading: false,
             dynamic_loading: false,
-            dynamic_offset: String::new(),
-            dynamic_has_more: true,
             session,
             account_avatar: None,
             login_image: None,
@@ -180,10 +174,11 @@ impl BiliGuga {
             cx.notify();
             return;
         }
-        if self.dynamic_items.is_empty() && !self.dynamic_loading {
+        if self.dynamic_videos.is_empty() && !self.dynamic_loading {
             self.load_dynamic(cx, true);
         } else {
-            self.message = SharedString::from(format!("动态 · {} 条", self.dynamic_items.len()));
+            self.message =
+                SharedString::from(format!("动态 · {} 个视频", self.dynamic_videos.len()));
             cx.notify();
         }
     }
@@ -194,14 +189,11 @@ impl BiliGuga {
             cx.notify();
             return;
         };
-        if self.dynamic_loading || (!reset && !self.dynamic_has_more) {
+        if self.dynamic_loading {
             return;
         }
         if reset {
-            self.dynamic_items.clear();
             self.dynamic_videos.clear();
-            self.dynamic_offset.clear();
-            self.dynamic_has_more = true;
             self.selected = 0;
         }
         self.dynamic_loading = true;
@@ -211,32 +203,20 @@ impl BiliGuga {
             SharedString::from("正在加载更多动态…")
         };
         let cookie = session.cookie.clone();
-        let offset = if reset {
-            String::new()
-        } else {
-            self.dynamic_offset.clone()
-        };
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_dynamic_feed(&cookie, &offset) })
+                .background_spawn(async move { fetch_dynamic_feed(&cookie) })
                 .await;
             view.update(cx, |app, cx| {
                 app.dynamic_loading = false;
                 match result {
-                    Ok(page) => {
-                        let mut items = page.items;
-                        for item in &mut items {
-                            if let Some(video) = item.video.clone() {
-                                item.video_index = Some(app.dynamic_videos.len());
-                                app.dynamic_videos.push(video);
-                            }
-                        }
-                        app.dynamic_items.extend(items);
-                        app.dynamic_offset = page.offset;
-                        app.dynamic_has_more = page.has_more;
-                        app.message =
-                            SharedString::from(format!("动态 · {} 条", app.dynamic_items.len()));
+                    Ok(videos) => {
+                        app.dynamic_videos = videos;
+                        app.message = SharedString::from(format!(
+                            "动态 · {} 个视频",
+                            app.dynamic_videos.len()
+                        ));
                         if app.active_tab == AppTab::Dynamic {
                             app.start_cover_loading(cx);
                         }
@@ -254,10 +234,6 @@ impl BiliGuga {
 
     fn refresh_dynamic(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.load_dynamic(cx, true);
-    }
-
-    fn load_more_dynamic(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.load_dynamic(cx, false);
     }
 
     fn show_history(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -620,7 +596,6 @@ impl BiliGuga {
         self.history.clear();
         self.watch_later.clear();
         self.favorites.clear();
-        self.dynamic_items.clear();
         self.dynamic_videos.clear();
         self.login_image = None;
         self.login_key = None;
@@ -956,16 +931,6 @@ impl BiliGuga {
         self.begin_play_selected(cx);
     }
 
-    fn select_dynamic_video(
-        &mut self,
-        video_index: usize,
-        event: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_video(video_index, event, window, cx);
-    }
-
     fn play_selected(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.playback == PlaybackState::Paused {
             self.player.set_pause(false);
@@ -1252,201 +1217,6 @@ impl BiliGuga {
             })
     }
 
-    fn render_dynamic_card(
-        index: usize,
-        post: DynamicPost,
-        entity: Entity<BiliGuga>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let post_id = post.id.clone();
-        let video_index = post.video_index;
-        let video = post.video.clone();
-        let mut card = div()
-            .id(SharedString::from(format!("dynamic-card-{post_id}")))
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_3()
-            .py_2()
-            .bg(rgb(0x323842))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_xs()
-                    .text_color(rgb(0xa9afbc))
-                    .child(format!("{}  ·  {}", post.author, post.pub_time))
-                    .child(post.kind.clone()),
-            );
-        if !post.text.is_empty() {
-            card = card.child(
-                div()
-                    .w_full()
-                    .text_sm()
-                    .text_color(rgb(0xdce0e5))
-                    .text_ellipsis()
-                    .child(post.text.clone()),
-            );
-        }
-        if let (Some(video), Some(video_index)) = (video, video_index) {
-            let click_entity = entity;
-            card = card.child(
-                div()
-                    .id(SharedString::from(format!("dynamic-video-{index}")))
-                    .w_full()
-                    .h(px(76.))
-                    .flex()
-                    .gap_2()
-                    .cursor_pointer()
-                    .bg(rgb(0x3b414d))
-                    .hover(|style| style.bg(rgb(0x454a56)))
-                    .child(thumbnail(&video, 126., 76.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xdce0e5))
-                                    .text_ellipsis()
-                                    .child(video.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x878a98))
-                                    .child(format!("{}  ·  {}", video.stats, video.duration)),
-                            ),
-                    )
-                    .on_click(move |event, window, cx| {
-                        click_entity.update(cx, |this, cx| {
-                            this.select_dynamic_video(video_index, event, window, cx);
-                        });
-                    }),
-            );
-        }
-        card
-    }
-
-    fn render_dynamic_feed(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut feed = div()
-            .id("dynamic-feed-scroll")
-            .w_full()
-            .flex_1()
-            .overflow_x_hidden();
-        if self.dynamic_loading && self.dynamic_items.is_empty() {
-            feed = feed.child(
-                div()
-                    .w_full()
-                    .py_8()
-                    .text_center()
-                    .text_sm()
-                    .text_color(rgb(0xa9afbc))
-                    .child("正在加载动态…"),
-            );
-        } else if self.dynamic_items.is_empty() {
-            feed = feed.child(
-                div()
-                    .w_full()
-                    .py_8()
-                    .text_center()
-                    .text_sm()
-                    .text_color(rgb(0xd07277))
-                    .child(if self.session.is_some() {
-                        "暂时没有动态"
-                    } else {
-                        "请先登录后查看动态"
-                    }),
-            );
-        } else {
-            let entity = cx.entity();
-            let count = self.dynamic_items.len() + 1;
-            let list = uniform_list(
-                "dynamic-list",
-                count,
-                cx.processor(move |this, range: Range<usize>, _window, _cx| {
-                    range
-                        .filter_map(|index| {
-                            if index == this.dynamic_items.len() {
-                                let mut footer = div()
-                                    .id("dynamic-footer")
-                                    .w_full()
-                                    .h(px(44.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_xs()
-                                    .text_color(rgb(0x878a98));
-                                if this.dynamic_loading {
-                                    footer = footer.child("正在加载更多…");
-                                } else if this.dynamic_has_more {
-                                    let footer_entity = entity.clone();
-                                    footer = footer
-                                        .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(0x74ade8)))
-                                        .child("加载更多")
-                                        .on_click(move |event, window, cx| {
-                                            footer_entity.update(cx, |this, cx| {
-                                                this.load_more_dynamic(event, window, cx);
-                                            });
-                                        });
-                                } else {
-                                    footer = footer.child("没有更多动态");
-                                }
-                                return Some(footer);
-                            }
-                            let post = this.dynamic_items.get(index)?.clone();
-                            Some(BiliGuga::render_dynamic_card(index, post, entity.clone()))
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
-            .size_full();
-            feed = feed.child(list);
-        }
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xdce0e5))
-                    .child("动态"),
-            )
-            .child(
-                div()
-                    .id("refresh-dynamic")
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(0x74ade8))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x363c46)))
-                    .child("刷新")
-                    .on_click(cx.listener(Self::refresh_dynamic)),
-            );
-        div()
-            .w(px(414.))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x2f343e))
-            .child(header)
-            .child(feed)
-    }
-
     fn render_login(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut panel = div()
             .flex_1()
@@ -1563,14 +1333,14 @@ impl BiliGuga {
         if self.active_tab == AppTab::Login {
             return self.render_login(cx);
         }
-        if self.active_tab == AppTab::Dynamic {
-            return self.render_dynamic_feed(cx);
-        }
         let is_search = self.active_tab == AppTab::Search;
+        let is_dynamic = self.active_tab == AppTab::Dynamic;
         let is_watch_later = self.active_tab == AppTab::WatchLater;
         let is_favorites = self.active_tab == AppTab::Favorites;
         let is_history = self.active_tab == AppTab::History;
-        let is_loading = if is_watch_later {
+        let is_loading = if is_dynamic {
+            self.dynamic_loading
+        } else if is_watch_later {
             self.watch_later_loading
         } else if is_favorites {
             self.favorites_loading
@@ -1595,6 +1365,8 @@ impl BiliGuga {
                     .text_color(rgb(0xa9afbc))
                     .child(if is_search {
                         "正在搜索 B 站视频…"
+                    } else if is_dynamic {
+                        "正在加载动态视频…"
                     } else if is_watch_later {
                         "正在加载稍后再看…"
                     } else if is_favorites {
@@ -1615,6 +1387,12 @@ impl BiliGuga {
                     .text_color(rgb(0xd07277))
                     .child(if is_search {
                         "没有找到视频，请换个关键词试试"
+                    } else if is_dynamic {
+                        if self.session.is_some() {
+                            "暂时没有关注中的视频动态"
+                        } else {
+                            "请先登录后查看动态"
+                        }
                     } else if is_watch_later {
                         if self.session.is_some() {
                             "还没有稍后再看"
@@ -1673,6 +1451,8 @@ impl BiliGuga {
                     .text_color(rgb(0xdce0e5))
                     .child(if is_search {
                         "搜索"
+                    } else if is_dynamic {
+                        "动态"
                     } else if is_watch_later {
                         "稍后再看"
                     } else if is_favorites {
@@ -1695,7 +1475,9 @@ impl BiliGuga {
                     .hover(|style| style.bg(rgb(0x363c46)))
                     .child("刷新")
                     .on_click(cx.listener(move |app, event, window, cx| {
-                        if is_watch_later {
+                        if is_dynamic {
+                            app.refresh_dynamic(event, window, cx);
+                        } else if is_watch_later {
                             app.refresh_watch_later(event, window, cx);
                         } else if is_favorites {
                             app.refresh_favorites(event, window, cx);
