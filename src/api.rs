@@ -1,4 +1,4 @@
-use crate::model::Video;
+use crate::model::{Comment, CommentPage, Video};
 use futures::channel::oneshot;
 use gpui::RenderImage;
 use image::Frame;
@@ -8,7 +8,7 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1083,6 +1083,123 @@ pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
     } else {
         Err(api_error(&response, "投币"))
     }
+}
+
+fn format_comment_time(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "未知时间".into();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let elapsed = now.saturating_sub(timestamp as u64);
+    if elapsed < 60 {
+        "刚刚".into()
+    } else if elapsed < 3600 {
+        format!("{}分钟前", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}小时前", elapsed / 3600)
+    } else if elapsed < 2_592_000 {
+        format!("{}天前", elapsed / 86_400)
+    } else {
+        format!(
+            "{}年{}月",
+            (timestamp / 31_536_000) + 1970,
+            (timestamp / 2_592_000) % 12 + 1
+        )
+    }
+}
+
+fn parse_comment(item: &Value) -> Option<Comment> {
+    let rpid = number(item.get("rpid"));
+    if rpid <= 0 {
+        return None;
+    }
+    let message = clean_search_text(text(
+        item.get("content")
+            .and_then(|content| content.get("message")),
+    ));
+    if message.trim().is_empty() {
+        return None;
+    }
+    Some(Comment {
+        rpid,
+        username: text(item.get("member").and_then(|member| member.get("uname"))),
+        message,
+        like: number(item.get("like")),
+        time: format_comment_time(number(item.get("ctime"))),
+    })
+}
+
+pub(crate) fn fetch_comments(
+    video: &Video,
+    cookie: Option<&str>,
+    page: u32,
+) -> Result<CommentPage, String> {
+    if video.aid <= 0 {
+        return Err("视频缺少 AV 号，无法获取评论".into());
+    }
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/v2/reply")
+            .header(
+                "Referer",
+                format!("https://www.bilibili.com/video/{}", video.bvid),
+            )
+            .query(&[
+                ("oid", video.aid.to_string()),
+                ("type", "1".into()),
+                ("pn", page.max(1).to_string()),
+                ("ps", "20".into()),
+                ("sort", "1".into()),
+                ("web_location", "1315875".into()),
+            ]),
+        cookie,
+    )
+    .send()
+    .map_err(|error| format!("获取评论失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析评论失败：{error}"))?;
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "获取评论"));
+    }
+
+    let data = response.get("data").unwrap_or(&Value::Null);
+    let mut comments = Vec::new();
+    let mut seen = HashSet::new();
+    for key in ["hots", "replies"] {
+        if let Some(items) = data.get(key).and_then(Value::as_array) {
+            for item in items {
+                if let Some(comment) = parse_comment(item)
+                    && seen.insert(comment.rpid)
+                {
+                    comments.push(comment);
+                }
+            }
+        }
+    }
+
+    let page_info = data.get("page").unwrap_or(&Value::Null);
+    let total = number(page_info.get("acount")).max(number(page_info.get("count")));
+    let page_size = number(page_info.get("size")).max(20);
+    let loaded = page as i64 * page_size;
+    let has_more = if total > 0 {
+        loaded < total
+    } else {
+        comments.len() >= 20
+    };
+    Ok(CommentPage {
+        comments,
+        total,
+        has_more,
+    })
 }
 
 #[cfg(test)]

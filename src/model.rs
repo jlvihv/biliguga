@@ -16,6 +16,22 @@ pub(crate) struct Video {
     pub(crate) category: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Comment {
+    pub(crate) rpid: i64,
+    pub(crate) username: String,
+    pub(crate) message: String,
+    pub(crate) like: i64,
+    pub(crate) time: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CommentPage {
+    pub(crate) comments: Vec<Comment>,
+    pub(crate) total: i64,
+    pub(crate) has_more: bool,
+}
+
 pub(crate) static LOADING_VIDEO: Video = Video {
     bvid: String::new(),
     aid: 0,

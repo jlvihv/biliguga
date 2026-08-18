@@ -1,11 +1,12 @@
 use crate::{
     api::{
-        add_to_favorites, add_to_watch_later, coin_video, download_avatar, fetch_dynamic_feed,
-        fetch_favorites, fetch_history, fetch_recommendations, fetch_search_results,
-        fetch_watch_later, format_time, like_video, queue_cover_download, resolve_play_url,
+        add_to_favorites, add_to_watch_later, coin_video, download_avatar, fetch_comments,
+        fetch_dynamic_feed, fetch_favorites, fetch_history, fetch_recommendations,
+        fetch_search_results, fetch_watch_later, format_time, like_video, queue_cover_download,
+        resolve_play_url,
     },
     login::{self, PollResult, UserSession},
-    model::{LOADING_VIDEO, Video},
+    model::{Comment, LOADING_VIDEO, Video},
     mpv,
     search_input::{SearchInput, bind_search_keys},
 };
@@ -63,6 +64,14 @@ struct BiliGuga {
     speed: f64,
     controls_visible: bool,
     controls_generation: u64,
+    comments: Vec<Comment>,
+    comments_for: String,
+    comments_page: u32,
+    comments_total: i64,
+    comments_has_more: bool,
+    comments_loading: bool,
+    comments_generation: u64,
+    comments_error: Option<SharedString>,
     message: SharedString,
     player: mpv::MpvPlayer,
 }
@@ -126,6 +135,14 @@ impl BiliGuga {
             speed: 1.,
             controls_visible: false,
             controls_generation: 0,
+            comments: Vec::new(),
+            comments_for: String::new(),
+            comments_page: 0,
+            comments_total: 0,
+            comments_has_more: false,
+            comments_loading: false,
+            comments_generation: 0,
+            comments_error: None,
             message: SharedString::from("正在从 B 站加载推荐视频…"),
             player: mpv::MpvPlayer::new(),
         }
@@ -172,10 +189,106 @@ impl BiliGuga {
         }
     }
 
+    fn reset_comments(&mut self) {
+        self.comments_generation = self.comments_generation.wrapping_add(1);
+        self.comments.clear();
+        self.comments_for.clear();
+        self.comments_page = 0;
+        self.comments_total = 0;
+        self.comments_has_more = false;
+        self.comments_loading = false;
+        self.comments_error = None;
+    }
+
+    fn load_comments_for_current(&mut self, cx: &mut Context<Self>) {
+        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+            self.reset_comments();
+            return;
+        };
+        if self.comments_for != video.bvid {
+            self.comments_generation = self.comments_generation.wrapping_add(1);
+            self.comments.clear();
+            self.comments_for = video.bvid.clone();
+            self.comments_page = 0;
+            self.comments_total = 0;
+            self.comments_has_more = true;
+            self.comments_loading = false;
+            self.comments_error = None;
+        }
+        if self.comments_page == 0 && !self.comments_loading {
+            self.load_comments_page(cx, true);
+        }
+    }
+
+    fn load_comments_page(&mut self, cx: &mut Context<Self>, reset: bool) {
+        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+            return;
+        };
+        if self.comments_loading || (!reset && !self.comments_has_more) {
+            return;
+        }
+        if reset {
+            self.comments_generation = self.comments_generation.wrapping_add(1);
+            self.comments.clear();
+            self.comments_page = 0;
+            self.comments_total = 0;
+            self.comments_has_more = true;
+            self.comments_error = None;
+        }
+        let page = self.comments_page + 1;
+        self.comments_loading = true;
+        let generation = self.comments_generation;
+        let bvid = video.bvid.clone();
+        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { fetch_comments(&video, cookie.as_deref(), page) })
+                .await;
+            view.update(cx, |app, cx| {
+                if app.comments_generation != generation
+                    || app
+                        .current_videos()
+                        .get(app.selected)
+                        .map(|current| current.bvid != bvid)
+                        .unwrap_or(true)
+                {
+                    return;
+                }
+                app.comments_loading = false;
+                match result {
+                    Ok(comment_page) => {
+                        app.comments.extend(comment_page.comments);
+                        app.comments_page = page;
+                        app.comments_total = comment_page.total;
+                        app.comments_has_more = comment_page.has_more;
+                        app.comments_error = None;
+                    }
+                    Err(error) => {
+                        app.comments_has_more = false;
+                        app.comments_error = Some(SharedString::from(error));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn retry_comments(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.load_comments_page(cx, true);
+    }
+
+    fn load_more_comments(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.load_comments_page(cx, false);
+    }
+
     fn leave_current_tab(&mut self, window: &mut Window) {
         self.debug_memory("before-tab-leave");
         self.stop_current_playback(window);
         self.reset_cover_loading();
+        self.reset_comments();
         self.debug_memory("after-tab-leave");
     }
 
@@ -1184,6 +1297,7 @@ impl BiliGuga {
     }
 
     fn begin_play_selected(&mut self, cx: &mut Context<Self>) {
+        self.load_comments_for_current(cx);
         if self.playback == PlaybackState::Buffering {
             return;
         }
@@ -1772,6 +1886,140 @@ impl BiliGuga {
         root.child(feed)
     }
 
+    fn render_comments(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut section = div().w_full().px_5().pb_6().flex().flex_col().gap_2();
+        let count = if self.comments_total > 0 {
+            self.comments_total
+        } else {
+            self.comments.len() as i64
+        };
+        section = section.child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xdce0e5))
+                        .child(format!("评论 {}", count)),
+                )
+                .child(div().text_xs().text_color(rgb(0x878a98)).child(
+                    if self.comments_page > 0 {
+                        "按热度"
+                    } else {
+                        "正在准备"
+                    },
+                )),
+        );
+
+        if self.comments.is_empty() && self.comments_loading {
+            return section.child(
+                div()
+                    .py_5()
+                    .text_sm()
+                    .text_color(rgb(0x878a98))
+                    .child("正在加载评论…"),
+            );
+        }
+        if let Some(error) = &self.comments_error {
+            return section.child(
+                div()
+                    .py_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(rgb(0xd07277))
+                    .child(error.clone())
+                    .child(
+                        div()
+                            .id("comments-retry")
+                            .cursor_pointer()
+                            .text_color(rgb(0x74ade8))
+                            .child("重试")
+                            .on_click(cx.listener(Self::retry_comments)),
+                    ),
+            );
+        }
+        if self.comments.is_empty() {
+            return section.child(
+                div()
+                    .py_5()
+                    .text_sm()
+                    .text_color(rgb(0x878a98))
+                    .child("还没有评论"),
+            );
+        }
+
+        for comment in &self.comments {
+            let mut item = div()
+                .id(SharedString::from(format!("comment-{}", comment.rpid)))
+                .w_full()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_1();
+            item = item
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .child(div().text_color(rgb(0x74ade8)).child(
+                            if comment.username.is_empty() {
+                                "用户".to_string()
+                            } else {
+                                comment.username.clone()
+                            },
+                        ))
+                        .child(
+                            div()
+                                .text_color(rgb(0x878a98))
+                                .child(format!("{}  ·  {}赞", comment.time, comment.like)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_sm()
+                        .line_height(px(22.))
+                        .text_color(rgb(0xdce0e5))
+                        .child(comment.message.clone()),
+                );
+            section = section.child(item);
+        }
+
+        if self.comments_loading {
+            section = section.child(
+                div()
+                    .py_3()
+                    .text_center()
+                    .text_xs()
+                    .text_color(rgb(0x878a98))
+                    .child("正在加载更多…"),
+            );
+        } else if self.comments_has_more {
+            section = section.child(
+                div()
+                    .id("comments-load-more")
+                    .w_full()
+                    .py_2()
+                    .text_center()
+                    .text_xs()
+                    .text_color(rgb(0x74ade8))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x363c46)))
+                    .child("加载更多评论")
+                    .on_click(cx.listener(Self::load_more_comments)),
+            );
+        }
+        section
+    }
+
     fn render_player(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let video = self
             .current_videos()
@@ -1996,86 +2244,94 @@ impl BiliGuga {
             .overflow_x_hidden()
             .bg(rgb(0x3b414d))
             .child(
-                div().w_full().flex().flex_col().child(stage).child(
-                    div()
-                        .w_full()
-                        .px_5()
-                        .py_4()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w_full()
-                                .text_xl()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xdce0e5))
-                                .text_ellipsis()
-                                .child(video.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .text_sm()
-                                .text_color(rgb(0xa9afbc))
-                                .text_ellipsis()
-                                .child(format!(
-                                    "{}  ·  {}  ·  {}",
-                                    video.uploader, video.stats, video.category
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .text_sm()
-                                .text_color(rgb(0xa9afbc))
-                                .child(
-                                    div()
-                                        .id("player-like")
-                                        .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(0x74ade8)))
-                                        .child("♡ 点赞")
-                                        .on_click(cx.listener(Self::like_current_video)),
-                                )
-                                .child(
-                                    div()
-                                        .id("player-coin")
-                                        .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(0x74ade8)))
-                                        .child("◇ 投币")
-                                        .on_click(cx.listener(Self::coin_current_video)),
-                                )
-                                .child(
-                                    div()
-                                        .id("player-favorite")
-                                        .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(0x74ade8)))
-                                        .child("收藏")
-                                        .on_click(cx.listener(Self::save_current_to_favorites)),
-                                )
-                                .child(
-                                    div()
-                                        .id("player-watch-later")
-                                        .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(0x74ade8)))
-                                        .child("稍后")
-                                        .on_click(cx.listener(Self::save_current_to_watch_later)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .text_xs()
-                                .text_color(rgb(0x878a98))
-                                .text_ellipsis()
-                                .child(self.message.clone()),
-                        ),
-                ),
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(stage)
+                    .child(
+                        div()
+                            .w_full()
+                            .px_5()
+                            .py_4()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_xl()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0xdce0e5))
+                                    .text_ellipsis()
+                                    .child(video.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .text_sm()
+                                    .text_color(rgb(0xa9afbc))
+                                    .text_ellipsis()
+                                    .child(format!(
+                                        "{}  ·  {}  ·  {}",
+                                        video.uploader, video.stats, video.category
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .text_sm()
+                                    .text_color(rgb(0xa9afbc))
+                                    .child(
+                                        div()
+                                            .id("player-like")
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0x74ade8)))
+                                            .child("♡ 点赞")
+                                            .on_click(cx.listener(Self::like_current_video)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("player-coin")
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0x74ade8)))
+                                            .child("◇ 投币")
+                                            .on_click(cx.listener(Self::coin_current_video)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("player-favorite")
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0x74ade8)))
+                                            .child("收藏")
+                                            .on_click(cx.listener(Self::save_current_to_favorites)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("player-watch-later")
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0x74ade8)))
+                                            .child("稍后")
+                                            .on_click(
+                                                cx.listener(Self::save_current_to_watch_later),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_xs()
+                                    .text_color(rgb(0x878a98))
+                                    .text_ellipsis()
+                                    .child(self.message.clone()),
+                            ),
+                    )
+                    .child(self.render_comments(cx)),
             )
     }
 }
