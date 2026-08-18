@@ -1,8 +1,8 @@
 use crate::{
     api::{
-        add_to_favorites, add_to_watch_later, download_cover, fetch_favorites, fetch_history,
-        fetch_recommendations, fetch_search_results, fetch_watch_later, format_time,
-        resolve_play_url,
+        add_to_favorites, add_to_watch_later, coin_video, download_cover, fetch_favorites,
+        fetch_history, fetch_recommendations, fetch_search_results, fetch_watch_later, format_time,
+        like_video, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
     model::{LOADING_VIDEO, Video},
@@ -604,6 +604,92 @@ impl BiliGuga {
             .ok();
         })
         .detach();
+    }
+
+    fn like_current_video(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后点赞");
+            cx.notify();
+            return;
+        };
+        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+            return;
+        };
+        if video.aid <= 0 {
+            self.message = SharedString::from("这个视频没有可用的 AV 号");
+            cx.notify();
+            return;
+        }
+        let cookie = session.cookie.clone();
+        self.message = SharedString::from("正在点赞…");
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { like_video(&cookie, video.aid) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.message = SharedString::from(match result {
+                    Ok(()) => "已点赞".to_string(),
+                    Err(error) => format!("点赞失败：{error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn coin_current_video(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后投币");
+            cx.notify();
+            return;
+        };
+        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+            return;
+        };
+        if video.aid <= 0 {
+            self.message = SharedString::from("这个视频没有可用的 AV 号");
+            cx.notify();
+            return;
+        }
+        let cookie = session.cookie.clone();
+        self.message = SharedString::from("正在投币…");
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { coin_video(&cookie, video.aid) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.message = SharedString::from(match result {
+                    Ok(()) => "已投 1 枚硬币".to_string(),
+                    Err(error) => format!("投币失败：{error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn save_current_to_watch_later(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.selected;
+        self.add_video_to_watch_later(index, event, window, cx);
+    }
+
+    fn save_current_to_favorites(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.selected;
+        self.add_video_to_favorites(index, event, window, cx);
     }
 
     fn start_cover_loading(&self, cx: &mut Context<Self>) {
@@ -1600,6 +1686,46 @@ impl BiliGuga {
                                     "{}  ·  {}  ·  {}",
                                     video.uploader, video.stats, video.category
                                 )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .text_sm()
+                                .text_color(rgb(0xa9afbc))
+                                .child(
+                                    div()
+                                        .id("player-like")
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(rgb(0x74ade8)))
+                                        .child("♡ 点赞")
+                                        .on_click(cx.listener(Self::like_current_video)),
+                                )
+                                .child(
+                                    div()
+                                        .id("player-coin")
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(rgb(0x74ade8)))
+                                        .child("◇ 投币")
+                                        .on_click(cx.listener(Self::coin_current_video)),
+                                )
+                                .child(
+                                    div()
+                                        .id("player-favorite")
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(rgb(0x74ade8)))
+                                        .child("收藏")
+                                        .on_click(cx.listener(Self::save_current_to_favorites)),
+                                )
+                                .child(
+                                    div()
+                                        .id("player-watch-later")
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(rgb(0x74ade8)))
+                                        .child("稍后")
+                                        .on_click(cx.listener(Self::save_current_to_watch_later)),
+                                ),
                         )
                         .child(
                             div()

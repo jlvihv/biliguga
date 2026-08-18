@@ -802,6 +802,65 @@ pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), S
     }
 }
 
+pub(crate) fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
+    let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .post("https://api.bilibili.com/x/web-interface/archive/like")
+            .header("Referer", "https://www.bilibili.com/"),
+        Some(cookie),
+    )
+    .form(&[
+        ("aid", aid.to_string()),
+        ("like", "1".into()),
+        ("csrf", csrf),
+    ])
+    .send()
+    .map_err(|error| format!("点赞失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析点赞响应失败：{error}"))?;
+    if number(response.get("code")) == 0 {
+        Ok(())
+    } else {
+        Err(api_error(&response, "点赞"))
+    }
+}
+
+pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
+    let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .post("https://api.bilibili.com/x/web-interface/coin/add")
+            .header("Referer", "https://www.bilibili.com/"),
+        Some(cookie),
+    )
+    .form(&[
+        ("aid", aid.to_string()),
+        ("multiply", "1".into()),
+        ("select_like", "0".into()),
+        ("csrf", csrf),
+    ])
+    .send()
+    .map_err(|error| format!("投币失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析投币响应失败：{error}"))?;
+    if number(response.get("code")) == 0 {
+        Ok(())
+    } else {
+        Err(api_error(&response, "投币"))
+    }
+}
+
 pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<String, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
