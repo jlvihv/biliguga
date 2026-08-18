@@ -72,7 +72,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          export PATH="/mingw64/bin:/usr/bin:$PATH"
+          export PATH="/c/Users/runneradmin/.cargo/bin:/mingw64/bin:/usr/bin:$PATH"
           cargo build --release --target ${{ matrix.target }}
 
       - name: Build macOS
