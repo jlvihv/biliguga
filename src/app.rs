@@ -620,6 +620,7 @@ impl BiliGuga {
         div()
             .id(SharedString::from(format!("video-card-{index}")))
             .w_full()
+            .h(px(76.))
             .flex()
             .flex_none()
             .gap_2()
@@ -747,7 +748,11 @@ impl BiliGuga {
         }
         let is_search = self.active_tab == AppTab::Search;
         let search_input = self.search_input.clone();
-        let mut feed = div().id("feed-scroll").flex_1().overflow_x_hidden();
+        let mut feed = div()
+            .id("feed-scroll")
+            .w_full()
+            .flex_1()
+            .overflow_x_hidden();
         if self.loading {
             feed = feed.child(
                 div()
@@ -795,6 +800,7 @@ impl BiliGuga {
                         .collect::<Vec<_>>()
                 }),
             )
+            .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
             .size_full();
             feed = feed.child(list);
         }
