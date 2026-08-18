@@ -2738,7 +2738,7 @@ pub(crate) fn launch() {
                                     app.speed = status.speed.max(0.1);
                                 }
                                 if app.playback == PlaybackState::Playing
-                                    && app.history_report_at.elapsed() >= Duration::from_secs(5)
+                                    && app.history_report_at.elapsed() >= Duration::from_secs(15)
                                 {
                                     app.queue_history_report(cx, 0);
                                 }
