@@ -48,6 +48,7 @@ struct BiliGuga {
     home_scroll_handle: UniformListScrollHandle,
     home_scroll_requested: bool,
     home_last_scroll_offset: Option<Pixels>,
+    home_feed_mid: Option<i64>,
     search_results: Vec<Video>,
     history: Vec<Video>,
     watch_later: Vec<Video>,
@@ -128,6 +129,7 @@ impl BiliGuga {
             home_scroll_handle: UniformListScrollHandle::new(),
             home_scroll_requested: false,
             home_last_scroll_offset: None,
+            home_feed_mid: None,
             search_results: Vec::new(),
             history: Vec::new(),
             watch_later: Vec::new(),
@@ -258,6 +260,7 @@ impl BiliGuga {
         }
         let page = self.home_page + 1;
         let generation = self.home_generation;
+        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
         self.home_loading = true;
         self.home_scroll_requested = false;
         if reset {
@@ -268,7 +271,7 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_recommendations(page) })
+                .background_spawn(async move { fetch_recommendations(page, cookie.as_deref()) })
                 .await;
             view.update(cx, |app, cx| {
                 if app.home_generation != generation || app.active_tab != AppTab::Home {
@@ -291,6 +294,7 @@ impl BiliGuga {
                             }
                         }
                         app.home_page = page;
+                        app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
                         let added = app.videos.len().saturating_sub(old_len);
                         app.home_has_more = received >= HOME_PAGE_SIZE && (reset || added > 0);
                         app.trim_home_items();
@@ -610,7 +614,12 @@ impl BiliGuga {
             self.leave_current_tab(window);
             self.active_tab = AppTab::Home;
             self.message = SharedString::from("首页推荐");
-            if self.videos.is_empty() && !self.home_loading {
+            let current_mid = self.session.as_ref().map(|session| session.mid);
+            if (!self.home_loading && self.home_feed_mid != current_mid)
+                || (self.videos.is_empty() && !self.home_loading)
+            {
+                Self::release_cover_images(&mut self.videos, window);
+                self.reset_cover_loading();
                 self.load_home_page(cx, true);
             } else {
                 self.start_cover_loading(cx);
@@ -1072,6 +1081,7 @@ impl BiliGuga {
         Self::release_image(&mut self.account_avatar, window);
         Self::release_image(&mut self.login_image, window);
         self.session = None;
+        self.home_feed_mid = None;
         self.reset_cover_loading();
         self.history.clear();
         self.watch_later.clear();
@@ -2663,9 +2673,16 @@ pub(crate) fn launch() {
             }
         })
         .detach();
+        let initial_cookie = view
+            .read(cx)
+            .session
+            .as_ref()
+            .map(|session| session.cookie.clone());
         cx.spawn(async move |cx| {
             let result = cx
-                .background_spawn(async move { fetch_recommendations(1) })
+                .background_spawn(
+                    async move { fetch_recommendations(1, initial_cookie.as_deref()) },
+                )
                 .await;
             view.update(cx, |app, cx| {
                 if app.home_generation != 0 || app.active_tab != AppTab::Home {
@@ -2679,6 +2696,7 @@ pub(crate) fn launch() {
                             SharedString::from(format!("已加载 {} 个真实视频", videos.len()));
                         app.home_page = 1;
                         app.home_has_more = videos.len() >= HOME_PAGE_SIZE;
+                        app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
                         app.videos = videos;
                         app.start_cover_loading(cx);
                     }

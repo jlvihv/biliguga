@@ -381,19 +381,24 @@ fn wbi_sign(
     signed
 }
 
-pub(crate) fn fetch_recommendations(page: usize) -> Result<Vec<Video>, String> {
+pub(crate) fn fetch_recommendations(
+    page: usize,
+    cookie: Option<&str>,
+) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
-    let nav: Value = client
-        .get("https://api.bilibili.com/x/web-interface/nav")
-        .send()
-        .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
-        .json()
-        .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
+    let nav: Value = with_cookie(
+        client.get("https://api.bilibili.com/x/web-interface/nav"),
+        cookie,
+    )
+    .send()
+    .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
     let wbi_img = nav
         .get("data")
         .and_then(|data| data.get("wbi_img"))
@@ -427,14 +432,17 @@ pub(crate) fn fetch_recommendations(page: usize) -> Result<Vec<Video>, String> {
     params.insert("homepage_ver".into(), "1".into());
     params.insert("ps".into(), "12".into());
     let signed = wbi_sign(&params, &img_key, &sub_key);
-    let response: Value = client
-        .get("https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd")
-        .header("Referer", "https://www.bilibili.com/")
-        .query(&signed)
-        .send()
-        .map_err(|error| format!("请求推荐流失败：{error}"))?
-        .json()
-        .map_err(|error| format!("解析推荐流失败：{error}"))?;
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd")
+            .header("Referer", "https://www.bilibili.com/"),
+        cookie,
+    )
+    .query(&signed)
+    .send()
+    .map_err(|error| format!("请求推荐流失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析推荐流失败：{error}"))?;
     let code = number(response.get("code"));
     if code != 0 {
         return Err(format!(
