@@ -77,6 +77,7 @@ struct BiliGuga {
     controls_visible: bool,
     controls_generation: u64,
     player_fullscreen: bool,
+    screen_fullscreen: bool,
     playing_video: Option<Video>,
     cloud_resume_progress: Option<f64>,
     cloud_resume_applied: bool,
@@ -163,6 +164,7 @@ impl BiliGuga {
             controls_visible: false,
             controls_generation: 0,
             player_fullscreen: false,
+            screen_fullscreen: false,
             playing_video: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
@@ -1672,7 +1674,18 @@ impl BiliGuga {
         cx.notify();
     }
 
-    fn toggle_player_fullscreen(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_player_fullscreen(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.screen_fullscreen {
+            self.screen_fullscreen = false;
+            window.toggle_fullscreen();
+            cx.notify();
+            return;
+        }
         self.player_fullscreen = !self.player_fullscreen;
         self.controls_visible = true;
         cx.notify();
@@ -1684,6 +1697,8 @@ impl BiliGuga {
         window: &mut Window,
         _: &mut Context<Self>,
     ) {
+        self.screen_fullscreen = !self.screen_fullscreen;
+        self.player_fullscreen = self.screen_fullscreen;
         window.toggle_fullscreen();
     }
 
@@ -2556,7 +2571,11 @@ impl BiliGuga {
                                 .py_1()
                                 .cursor_pointer()
                                 .text_xs()
-                                .child("屏幕全屏")
+                                .child(if self.screen_fullscreen {
+                                    "退出屏幕全屏"
+                                } else {
+                                    "屏幕全屏"
+                                })
                                 .on_click(cx.listener(Self::toggle_screen_fullscreen)),
                         ),
                 );
