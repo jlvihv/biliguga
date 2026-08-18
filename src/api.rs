@@ -462,6 +462,76 @@ pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> 
     }
 }
 
+fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
+    let history = item.get("history")?;
+    let bvid = text(history.get("bvid"));
+    if bvid.is_empty() {
+        return None;
+    }
+    let stat = item.get("stat");
+    let cover = {
+        let cover = text(item.get("cover"));
+        if cover.is_empty() {
+            text(item.get("pic"))
+        } else {
+            cover
+        }
+    };
+    Some(Video {
+        bvid,
+        cid: number(history.get("cid")),
+        title: clean_search_text(text(item.get("title"))),
+        uploader: text(item.get("author_name")),
+        stats: format!(
+            "{}播放  ·  {}弹幕",
+            compact_number(number(stat.and_then(|stat| stat.get("view")))),
+            compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
+        ),
+        duration: duration(item.get("duration")),
+        cover: https_url(cover),
+        cover_image: None,
+        accent: accent_for(index),
+        category: "观看历史".into(),
+    })
+}
+
+pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/web-interface/history/cursor")
+            .header("Referer", "https://www.bilibili.com/")
+            .query(&[("ps", "30"), ("max", "0"), ("view_at", "0")]),
+        Some(cookie),
+    )
+    .send()
+    .map_err(|error| format!("请求观看历史失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析观看历史失败：{error}"))?;
+    let code = number(response.get("code"));
+    if code != 0 {
+        return Err(format!(
+            "观看历史接口返回错误 {code}：{}",
+            text(response.get("message"))
+        ));
+    }
+    let items = response
+        .get("data")
+        .and_then(|data| data.get("list"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "观看历史接口没有返回列表".to_string())?;
+    Ok(items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| parse_history_video(item, index))
+        .collect())
+}
+
 pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<String, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")

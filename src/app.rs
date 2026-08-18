@@ -1,6 +1,7 @@
 use crate::{
     api::{
-        download_cover, fetch_recommendations, fetch_search_results, format_time, resolve_play_url,
+        download_cover, fetch_history, fetch_recommendations, fetch_search_results, format_time,
+        resolve_play_url,
     },
     login::{self, PollResult, UserSession},
     model::{LOADING_VIDEO, Video},
@@ -22,9 +23,12 @@ struct BiliGuga {
     active_tab: AppTab,
     videos: Vec<Video>,
     search_results: Vec<Video>,
+    history: Vec<Video>,
     selected: usize,
     loading: bool,
+    history_loading: bool,
     session: Option<UserSession>,
+    account_avatar: Option<Arc<RenderImage>>,
     login_image: Option<Arc<RenderImage>>,
     login_key: Option<String>,
     login_loading: bool,
@@ -44,6 +48,7 @@ struct BiliGuga {
 enum AppTab {
     Home,
     Search,
+    History,
     Login,
 }
 
@@ -68,9 +73,12 @@ impl BiliGuga {
             active_tab: AppTab::Home,
             videos: Vec::new(),
             search_results: Vec::new(),
+            history: Vec::new(),
             selected: 0,
             loading: true,
+            history_loading: false,
             session,
+            account_avatar: None,
             login_image: None,
             login_key: None,
             login_loading: false,
@@ -91,6 +99,7 @@ impl BiliGuga {
         match self.active_tab {
             AppTab::Home => &self.videos,
             AppTab::Search => &self.search_results,
+            AppTab::History => &self.history,
             AppTab::Login => &self.videos,
         }
     }
@@ -99,6 +108,7 @@ impl BiliGuga {
         match self.active_tab {
             AppTab::Home => &mut self.videos,
             AppTab::Search => &mut self.search_results,
+            AppTab::History => &mut self.history,
             AppTab::Login => &mut self.videos,
         }
     }
@@ -134,6 +144,66 @@ impl BiliGuga {
         }
     }
 
+    fn show_history(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.active_tab = AppTab::History;
+        self.stop_current_playback();
+        if self.session.is_none() {
+            self.message = SharedString::from("请先登录后查看观看历史");
+            cx.notify();
+            return;
+        }
+        if self.history.is_empty() && !self.history_loading {
+            self.load_history(cx);
+        } else {
+            self.message = SharedString::from(format!("观看历史 · {} 个视频", self.history.len()));
+            cx.notify();
+        }
+    }
+
+    fn load_history(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后查看观看历史");
+            cx.notify();
+            return;
+        };
+        self.history_loading = true;
+        self.history.clear();
+        self.selected = 0;
+        self.message = SharedString::from("正在加载观看历史…");
+        let cookie = session.cookie.clone();
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { fetch_history(&cookie) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.history_loading = false;
+                match result {
+                    Ok(videos) => {
+                        let count = videos.len();
+                        app.history = videos;
+                        app.message = SharedString::from(format!("观看历史 · {count} 个视频"));
+                        if app.active_tab == AppTab::History {
+                            app.start_cover_loading(cx);
+                        }
+                    }
+                    Err(error) => {
+                        app.message = SharedString::from(format!("加载观看历史失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_history(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.history_loading {
+            self.load_history(cx);
+        }
+    }
+
     fn show_login(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab != AppTab::Login {
             self.active_tab = AppTab::Login;
@@ -144,6 +214,41 @@ impl BiliGuga {
         if self.session.is_none() && self.login_image.is_none() && !self.login_loading {
             self.start_login(cx);
         }
+        if self.session.is_some() && self.account_avatar.is_none() {
+            self.start_avatar_loading(cx);
+        }
+    }
+
+    fn start_avatar_loading(&self, cx: &mut Context<Self>) {
+        let Some(face_url) = self
+            .session
+            .as_ref()
+            .map(|session| session.face.clone())
+            .filter(|face| !face.is_empty())
+        else {
+            return;
+        };
+        cx.spawn(async move |view, cx| {
+            let image = cx
+                .background_spawn(async move {
+                    Client::builder()
+                        .user_agent("Mozilla/5.0 biliguga/0.1")
+                        .connect_timeout(Duration::from_secs(5))
+                        .timeout(Duration::from_secs(15))
+                        .build()
+                        .ok()
+                        .and_then(|client| download_cover(&client, &face_url))
+                })
+                .await;
+            if let Some(image) = image {
+                view.update(cx, |app, cx| {
+                    app.account_avatar = Some(image);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn start_login(&mut self, cx: &mut Context<Self>) {
@@ -273,6 +378,7 @@ impl BiliGuga {
     fn logout(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         login::clear_session();
         self.session = None;
+        self.account_avatar = None;
         self.login_image = None;
         self.login_key = None;
         self.login_status = SharedString::from("已退出登录");
@@ -590,7 +696,12 @@ impl BiliGuga {
             ))
             .child(sidebar_item("▣", "动态", false))
             .child(sidebar_item("♡", "收藏", false))
-            .child(sidebar_item("◷", "历史", false))
+            .child(clickable_sidebar_item(
+                "◷",
+                "历史",
+                self.active_tab == AppTab::History,
+                cx.listener(Self::show_history),
+            ))
             .child(clickable_sidebar_item(
                 "⌕",
                 "搜索",
@@ -668,45 +779,70 @@ impl BiliGuga {
             .justify_center()
             .gap_3()
             .text_center();
-        if let Some(image) = &self.login_image {
-            panel = panel.child(img(image.clone()).w(px(240.)).h(px(240.)));
-        } else {
-            panel = panel.child(div().text_sm().text_color(rgb(0xa9afbc)).child(
-                if self.login_loading {
-                    "正在准备登录…"
-                } else {
-                    "点击刷新获取二维码"
-                },
-            ));
-        }
-        panel = panel.child(
-            div()
-                .text_sm()
-                .text_color(rgb(0xa9afbc))
-                .child(self.login_status.clone()),
-        );
-
         if let Some(session) = &self.session {
+            if let Some(image) = &self.account_avatar {
+                panel = panel.child(img(image.clone()).w(px(72.)).h(px(72.)));
+            } else {
+                panel = panel.child(
+                    div()
+                        .w(px(72.))
+                        .h(px(72.))
+                        .bg(rgb(0x454a56))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_2xl()
+                        .text_color(rgb(0xdce0e5))
+                        .child(session.username.chars().next().unwrap_or('?').to_string()),
+                );
+            }
             panel = panel
+                .child(
+                    div()
+                        .text_lg()
+                        .text_color(rgb(0xdce0e5))
+                        .child(session.username.clone()),
+                )
                 .child(
                     div()
                         .text_xs()
                         .text_color(rgb(0x878a98))
-                        .child(format!("{} · UID {}", session.username, session.mid)),
-                )
-                .child(
-                    div()
-                        .id("logout")
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .text_color(rgb(0xd07277))
-                        .bg(rgb(0x363c46))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x454a56)))
-                        .child("退出登录")
-                        .on_click(cx.listener(Self::logout)),
+                        .child(format!("UID {} · 已登录", session.mid)),
                 );
+        } else {
+            if let Some(image) = &self.login_image {
+                panel = panel.child(img(image.clone()).w(px(240.)).h(px(240.)));
+            } else {
+                panel = panel.child(div().text_sm().text_color(rgb(0xa9afbc)).child(
+                    if self.login_loading {
+                        "正在准备登录…"
+                    } else {
+                        "点击刷新获取二维码"
+                    },
+                ));
+            }
+            panel = panel.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xa9afbc))
+                    .child(self.login_status.clone()),
+            );
+        }
+
+        if self.session.is_some() {
+            panel = panel.child(
+                div()
+                    .id("logout")
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0xd07277))
+                    .bg(rgb(0x363c46))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x454a56)))
+                    .child("退出登录")
+                    .on_click(cx.listener(Self::logout)),
+            );
         } else if !self.login_loading {
             panel = panel.child(
                 div()
@@ -737,7 +873,11 @@ impl BiliGuga {
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(0xdce0e5))
-                    .child("登录"),
+                    .child(if self.session.is_some() {
+                        "账号"
+                    } else {
+                        "登录"
+                    }),
             )
             .child(panel)
     }
@@ -747,13 +887,19 @@ impl BiliGuga {
             return self.render_login(cx);
         }
         let is_search = self.active_tab == AppTab::Search;
+        let is_history = self.active_tab == AppTab::History;
+        let is_loading = if is_history {
+            self.history_loading
+        } else {
+            self.loading
+        };
         let search_input = self.search_input.clone();
         let mut feed = div()
             .id("feed-scroll")
             .w_full()
             .flex_1()
             .overflow_x_hidden();
-        if self.loading {
+        if is_loading {
             feed = feed.child(
                 div()
                     .w_full()
@@ -763,6 +909,8 @@ impl BiliGuga {
                     .text_color(rgb(0xa9afbc))
                     .child(if is_search {
                         "正在搜索 B 站视频…"
+                    } else if is_history {
+                        "正在加载观看历史…"
                     } else {
                         "正在加载 B 站推荐…"
                     }),
@@ -777,6 +925,12 @@ impl BiliGuga {
                     .text_color(rgb(0xd07277))
                     .child(if is_search {
                         "没有找到视频，请换个关键词试试"
+                    } else if is_history {
+                        if self.session.is_some() {
+                            "还没有观看历史"
+                        } else {
+                            "请先登录后查看观看历史"
+                        }
                     } else {
                         "没有加载到视频，请点击刷新重试"
                     }),
@@ -815,7 +969,13 @@ impl BiliGuga {
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(0xdce0e5))
-                    .child(if is_search { "搜索" } else { "为你推荐" }),
+                    .child(if is_search {
+                        "搜索"
+                    } else if is_history {
+                        "观看历史"
+                    } else {
+                        "为你推荐"
+                    }),
             );
         if !is_search {
             header = header.child(
@@ -828,7 +988,13 @@ impl BiliGuga {
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(0x363c46)))
                     .child("刷新")
-                    .on_click(cx.listener(Self::refresh)),
+                    .on_click(cx.listener(move |app, event, window, cx| {
+                        if is_history {
+                            app.refresh_history(event, window, cx);
+                        } else {
+                            app.refresh(event, window, cx);
+                        }
+                    })),
             );
         }
         let search_bar = div()

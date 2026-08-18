@@ -18,6 +18,7 @@ pub(crate) struct UserSession {
     pub(crate) cookie: String,
     pub(crate) mid: i64,
     pub(crate) username: String,
+    pub(crate) face: String,
 }
 
 pub(crate) enum PollResult {
@@ -121,16 +122,18 @@ pub(crate) fn poll_qr_code(key: &str) -> Result<PollResult, String> {
             if cookie.is_empty() {
                 return Err("登录成功但没有获取到 Cookie".into());
             }
-            let mid = cookie_value(&cookie, "DedeUserID")
+            let cookie_mid = cookie_value(&cookie, "DedeUserID")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default();
-            let username = fetch_user(&cookie)
-                .map(|user| user.username)
-                .unwrap_or_else(|_| "已登录用户".into());
+            let user = fetch_user(&cookie).ok();
             Ok(PollResult::LoggedIn(UserSession {
                 cookie,
-                mid,
-                username,
+                mid: user.as_ref().map(|user| user.mid).unwrap_or(cookie_mid),
+                username: user
+                    .as_ref()
+                    .map(|user| user.username.clone())
+                    .unwrap_or_else(|| "已登录用户".into()),
+                face: user.map(|user| user.face).unwrap_or_default(),
             }))
         }
         86090 => Ok(PollResult::Scanned),
@@ -198,6 +201,7 @@ fn fetch_user(cookie: &str) -> Result<UserSession, String> {
         cookie: cookie.to_string(),
         mid: number(data.get("mid")),
         username: text(data.get("uname")),
+        face: text(data.get("face")),
     })
 }
 
@@ -215,8 +219,8 @@ pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| format!("创建登录目录失败：{error}"))?;
     }
     let content = format!(
-        "{}\n{}\n{}\n",
-        session.cookie, session.mid, session.username
+        "{}\n{}\n{}\n{}\n",
+        session.cookie, session.mid, session.username, session.face
     );
     fs::write(&path, content).map_err(|error| format!("保存登录状态失败：{error}"))?;
     #[cfg(unix)]
@@ -242,6 +246,7 @@ pub(crate) fn load_session() -> Option<UserSession> {
             .and_then(|value| value.parse().ok())
             .unwrap_or_default(),
         username: lines.next().unwrap_or("已登录用户").to_string(),
+        face: lines.next().unwrap_or_default().to_string(),
     })
 }
 
