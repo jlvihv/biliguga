@@ -124,7 +124,8 @@ pub(crate) fn download_cover(client: &Client, url: &str) -> Option<Arc<RenderIma
         return None;
     }
     let bytes = response.bytes().ok()?;
-    let mut rgba = image::load_from_memory(&bytes).ok()?.into_rgba8();
+    let rgba = image::load_from_memory(&bytes).ok()?.into_rgba8();
+    let mut rgba = image::imageops::thumbnail(&rgba, 320, 180);
     for pixel in rgba.pixels_mut() {
         let [red, green, blue, alpha] = pixel.0;
         pixel.0 = [blue, green, red, alpha];

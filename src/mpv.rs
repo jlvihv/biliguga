@@ -2,6 +2,7 @@ use gpui::RenderImage;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 use std::{
+    collections::VecDeque,
     ffi::CString,
     os::raw::{c_char, c_double, c_int, c_void},
     ptr,
@@ -65,6 +66,7 @@ const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_DOUBLE: c_int = 5;
 const FRAME_WIDTH: usize = 960;
 const FRAME_HEIGHT: usize = 540;
+const RETIRED_FRAME_LIMIT: usize = 6;
 
 enum PlayerCommand {
     Load(String),
@@ -106,6 +108,7 @@ pub struct MpvPlayer {
     frames: Receiver<FramePacket>,
     statuses: Receiver<MpvStatus>,
     current_frame: Option<std::sync::Arc<RenderImage>>,
+    retired_frames: VecDeque<std::sync::Arc<RenderImage>>,
     current_status: MpvStatus,
     worker: Option<JoinHandle<()>>,
 }
@@ -124,6 +127,7 @@ impl MpvPlayer {
             frames: frame_rx,
             statuses: status_rx,
             current_frame: None,
+            retired_frames: VecDeque::new(),
             current_status: MpvStatus::default(),
             worker,
         }
@@ -154,26 +158,46 @@ impl MpvPlayer {
     }
 
     pub fn poll_frame(&mut self) {
+        let mut latest_packet = None;
         loop {
             match self.frames.try_recv() {
                 Ok(packet) => {
-                    let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(
-                        FRAME_WIDTH as u32,
-                        FRAME_HEIGHT as u32,
-                        packet.pixels,
-                    );
-                    if let Some(buffer) = buffer {
-                        self.current_frame = Some(std::sync::Arc::new(RenderImage::new(
-                            SmallVec::from_elem(Frame::new(buffer), 1),
-                        )));
-                    }
+                    latest_packet = Some(packet);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if let Some(packet) = latest_packet {
+            let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(
+                FRAME_WIDTH as u32,
+                FRAME_HEIGHT as u32,
+                packet.pixels,
+            );
+            if let Some(buffer) = buffer {
+                if let Some(previous) =
+                    self.current_frame
+                        .replace(std::sync::Arc::new(RenderImage::new(SmallVec::from_elem(
+                            Frame::new(buffer),
+                            1,
+                        ))))
+                {
+                    self.retired_frames.push_back(previous);
+                }
             }
         }
         while let Ok(status) = self.statuses.try_recv() {
             self.current_status = status;
         }
+    }
+
+    pub fn take_expired_frames(&mut self) -> Vec<std::sync::Arc<RenderImage>> {
+        let expired = self
+            .retired_frames
+            .len()
+            .saturating_sub(RETIRED_FRAME_LIMIT);
+        (0..expired)
+            .filter_map(|_| self.retired_frames.pop_front())
+            .collect()
     }
 
     pub fn frame(&self) -> Option<std::sync::Arc<RenderImage>> {

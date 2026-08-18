@@ -144,6 +144,26 @@ impl BiliGuga {
         self.controls_generation = self.controls_generation.wrapping_add(1);
     }
 
+    fn release_cover_images(videos: &mut Vec<Video>, window: &mut Window) {
+        for video in videos {
+            if let Some(image) = video.cover_image.take() {
+                let _ = window.drop_image(image);
+            }
+        }
+    }
+
+    fn release_active_cover_images(&mut self, window: &mut Window) {
+        match self.active_tab {
+            AppTab::Home => Self::release_cover_images(&mut self.videos, window),
+            AppTab::Search => Self::release_cover_images(&mut self.search_results, window),
+            AppTab::Dynamic => Self::release_cover_images(&mut self.dynamic_videos, window),
+            AppTab::WatchLater => Self::release_cover_images(&mut self.watch_later, window),
+            AppTab::Favorites => Self::release_cover_images(&mut self.favorites, window),
+            AppTab::History => Self::release_cover_images(&mut self.history, window),
+            AppTab::Login => {}
+        }
+    }
+
     fn show_home(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab != AppTab::Home {
             self.active_tab = AppTab::Home;
@@ -232,7 +252,8 @@ impl BiliGuga {
         .detach();
     }
 
-    fn refresh_dynamic(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_dynamic(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.release_active_cover_images(window);
         self.load_dynamic(cx, true);
     }
 
@@ -290,8 +311,9 @@ impl BiliGuga {
         .detach();
     }
 
-    fn refresh_history(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_history(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.history_loading {
+            self.release_active_cover_images(window);
             self.load_history(cx);
         }
     }
@@ -351,8 +373,9 @@ impl BiliGuga {
         .detach();
     }
 
-    fn refresh_watch_later(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_watch_later(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.watch_later_loading {
+            self.release_active_cover_images(window);
             self.load_watch_later(cx);
         }
     }
@@ -412,8 +435,9 @@ impl BiliGuga {
         .detach();
     }
 
-    fn refresh_favorites(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_favorites(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.favorites_loading {
+            self.release_active_cover_images(window);
             self.load_favorites(cx);
         }
     }
@@ -589,10 +613,19 @@ impl BiliGuga {
         self.start_login(cx);
     }
 
-    fn logout(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn logout(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         login::clear_session();
+        self.release_active_cover_images(window);
+        Self::release_cover_images(&mut self.videos, window);
+        Self::release_cover_images(&mut self.search_results, window);
+        Self::release_cover_images(&mut self.dynamic_videos, window);
+        Self::release_cover_images(&mut self.watch_later, window);
+        Self::release_cover_images(&mut self.favorites, window);
+        Self::release_cover_images(&mut self.history, window);
+        if let Some(image) = self.account_avatar.take() {
+            let _ = window.drop_image(image);
+        }
         self.session = None;
-        self.account_avatar = None;
         self.history.clear();
         self.watch_later.clear();
         self.favorites.clear();
@@ -775,6 +808,7 @@ impl BiliGuga {
             .current_videos()
             .iter()
             .enumerate()
+            .filter(|(_, video)| video.cover_image.is_none())
             .map(|(index, video)| (index, video.bvid.clone(), video.cover.clone()))
             .collect::<Vec<_>>();
 
@@ -811,17 +845,22 @@ impl BiliGuga {
         }
     }
 
-    fn search_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn search_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if event.keystroke.key.eq_ignore_ascii_case("enter") {
-            self.start_search(cx);
+            self.start_search(window, cx);
         }
     }
 
-    fn submit_search(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.start_search(cx);
+    fn submit_search(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_search(window, cx);
     }
 
-    fn start_search(&mut self, cx: &mut Context<Self>) {
+    fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let keyword = self.search_input.read(cx).content.trim().to_string();
         if keyword.is_empty() {
             self.message = SharedString::from("请输入搜索关键词");
@@ -830,6 +869,7 @@ impl BiliGuga {
         }
         self.active_tab = AppTab::Search;
         self.search_query = keyword.clone();
+        Self::release_cover_images(&mut self.search_results, window);
         self.loading = true;
         self.search_results.clear();
         self.selected = 0;
@@ -863,8 +903,9 @@ impl BiliGuga {
         .detach();
     }
 
-    fn refresh(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn refresh(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tab = AppTab::Home;
+        Self::release_cover_images(&mut self.videos, window);
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.reset(cx));
         self.loading = true;
@@ -1912,28 +1953,38 @@ pub(crate) fn launch() {
             )
             .expect("failed to open biliguga window");
         let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let window_handle = window
+            .update(cx, |_, window, _| window.window_handle())
+            .unwrap();
         let frame_view = view.clone();
         cx.spawn(async move |cx| {
             loop {
-                Timer::after(Duration::from_millis(33)).await;
-                if frame_view
-                    .update(cx, |app, cx| {
-                        app.player.poll_frame();
-                        let status = app.player.status();
-                        if app.playback != PlaybackState::Idle && status.time_pos.is_finite() {
-                            app.playback = if status.paused {
-                                PlaybackState::Paused
-                            } else {
-                                PlaybackState::Playing
-                            };
-                            if status.volume.is_finite() {
-                                app.volume = status.volume.clamp(0., 100.);
+                Timer::after(Duration::from_millis(50)).await;
+                if cx
+                    .update_window(window_handle.clone(), |_, window, cx| {
+                        let expired_frames = frame_view.update(cx, |app, cx| {
+                            app.player.poll_frame();
+                            let status = app.player.status();
+                            if app.playback != PlaybackState::Idle && status.time_pos.is_finite() {
+                                app.playback = if status.paused {
+                                    PlaybackState::Paused
+                                } else {
+                                    PlaybackState::Playing
+                                };
+                                if status.volume.is_finite() {
+                                    app.volume = status.volume.clamp(0., 100.);
+                                }
+                                if status.speed.is_finite() {
+                                    app.speed = status.speed.max(0.1);
+                                }
                             }
-                            if status.speed.is_finite() {
-                                app.speed = status.speed.max(0.1);
-                            }
+                            let expired_frames = app.player.take_expired_frames();
+                            cx.notify();
+                            expired_frames
+                        });
+                        for frame in expired_frames {
+                            let _ = window.drop_image(frame);
                         }
-                        cx.notify();
                     })
                     .is_err()
                 {
