@@ -1137,15 +1137,39 @@ pub(crate) fn fetch_comments(
     cookie: Option<&str>,
     page: u32,
 ) -> Result<CommentPage, String> {
-    if video.aid <= 0 {
-        return Err("视频缺少 AV 号，无法获取评论".into());
-    }
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
+    let mut aid = video.aid;
+    if aid <= 0 {
+        if video.bvid.is_empty() {
+            return Err("视频缺少 BV 号，无法获取评论".into());
+        }
+        let detail: Value = with_cookie(
+            client
+                .get("https://api.bilibili.com/x/web-interface/view")
+                .header(
+                    "Referer",
+                    format!("https://www.bilibili.com/video/{}", video.bvid),
+                )
+                .query(&[("bvid", video.bvid.as_str())]),
+            cookie,
+        )
+        .send()
+        .map_err(|error| format!("获取视频详情失败：{error}"))?
+        .json()
+        .map_err(|error| format!("解析视频详情失败：{error}"))?;
+        if number(detail.get("code")) != 0 {
+            return Err(api_error(&detail, "获取视频详情"));
+        }
+        aid = number(detail.get("data").and_then(|data| data.get("aid")));
+        if aid <= 0 {
+            return Err("视频详情没有返回 AV 号，无法获取评论".into());
+        }
+    }
     let response: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/v2/reply")
@@ -1154,7 +1178,7 @@ pub(crate) fn fetch_comments(
                 format!("https://www.bilibili.com/video/{}", video.bvid),
             )
             .query(&[
-                ("oid", video.aid.to_string()),
+                ("oid", aid.to_string()),
                 ("type", "1".into()),
                 ("pn", page.max(1).to_string()),
                 ("ps", "20".into()),
