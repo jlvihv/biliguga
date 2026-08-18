@@ -1484,7 +1484,7 @@ mod tests {
 pub(crate) fn resolve_play_url(
     video: &Video,
     cookie: Option<&str>,
-) -> Result<(String, i64), String> {
+) -> Result<(String, i64, i64), String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(3))
@@ -1493,7 +1493,8 @@ pub(crate) fn resolve_play_url(
         .map_err(|error| error.to_string())?;
 
     let mut cid = video.cid;
-    if cid == 0 {
+    let mut aid = video.aid;
+    if cid == 0 || aid == 0 {
         let detail: Value = with_cookie(
             client
                 .get("https://api.bilibili.com/x/web-interface/view")
@@ -1515,7 +1516,13 @@ pub(crate) fn resolve_play_url(
                 text(detail.get("message"))
             ));
         }
-        cid = number(detail.get("data").and_then(|data| data.get("cid")));
+        let data = detail.get("data");
+        if cid == 0 {
+            cid = number(data.and_then(|data| data.get("cid")));
+        }
+        aid = aid
+            .max(number(data.and_then(|data| data.get("aid"))))
+            .max(number(data.and_then(|data| data.get("id"))));
     }
     if cid == 0 {
         return Err("视频没有可用的 CID".into());
@@ -1574,7 +1581,7 @@ pub(crate) fn resolve_play_url(
                     {
                         Ok(response) if number(response.get("code")) == 0 => {
                             if let Some(url) = first_durl(&response) {
-                                return Ok((url, cid));
+                                return Ok((url, cid, aid));
                             }
                             errors.push("WBI 接口没有返回 MP4 地址".to_string());
                         }
@@ -1608,7 +1615,7 @@ pub(crate) fn resolve_play_url(
     {
         Ok(response) if number(response.get("code")) == 0 => {
             if let Some(url) = first_durl(&response) {
-                return Ok((url, cid));
+                return Ok((url, cid, aid));
             }
             errors.push("旧播放接口没有返回 MP4 地址".to_string());
         }

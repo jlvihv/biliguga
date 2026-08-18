@@ -1576,12 +1576,13 @@ impl BiliGuga {
                     let result = resolve_play_url(&video, cookie.as_deref())?;
                     let mut resolved_video = video.clone();
                     resolved_video.cid = result.1;
+                    resolved_video.aid = result.2;
                     let progress = fetch_last_play_progress(&resolved_video, cookie.as_deref());
-                    Ok::<_, String>((result.0, result.1, progress))
+                    Ok::<_, String>((result.0, result.1, result.2, progress))
                 })
                 .await;
             let message = match result {
-                Ok((url, cid, progress)) => {
+                Ok((url, cid, aid, progress)) => {
                     view.update(cx, |app, cx| {
                         if app.playback_request != playback_request
                             || app
@@ -1593,6 +1594,7 @@ impl BiliGuga {
                         }
                         if let Some(playing_video) = app.playing_video.as_mut() {
                             playing_video.cid = cid;
+                            playing_video.aid = aid;
                         }
                         if let Some(progress) = progress {
                             app.cloud_resume_progress = Some(progress as f64);
@@ -2736,7 +2738,7 @@ pub(crate) fn launch() {
                                     app.speed = status.speed.max(0.1);
                                 }
                                 if app.playback == PlaybackState::Playing
-                                    && app.history_report_at.elapsed() >= Duration::from_secs(15)
+                                    && app.history_report_at.elapsed() >= Duration::from_secs(5)
                                 {
                                     app.queue_history_report(cx, 0);
                                 }
