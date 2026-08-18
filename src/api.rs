@@ -624,7 +624,10 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
     };
     Some(Video {
         bvid,
-        aid: number(history.get("aid")).max(number(item.get("aid"))),
+        // 历史接口通常把 AV 号放在 history.oid，而不是 aid。
+        aid: number(history.get("aid"))
+            .max(number(history.get("oid")))
+            .max(number(item.get("aid"))),
         cid: number(history.get("cid")),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("author_name")),
@@ -1415,7 +1418,7 @@ pub(crate) fn fetch_comments(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_video, thumbnail_url};
+    use super::{parse_history_video, parse_video, thumbnail_url};
     use serde_json::json;
 
     #[test]
@@ -1436,6 +1439,25 @@ mod tests {
         .expect("recommendation item should parse");
 
         assert_eq!(video.aid, 123456);
+    }
+
+    #[test]
+    fn history_oid_is_used_as_video_aid() {
+        let video = parse_history_video(
+            &json!({
+                "title": "test",
+                "duration": 60,
+                "history": {
+                    "oid": 654321,
+                    "bvid": "BV1xx411c7mD",
+                    "cid": 789
+                }
+            }),
+            0,
+        )
+        .expect("history item should parse");
+
+        assert_eq!(video.aid, 654321);
     }
 
     #[test]
