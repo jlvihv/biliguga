@@ -17,9 +17,9 @@ use futures::{
 };
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DispatchPhase, Entity, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage, SharedString, Timer, Window,
-    WindowBounds, WindowOptions, canvas, div, img, prelude::*, px, relative, rgb, size,
-    uniform_list,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, RenderImage, ScrollWheelEvent,
+    SharedString, Timer, UniformListScrollHandle, Window, WindowBounds, WindowOptions, canvas, div,
+    img, point, prelude::*, px, relative, rgb, size, uniform_list,
 };
 use std::{
     fs,
@@ -31,11 +31,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+const HOME_PAGE_SIZE: usize = 12;
+const HOME_MAX_ITEMS: usize = 120;
+const HOME_PREFETCH_ITEMS: usize = 4;
+const VIDEO_ROW_HEIGHT: f32 = 76.;
+
 struct BiliGuga {
     search_input: Entity<SearchInput>,
     search_query: String,
     active_tab: AppTab,
     videos: Vec<Video>,
+    home_page: usize,
+    home_loading: bool,
+    home_has_more: bool,
+    home_generation: u64,
+    home_scroll_handle: UniformListScrollHandle,
+    home_scroll_requested: bool,
+    home_last_scroll_offset: Option<Pixels>,
     search_results: Vec<Video>,
     history: Vec<Video>,
     watch_later: Vec<Video>,
@@ -64,6 +76,8 @@ struct BiliGuga {
     speed: f64,
     controls_visible: bool,
     controls_generation: u64,
+    playing_video: Option<Video>,
+    pending_cover_drops: Vec<Arc<RenderImage>>,
     comments: Vec<Comment>,
     comments_for: String,
     comments_page: u32,
@@ -107,6 +121,13 @@ impl BiliGuga {
             search_query: String::new(),
             active_tab: AppTab::Home,
             videos: Vec::new(),
+            home_page: 0,
+            home_loading: true,
+            home_has_more: true,
+            home_generation: 0,
+            home_scroll_handle: UniformListScrollHandle::new(),
+            home_scroll_requested: false,
+            home_last_scroll_offset: None,
             search_results: Vec::new(),
             history: Vec::new(),
             watch_later: Vec::new(),
@@ -135,6 +156,8 @@ impl BiliGuga {
             speed: 1.,
             controls_visible: false,
             controls_generation: 0,
+            playing_video: None,
+            pending_cover_drops: Vec::new(),
             comments: Vec::new(),
             comments_for: String::new(),
             comments_page: 0,
@@ -172,14 +195,182 @@ impl BiliGuga {
         }
     }
 
+    fn selected_video_ref(&self) -> Option<&Video> {
+        self.playing_video
+            .as_ref()
+            .or_else(|| self.current_videos().get(self.selected))
+    }
+
+    fn pin_playing_video(&mut self, video: &Video) {
+        let mut video = video.clone();
+        video.cover_image = None;
+        self.playing_video = Some(video);
+    }
+
+    fn trim_home_items(&mut self) {
+        if self.videos.len() <= HOME_MAX_ITEMS {
+            return;
+        }
+        let excess = self.videos.len() - HOME_MAX_ITEMS;
+        let remove_count = ((excess + HOME_PAGE_SIZE - 1) / HOME_PAGE_SIZE * HOME_PAGE_SIZE)
+            .min(self.videos.len());
+        let removed: Vec<_> = self.videos.drain(..remove_count).collect();
+        for mut video in removed {
+            if let Some(image) = video.cover_image.take() {
+                self.pending_cover_drops.push(image);
+            }
+        }
+        if self.selected >= remove_count {
+            self.selected -= remove_count;
+        } else {
+            self.selected = 0;
+        }
+
+        let handle = self.home_scroll_handle.0.borrow().base_handle.clone();
+        let offset = handle.offset();
+        handle.set_offset(point(
+            offset.x,
+            offset.y + px(remove_count as f32 * VIDEO_ROW_HEIGHT),
+        ));
+        self.home_last_scroll_offset = Some(offset.y + px(remove_count as f32 * VIDEO_ROW_HEIGHT));
+    }
+
+    fn reset_home_scroll(&mut self) {
+        let handle = self.home_scroll_handle.0.borrow().base_handle.clone();
+        handle.set_offset(point(px(0.), px(0.)));
+        self.home_last_scroll_offset = Some(px(0.));
+    }
+
+    fn load_home_page(&mut self, cx: &mut Context<Self>, reset: bool) {
+        if (!reset && self.home_loading) || (!reset && !self.home_has_more) {
+            return;
+        }
+        if reset {
+            self.home_generation = self.home_generation.wrapping_add(1);
+            self.home_page = 0;
+            self.home_has_more = true;
+            self.loading = true;
+            self.videos.clear();
+            self.selected = 0;
+            self.playing_video = None;
+            self.home_scroll_requested = false;
+            self.reset_home_scroll();
+        }
+        let page = self.home_page + 1;
+        let generation = self.home_generation;
+        self.home_loading = true;
+        self.home_scroll_requested = false;
+        if reset {
+            self.message = SharedString::from("正在从 B 站加载推荐视频…");
+        } else {
+            self.message = SharedString::from("正在加载更多推荐视频…");
+        }
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { fetch_recommendations(page) })
+                .await;
+            view.update(cx, |app, cx| {
+                if app.home_generation != generation || app.active_tab != AppTab::Home {
+                    return;
+                }
+                app.home_loading = false;
+                app.loading = false;
+                app.home_scroll_requested = false;
+                match result {
+                    Ok(videos) => {
+                        let received = videos.len();
+                        let old_len = app.videos.len();
+                        if reset {
+                            app.videos = videos;
+                        } else {
+                            for video in videos {
+                                if !app.videos.iter().any(|current| current.bvid == video.bvid) {
+                                    app.videos.push(video);
+                                }
+                            }
+                        }
+                        app.home_page = page;
+                        let added = app.videos.len().saturating_sub(old_len);
+                        app.home_has_more = received >= HOME_PAGE_SIZE && (reset || added > 0);
+                        app.trim_home_items();
+                        app.message = SharedString::from(format!(
+                            "为你推荐 · 已加载 {} 个视频",
+                            app.videos.len()
+                        ));
+                        app.start_cover_loading(cx);
+                    }
+                    Err(error) => {
+                        app.home_has_more = false;
+                        app.message = SharedString::from(format!("加载推荐失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn maybe_load_home_page(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab != AppTab::Home
+            || self.loading
+            || self.home_loading
+            || !self.home_has_more
+            || self.videos.is_empty()
+        {
+            return;
+        }
+
+        let current_scroll_offset = {
+            let state = self.home_scroll_handle.0.borrow();
+            state.base_handle.offset().y
+        };
+        if self
+            .home_last_scroll_offset
+            .is_some_and(|last| last != current_scroll_offset)
+        {
+            self.home_scroll_requested = true;
+        }
+        self.home_last_scroll_offset = Some(current_scroll_offset);
+
+        if !self.home_scroll_requested {
+            return;
+        }
+        let near_bottom = {
+            let state = self.home_scroll_handle.0.borrow();
+            let offset = state.base_handle.offset();
+            let max_offset = state.base_handle.max_offset();
+            let remaining = max_offset.height + offset.y;
+            max_offset.height > px(0.)
+                && remaining <= px(VIDEO_ROW_HEIGHT * HOME_PREFETCH_ITEMS as f32)
+        };
+        if near_bottom {
+            self.load_home_page(cx, false);
+        }
+    }
+
     fn stop_current_playback(&mut self, window: &mut Window) {
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.selected = 0;
         self.playback = PlaybackState::Idle;
+        self.playing_video = None;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
+    }
+
+    fn note_home_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab == AppTab::Home && event.delta.pixel_delta(px(20.)).y < px(0.) {
+            self.home_scroll_requested = true;
+            cx.notify();
+        }
     }
 
     fn drop_player_frames(&mut self, frames: Vec<Arc<RenderImage>>, window: &mut Window) {
@@ -201,7 +392,7 @@ impl BiliGuga {
     }
 
     fn load_comments_for_current(&mut self, cx: &mut Context<Self>) {
-        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+        let Some(video) = self.selected_video_ref().cloned() else {
             self.reset_comments();
             return;
         };
@@ -221,7 +412,7 @@ impl BiliGuga {
     }
 
     fn load_comments_page(&mut self, cx: &mut Context<Self>, reset: bool) {
-        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+        let Some(video) = self.selected_video_ref().cloned() else {
             return;
         };
         if self.comments_loading || (!reset && !self.comments_has_more) {
@@ -248,8 +439,7 @@ impl BiliGuga {
             view.update(cx, |app, cx| {
                 if app.comments_generation != generation
                     || app
-                        .current_videos()
-                        .get(app.selected)
+                        .selected_video_ref()
                         .map(|current| current.bvid != bvid)
                         .unwrap_or(true)
                 {
@@ -286,6 +476,10 @@ impl BiliGuga {
 
     fn leave_current_tab(&mut self, window: &mut Window) {
         self.debug_memory("before-tab-leave");
+        if self.active_tab == AppTab::Home {
+            self.home_generation = self.home_generation.wrapping_add(1);
+            self.home_loading = false;
+        }
         self.stop_current_playback(window);
         self.reset_cover_loading();
         self.reset_comments();
@@ -416,7 +610,11 @@ impl BiliGuga {
             self.leave_current_tab(window);
             self.active_tab = AppTab::Home;
             self.message = SharedString::from("首页推荐");
-            self.start_cover_loading(cx);
+            if self.videos.is_empty() && !self.home_loading {
+                self.load_home_page(cx, true);
+            } else {
+                self.start_cover_loading(cx);
+            }
             cx.notify();
         }
     }
@@ -972,7 +1170,7 @@ impl BiliGuga {
             cx.notify();
             return;
         };
-        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+        let Some(video) = self.selected_video_ref().cloned() else {
             return;
         };
         if video.aid <= 0 {
@@ -1005,7 +1203,7 @@ impl BiliGuga {
             cx.notify();
             return;
         };
-        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+        let Some(video) = self.selected_video_ref().cloned() else {
             return;
         };
         if video.aid <= 0 {
@@ -1127,9 +1325,16 @@ impl BiliGuga {
                 }
             }
 
-            view.update(cx, |app, _| {
+            view.update(cx, |app, cx| {
                 if app.cover_generation == generation {
                     app.cover_loading = false;
+                    let has_pending_covers = app
+                        .current_videos()
+                        .iter()
+                        .any(|video| video.cover_image.is_none());
+                    if has_pending_covers {
+                        app.start_cover_loading(cx);
+                    }
                 }
             })
             .ok();
@@ -1206,50 +1411,17 @@ impl BiliGuga {
 
     fn refresh(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tab = AppTab::Home;
-        self.feed_generation = self.feed_generation.wrapping_add(1);
-        let feed_generation = self.feed_generation;
         Self::release_cover_images(&mut self.videos, window);
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.reset(cx));
-        self.loading = true;
-        self.videos.clear();
         self.reset_cover_loading();
-        self.selected = 0;
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.playback = PlaybackState::Idle;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
-        self.message = SharedString::from("正在从 B 站加载推荐视频…");
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move { fetch_recommendations() })
-                .await;
-            view.update(cx, |app, cx| {
-                if app.feed_generation != feed_generation {
-                    return;
-                }
-                app.loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.message =
-                            SharedString::from(format!("已加载 {} 个真实视频", videos.len()));
-                        app.videos = videos;
-                        if app.active_tab == AppTab::Home {
-                            app.start_cover_loading(cx);
-                        }
-                    }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载失败：{error}"));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.load_home_page(cx, true);
     }
 
     fn select_video(
@@ -1259,10 +1431,14 @@ impl BiliGuga {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index >= self.current_videos().len() {
+        let Some(video) = self.current_videos().get(index).cloned() else {
             return;
-        }
-        if index == self.selected {
+        };
+        let same_video = self
+            .selected_video_ref()
+            .map(|current| current.bvid == video.bvid)
+            .unwrap_or(false);
+        if same_video {
             if self.playback == PlaybackState::Paused {
                 self.player.set_pause(false);
                 self.playback = PlaybackState::Playing;
@@ -1275,6 +1451,7 @@ impl BiliGuga {
         }
         self.debug_memory("before-video-switch");
         self.selected = index;
+        self.pin_playing_video(&video);
         let frames = self.player.stop_playback();
         self.drop_player_frames(frames, window);
         self.debug_memory("after-video-stop");
@@ -1297,15 +1474,16 @@ impl BiliGuga {
     }
 
     fn begin_play_selected(&mut self, cx: &mut Context<Self>) {
-        self.load_comments_for_current(cx);
         if self.playback == PlaybackState::Buffering {
             return;
         }
-        let Some(video) = self.current_videos().get(self.selected).cloned() else {
+        let Some(video) = self.selected_video_ref().cloned() else {
             self.message = SharedString::from("还没有可播放的视频");
             cx.notify();
             return;
         };
+        self.pin_playing_video(&video);
+        self.load_comments_for_current(cx);
         self.playback = PlaybackState::Buffering;
         self.message = SharedString::from("正在向 B 站获取播放地址…");
         cx.notify();
@@ -1322,8 +1500,7 @@ impl BiliGuga {
                     view.update(cx, |app, cx| {
                         if app.playback_request != playback_request
                             || app
-                                .current_videos()
-                                .get(app.selected)
+                                .selected_video_ref()
                                 .map(|current| current.bvid != video_bvid)
                                 .unwrap_or(true)
                         {
@@ -1685,16 +1862,22 @@ impl BiliGuga {
             .child(panel)
     }
 
-    fn render_feed(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_feed(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         if self.active_tab == AppTab::Login {
             return self.render_login(cx);
         }
+        let is_home = self.active_tab == AppTab::Home;
         let is_search = self.active_tab == AppTab::Search;
         let is_dynamic = self.active_tab == AppTab::Dynamic;
         let is_watch_later = self.active_tab == AppTab::WatchLater;
         let is_favorites = self.active_tab == AppTab::Favorites;
         let is_history = self.active_tab == AppTab::History;
-        let is_loading = if is_dynamic {
+        if is_home {
+            self.maybe_load_home_page(cx);
+        }
+        let is_loading = if is_home {
+            self.loading && self.videos.is_empty()
+        } else if is_dynamic {
             self.dynamic_loading
         } else if is_watch_later {
             self.watch_later_loading
@@ -1780,10 +1963,14 @@ impl BiliGuga {
                     range
                         .filter_map(|index| {
                             let video = this.current_videos().get(index)?.clone();
+                            let selected = this
+                                .selected_video_ref()
+                                .map(|current| current.bvid == video.bvid)
+                                .unwrap_or(index == this.selected);
                             Some(BiliGuga::render_video_card(
                                 index,
                                 video,
-                                index == this.selected,
+                                selected,
                                 entity.clone(),
                             ))
                         })
@@ -1792,6 +1979,12 @@ impl BiliGuga {
             )
             .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
             .size_full();
+            let list = if is_home {
+                list.track_scroll(self.home_scroll_handle.clone())
+                    .on_scroll_wheel(cx.listener(Self::note_home_scroll))
+            } else {
+                list
+            };
             feed = feed.child(list);
         }
         let mut header = div()
@@ -2021,10 +2214,7 @@ impl BiliGuga {
     }
 
     fn render_player(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let video = self
-            .current_videos()
-            .get(self.selected)
-            .unwrap_or(&LOADING_VIDEO);
+        let video = self.selected_video_ref().unwrap_or(&LOADING_VIDEO);
         let status = self.player.status();
         let playing = self.playback == PlaybackState::Playing;
         let paused = self.playback == PlaybackState::Paused;
@@ -2449,10 +2639,16 @@ pub(crate) fn launch() {
                                 app.debug_memory("tick");
                                 last_memory_log = Instant::now();
                             }
+                            app.maybe_load_home_page(cx);
                             expired_frames
                         });
                         for frame in &expired_frames {
                             let _ = window.drop_image(frame.clone());
+                        }
+                        let pending_cover_drops = frame_view
+                            .update(cx, |app, _| std::mem::take(&mut app.pending_cover_drops));
+                        for image in pending_cover_drops {
+                            let _ = window.drop_image(image);
                         }
                         frame_view.update(cx, |app, _| {
                             for frame in expired_frames {
@@ -2469,21 +2665,22 @@ pub(crate) fn launch() {
         .detach();
         cx.spawn(async move |cx| {
             let result = cx
-                .background_spawn(async move { fetch_recommendations() })
+                .background_spawn(async move { fetch_recommendations(1) })
                 .await;
             view.update(cx, |app, cx| {
-                if app.feed_generation != 0 {
+                if app.home_generation != 0 || app.active_tab != AppTab::Home {
                     return;
                 }
+                app.home_loading = false;
                 app.loading = false;
                 match result {
                     Ok(videos) => {
                         app.message =
                             SharedString::from(format!("已加载 {} 个真实视频", videos.len()));
+                        app.home_page = 1;
+                        app.home_has_more = videos.len() >= HOME_PAGE_SIZE;
                         app.videos = videos;
-                        if app.active_tab == AppTab::Home {
-                            app.start_cover_loading(cx);
-                        }
+                        app.start_cover_loading(cx);
                     }
                     Err(error) => {
                         app.message = SharedString::from(format!("加载失败：{error}"));

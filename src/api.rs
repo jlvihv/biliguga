@@ -381,7 +381,7 @@ fn wbi_sign(
     signed
 }
 
-pub(crate) fn fetch_recommendations() -> Result<Vec<Video>, String> {
+pub(crate) fn fetch_recommendations(page: usize) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -419,8 +419,10 @@ pub(crate) fn fetch_recommendations() -> Result<Vec<Video>, String> {
     }
 
     let mut params = BTreeMap::new();
+    params.insert("version".into(), "1".into());
     params.insert("feed_version".into(), "V8".into());
-    params.insert("fresh_idx".into(), "1".into());
+    params.insert("fresh_idx".into(), page.max(1).to_string());
+    params.insert("brush".into(), page.max(1).to_string());
     params.insert("fresh_type".into(), "4".into());
     params.insert("homepage_ver".into(), "1".into());
     params.insert("ps".into(), "12".into());
