@@ -6,7 +6,10 @@ use std::{
     ffi::CString,
     os::raw::{c_char, c_double, c_int, c_void},
     ptr,
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -54,6 +57,7 @@ unsafe extern "C" {
         context: *mut MpvRenderContext,
         params: *const MpvRenderParam,
     ) -> c_int;
+    fn mpv_render_context_update(context: *mut MpvRenderContext) -> u64;
     fn mpv_render_context_free(context: *mut MpvRenderContext);
 }
 
@@ -64,12 +68,18 @@ const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
 const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
 const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_DOUBLE: c_int = 5;
+const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 const FRAME_WIDTH: usize = 960;
 const FRAME_HEIGHT: usize = 540;
-const RETIRED_FRAME_LIMIT: usize = 6;
+const RETIRED_FRAME_LIMIT: usize = 3;
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 enum PlayerCommand {
-    Load(String),
+    Load {
+        url: String,
+        volume: f64,
+        speed: f64,
+    },
     StopPlayback,
     SetPause(bool),
     SetVolume(f64),
@@ -106,9 +116,10 @@ struct FramePacket {
 pub struct MpvPlayer {
     commands: mpsc::Sender<PlayerCommand>,
     frames: Receiver<FramePacket>,
+    recycled_frames: mpsc::Sender<Vec<u8>>,
     statuses: Receiver<MpvStatus>,
-    current_frame: Option<std::sync::Arc<RenderImage>>,
-    retired_frames: VecDeque<std::sync::Arc<RenderImage>>,
+    current_frame: Option<Arc<RenderImage>>,
+    retired_frames: VecDeque<Arc<RenderImage>>,
     current_status: MpvStatus,
     worker: Option<JoinHandle<()>>,
 }
@@ -117,14 +128,16 @@ impl MpvPlayer {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::sync_channel(2);
+        let (recycled_tx, recycled_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::sync_channel(2);
         let worker = thread::Builder::new()
             .name("biliguga-libmpv".into())
-            .spawn(move || run_mpv(command_rx, frame_tx, status_tx))
+            .spawn(move || run_mpv(command_rx, frame_tx, recycled_rx, status_tx))
             .ok();
         Self {
             commands: command_tx,
             frames: frame_rx,
+            recycled_frames: recycled_tx,
             statuses: status_rx,
             current_frame: None,
             retired_frames: VecDeque::new(),
@@ -133,12 +146,17 @@ impl MpvPlayer {
         }
     }
 
-    pub fn load(&self, url: String) {
-        let _ = self.commands.send(PlayerCommand::Load(url));
+    pub fn load(&self, url: String, volume: f64, speed: f64) {
+        let _ = self
+            .commands
+            .send(PlayerCommand::Load { url, volume, speed });
     }
 
-    pub fn stop_playback(&self) {
+    pub fn stop_playback(&mut self) -> Vec<Arc<RenderImage>> {
         let _ = self.commands.send(PlayerCommand::StopPlayback);
+        self.discard_pending_frames();
+        self.current_status = MpvStatus::default();
+        self.take_all_frames()
     }
 
     pub fn set_pause(&self, paused: bool) {
@@ -162,7 +180,9 @@ impl MpvPlayer {
         loop {
             match self.frames.try_recv() {
                 Ok(packet) => {
-                    latest_packet = Some(packet);
+                    if let Some(previous) = latest_packet.replace(packet) {
+                        let _ = self.recycled_frames.send(previous.pixels);
+                    }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -176,7 +196,7 @@ impl MpvPlayer {
             if let Some(buffer) = buffer {
                 if let Some(previous) =
                     self.current_frame
-                        .replace(std::sync::Arc::new(RenderImage::new(SmallVec::from_elem(
+                        .replace(Arc::new(RenderImage::new(SmallVec::from_elem(
                             Frame::new(buffer),
                             1,
                         ))))
@@ -204,6 +224,33 @@ impl MpvPlayer {
         self.current_frame.clone()
     }
 
+    pub fn discard_pending_frames(&mut self) {
+        while let Ok(frame) = self.frames.try_recv() {
+            let _ = self.recycled_frames.send(frame.pixels);
+        }
+    }
+
+    pub fn take_all_frames(&mut self) -> Vec<Arc<RenderImage>> {
+        let mut frames = Vec::with_capacity(self.retired_frames.len() + 1);
+        if let Some(frame) = self.current_frame.take() {
+            frames.push(frame);
+        }
+        frames.extend(self.retired_frames.drain(..));
+        frames
+    }
+
+    pub fn debug_frame_counts(&self) -> (bool, usize) {
+        (self.current_frame.is_some(), self.retired_frames.len())
+    }
+
+    pub fn recycle_frame(&self, frame: Arc<RenderImage>) {
+        if let Ok(frame) = Arc::try_unwrap(frame) {
+            if let Some(pixels) = frame.into_single_frame_bytes() {
+                let _ = self.recycled_frames.send(pixels);
+            }
+        }
+    }
+
     pub fn status(&self) -> MpvStatus {
         self.current_status
     }
@@ -221,17 +268,73 @@ impl Drop for MpvPlayer {
 fn run_mpv(
     command_rx: Receiver<PlayerCommand>,
     frame_tx: SyncSender<FramePacket>,
+    recycled_rx: Receiver<Vec<u8>>,
     status_tx: SyncSender<MpvStatus>,
 ) {
+    let mut next_load = None;
+    loop {
+        let command = match next_load.take() {
+            Some(command) => command,
+            None => match command_rx.recv() {
+                Ok(command) => command,
+                Err(_) => return,
+            },
+        };
+        match command {
+            PlayerCommand::Load { url, volume, speed } => {
+                match run_mpv_session(
+                    url,
+                    volume,
+                    speed,
+                    &command_rx,
+                    &frame_tx,
+                    &recycled_rx,
+                    &status_tx,
+                ) {
+                    SessionExit::Idle => {}
+                    SessionExit::Reload(command) => next_load = Some(command),
+                    SessionExit::Stop => return,
+                }
+            }
+            PlayerCommand::Stop => return,
+            PlayerCommand::StopPlayback
+            | PlayerCommand::SetPause(_)
+            | PlayerCommand::SetVolume(_)
+            | PlayerCommand::SetSpeed(_)
+            | PlayerCommand::SeekPercent(_) => {}
+        }
+    }
+}
+
+enum SessionExit {
+    Idle,
+    Reload(PlayerCommand),
+    Stop,
+}
+
+fn run_mpv_session(
+    url: String,
+    volume: f64,
+    speed: f64,
+    command_rx: &Receiver<PlayerCommand>,
+    frame_tx: &SyncSender<FramePacket>,
+    recycled_rx: &Receiver<Vec<u8>>,
+    status_tx: &SyncSender<MpvStatus>,
+) -> SessionExit {
     unsafe {
         let handle = mpv_create();
         if handle.is_null() {
             eprintln!("libmpv: mpv_create failed");
-            return;
+            return SessionExit::Idle;
         }
 
         set_option(handle, "vo", "libmpv");
         set_option(handle, "hwdec", "no");
+        set_option(handle, "vd-lavc-threads", "4");
+        set_option(handle, "cache", "yes");
+        set_option(handle, "cache-secs", "3");
+        set_option(handle, "demuxer-max-bytes", "16MiB");
+        set_option(handle, "demuxer-max-back-bytes", "4MiB");
         set_option(handle, "osd-level", "0");
         set_option(handle, "user-agent", "Mozilla/5.0");
         set_option(
@@ -243,7 +346,7 @@ fn run_mpv(
         if mpv_initialize(handle) < 0 {
             eprintln!("libmpv: mpv_initialize failed");
             mpv_terminate_destroy(handle);
-            return;
+            return SessionExit::Idle;
         }
 
         let api_type = CString::new("sw").unwrap();
@@ -263,99 +366,82 @@ fn run_mpv(
         {
             eprintln!("libmpv: software render context creation failed");
             mpv_terminate_destroy(handle);
-            return;
+            return SessionExit::Idle;
         }
+
+        let load = CString::new(format!("loadfile {} replace", quote(&url)))
+            .unwrap_or_else(|_| CString::new("stop").unwrap());
+        let _ = mpv_command_string(handle, load.as_ptr());
+        run_command(handle, &PlayerCommand::SetVolume(volume));
+        run_command(handle, &PlayerCommand::SetSpeed(speed));
 
         let mut buffer = vec![0_u8; FRAME_WIDTH * FRAME_HEIGHT * 4];
         let format = CString::new("rgb0").unwrap();
         let size = [FRAME_WIDTH as c_int, FRAME_HEIGHT as c_int];
         let stride = FRAME_WIDTH * 4;
-        let mut running = true;
+        let mut render_enabled = true;
         let mut last_status = Instant::now();
-
-        while running {
+        let exit = 'playback: loop {
             while let Ok(command) = command_rx.try_recv() {
                 match command {
-                    PlayerCommand::Load(url) => {
-                        let command = CString::new(format!("loadfile {} replace", quote(&url)))
-                            .unwrap_or_else(|_| CString::new("stop").unwrap());
-                        let _ = mpv_command_string(handle, command.as_ptr());
+                    command @ PlayerCommand::Load { .. } => {
+                        break 'playback SessionExit::Reload(command);
                     }
-                    PlayerCommand::StopPlayback => {
-                        let command = CString::new("stop").unwrap();
-                        let _ = mpv_command_string(handle, command.as_ptr());
-                    }
+                    PlayerCommand::StopPlayback => break 'playback SessionExit::Idle,
+                    PlayerCommand::Stop => break 'playback SessionExit::Stop,
                     PlayerCommand::SetPause(paused) => {
-                        let command = CString::new(format!(
-                            "set pause {}",
-                            if paused { "yes" } else { "no" }
-                        ))
-                        .unwrap();
-                        let _ = mpv_command_string(handle, command.as_ptr());
+                        render_enabled = !paused;
+                        run_command(handle, &PlayerCommand::SetPause(paused));
                     }
-                    PlayerCommand::SetVolume(volume) => {
-                        let command =
-                            CString::new(format!("set volume {:.1}", volume.clamp(0., 100.)))
-                                .unwrap();
-                        let _ = mpv_command_string(handle, command.as_ptr());
-                    }
-                    PlayerCommand::SetSpeed(speed) => {
-                        let command =
-                            CString::new(format!("set speed {:.2}", speed.max(0.1))).unwrap();
-                        let _ = mpv_command_string(handle, command.as_ptr());
-                    }
-                    PlayerCommand::SeekPercent(percent) => {
-                        let command = CString::new(format!(
-                            "seek {:.3} absolute-percent",
-                            percent.clamp(0., 1.) * 100.
-                        ))
-                        .unwrap();
-                        let _ = mpv_command_string(handle, command.as_ptr());
-                    }
-                    PlayerCommand::Stop => {
-                        running = false;
-                        break;
-                    }
+                    command @ (PlayerCommand::SetVolume(_)
+                    | PlayerCommand::SetSpeed(_)
+                    | PlayerCommand::SeekPercent(_)) => run_command(handle, &command),
                 }
-            }
-            if !running {
-                break;
             }
 
             let _ = mpv_wait_event(handle, 0.0);
-            let mut params = [
-                MpvRenderParam {
-                    type_: MPV_RENDER_PARAM_SW_SIZE,
-                    data: size.as_ptr() as *mut c_void,
-                },
-                MpvRenderParam {
-                    type_: MPV_RENDER_PARAM_SW_FORMAT,
-                    data: format.as_ptr() as *mut c_void,
-                },
-                MpvRenderParam {
-                    type_: MPV_RENDER_PARAM_SW_STRIDE,
-                    data: &stride as *const usize as *mut c_void,
-                },
-                MpvRenderParam {
-                    type_: MPV_RENDER_PARAM_SW_POINTER,
-                    data: buffer.as_mut_ptr() as *mut c_void,
-                },
-                MpvRenderParam {
-                    type_: 0,
-                    data: ptr::null_mut(),
-                },
-            ];
-            if mpv_render_context_render(context, params.as_mut_ptr()) >= 0 {
-                let mut pixels = vec![0_u8; buffer.len()];
-                for (source, target) in buffer.chunks_exact(4).zip(pixels.chunks_exact_mut(4)) {
-                    target[0] = source[2];
-                    target[1] = source[1];
-                    target[2] = source[0];
-                    target[3] = 255;
-                }
-                match frame_tx.try_send(FramePacket { pixels }) {
-                    Ok(()) | Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => break,
+            let update = mpv_render_context_update(context);
+            if render_enabled && update & MPV_RENDER_UPDATE_FRAME != 0 {
+                let mut params = [
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_SW_SIZE,
+                        data: size.as_ptr() as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_SW_FORMAT,
+                        data: format.as_ptr() as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_SW_STRIDE,
+                        data: &stride as *const usize as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_SW_POINTER,
+                        data: buffer.as_mut_ptr() as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: 0,
+                        data: ptr::null_mut(),
+                    },
+                ];
+                if mpv_render_context_render(context, params.as_mut_ptr()) >= 0 {
+                    let mut pixels = recycled_rx
+                        .try_recv()
+                        .ok()
+                        .filter(|pixels| pixels.len() == buffer.len())
+                        .unwrap_or_else(|| vec![0_u8; buffer.len()]);
+                    for (source, target) in buffer.chunks_exact(4).zip(pixels.chunks_exact_mut(4)) {
+                        target[0] = source[2];
+                        target[1] = source[1];
+                        target[2] = source[0];
+                        target[3] = 255;
+                    }
+                    match frame_tx.try_send(FramePacket { pixels }) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => {
+                            break 'playback SessionExit::Stop;
+                        }
+                    }
                 }
             }
             if last_status.elapsed() >= Duration::from_millis(100) {
@@ -366,17 +452,45 @@ fn run_mpv(
                     volume: get_double_property(handle, "volume").unwrap_or(100.),
                     speed: get_double_property(handle, "speed").unwrap_or(1.),
                 };
+                if status.paused {
+                    render_enabled = false;
+                }
                 match status_tx.try_send(status) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => break,
+                    Err(TrySendError::Disconnected(_)) => {
+                        break 'playback SessionExit::Stop;
+                    }
                 }
                 last_status = Instant::now();
             }
-            thread::sleep(Duration::from_millis(16));
-        }
+            thread::sleep(FRAME_INTERVAL);
+        };
 
         mpv_render_context_free(context);
         mpv_terminate_destroy(handle);
+        crate::allocator::trim();
+        exit
+    }
+}
+
+unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
+    let text = match command {
+        PlayerCommand::SetPause(paused) => {
+            format!("set pause {}", if *paused { "yes" } else { "no" })
+        }
+        PlayerCommand::SetVolume(volume) => {
+            format!("set volume {:.1}", volume.clamp(0., 100.))
+        }
+        PlayerCommand::SetSpeed(speed) => format!("set speed {:.2}", speed.max(0.1)),
+        PlayerCommand::SeekPercent(percent) => {
+            format!("seek {:.3} absolute-percent", percent.clamp(0., 1.) * 100.)
+        }
+        PlayerCommand::Load { .. } | PlayerCommand::StopPlayback | PlayerCommand::Stop => return,
+    };
+    if let Ok(command) = CString::new(text) {
+        unsafe {
+            let _ = mpv_command_string(handle, command.as_ptr());
+        }
     }
 }
 

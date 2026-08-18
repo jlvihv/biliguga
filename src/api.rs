@@ -1,4 +1,5 @@
 use crate::model::Video;
+use futures::channel::oneshot;
 use gpui::RenderImage;
 use image::Frame;
 use md5::{Digest, Md5};
@@ -8,7 +9,12 @@ use serde_json::Value;
 use smallvec::SmallVec;
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -111,12 +117,43 @@ fn https_url(value: String) -> String {
     }
 }
 
-pub(crate) fn download_cover(client: &Client, url: &str) -> Option<Arc<RenderImage>> {
+fn image_client() -> Option<&'static Client> {
+    static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .user_agent("Mozilla/5.0 biliguga/0.1")
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(15))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+fn thumbnail_url(url: &str, width: u32, height: u32) -> String {
+    let normalized = https_url(url.to_string());
+    if !(normalized.contains(".hdslb.com/") || normalized.contains(".biliimg.com/")) {
+        return normalized;
+    }
+
+    let base = normalized
+        .split('?')
+        .next()
+        .unwrap_or(&normalized)
+        .split('@')
+        .next()
+        .unwrap_or(&normalized);
+    format!("{base}@{width}w_{height}h_1c.webp")
+}
+
+fn download_image(url: &str, width: u32, height: u32) -> Option<Arc<RenderImage>> {
     if url.is_empty() {
         return None;
     }
-    let response = client
-        .get(url)
+    let request_url = thumbnail_url(url, width, height);
+    let response = image_client()?
+        .get(&request_url)
         .header("Referer", "https://www.bilibili.com/")
         .send()
         .ok()?;
@@ -124,8 +161,21 @@ pub(crate) fn download_cover(client: &Client, url: &str) -> Option<Arc<RenderIma
         return None;
     }
     let bytes = response.bytes().ok()?;
-    let rgba = image::load_from_memory(&bytes).ok()?.into_rgba8();
-    let mut rgba = image::imageops::thumbnail(&rgba, 320, 180);
+    let compressed_len = bytes.len();
+    let source = image::load_from_memory(&bytes).ok()?.into_rgba8();
+    drop(bytes);
+    if std::env::var_os("BILIGUGA_IMAGE_DEBUG").is_some() {
+        eprintln!(
+            "[biliguga-image] decode bytes={} source={}x{} target={}x{}",
+            compressed_len,
+            source.width(),
+            source.height(),
+            width,
+            height,
+        );
+    }
+    let mut rgba = image::imageops::thumbnail(&source, width, height);
+    drop(source);
     for pixel in rgba.pixels_mut() {
         let [red, green, blue, alpha] = pixel.0;
         pixel.0 = [blue, green, red, alpha];
@@ -134,6 +184,74 @@ pub(crate) fn download_cover(client: &Client, url: &str) -> Option<Arc<RenderIma
         Frame::new(rgba),
         1,
     ))))
+}
+
+pub(crate) fn download_cover(url: &str) -> Option<Arc<RenderImage>> {
+    download_image(url, 160, 90)
+}
+
+struct CoverRequest {
+    url: String,
+    cancelled: Arc<AtomicBool>,
+    reply: oneshot::Sender<Option<Arc<RenderImage>>>,
+}
+
+struct CoverWorkers {
+    senders: Vec<mpsc::Sender<CoverRequest>>,
+    next: AtomicUsize,
+}
+
+fn cover_workers() -> Option<&'static CoverWorkers> {
+    const WORKER_COUNT: usize = 4;
+    static WORKERS: OnceLock<Option<CoverWorkers>> = OnceLock::new();
+
+    WORKERS
+        .get_or_init(|| {
+            let mut senders = Vec::with_capacity(WORKER_COUNT);
+            for index in 0..WORKER_COUNT {
+                let (sender, receiver) = mpsc::channel::<CoverRequest>();
+                thread::Builder::new()
+                    .name(format!("biliguga-cover-{index}"))
+                    .spawn(move || {
+                        while let Ok(request) = receiver.recv() {
+                            let image = if request.cancelled.load(Ordering::Acquire) {
+                                None
+                            } else {
+                                download_cover(&request.url)
+                            };
+                            let _ = request.reply.send(image);
+                        }
+                    })
+                    .ok()?;
+                senders.push(sender);
+            }
+            Some(CoverWorkers {
+                senders,
+                next: AtomicUsize::new(0),
+            })
+        })
+        .as_ref()
+}
+
+pub(crate) fn queue_cover_download(
+    url: String,
+    cancelled: Arc<AtomicBool>,
+) -> Option<oneshot::Receiver<Option<Arc<RenderImage>>>> {
+    let workers = cover_workers()?;
+    let (reply, receiver) = oneshot::channel();
+    let index = workers.next.fetch_add(1, Ordering::Relaxed) % workers.senders.len();
+    workers.senders[index]
+        .send(CoverRequest {
+            url,
+            cancelled,
+            reply,
+        })
+        .ok()?;
+    Some(receiver)
+}
+
+pub(crate) fn download_avatar(url: &str) -> Option<Arc<RenderImage>> {
+    download_image(url, 160, 160)
 }
 
 fn parse_video(item: &Value, index: usize) -> Option<Video> {
@@ -964,6 +1082,31 @@ pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
         Ok(())
     } else {
         Err(api_error(&response, "投币"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thumbnail_url;
+
+    #[test]
+    fn bilibili_thumbnail_url_requests_small_cdn_image() {
+        assert_eq!(
+            thumbnail_url(
+                "http://i0.hdslb.com/bfs/archive/cover.jpg@672w_378h.webp?legacy=1",
+                160,
+                90,
+            ),
+            "https://i0.hdslb.com/bfs/archive/cover.jpg@160w_90h_1c.webp",
+        );
+    }
+
+    #[test]
+    fn non_bilibili_thumbnail_url_is_unchanged() {
+        assert_eq!(
+            thumbnail_url("https://example.com/cover.jpg", 160, 90),
+            "https://example.com/cover.jpg",
+        );
     }
 }
 
