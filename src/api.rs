@@ -144,6 +144,7 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
     let danmaku = number(item.get("stat").and_then(|stat| stat.get("danmaku")));
     Some(Video {
         bvid,
+        aid: number(item.get("aid")),
         cid: number(item.get("cid")),
         title: text(item.get("title")),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
@@ -197,6 +198,7 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
     let duration = clean_search_text(text(item.get("duration")));
     Some(Video {
         bvid,
+        aid: number(item.get("aid")),
         cid: 0,
         title,
         uploader: clean_search_text(text(item.get("author"))),
@@ -479,6 +481,7 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
     };
     Some(Video {
         bvid,
+        aid: number(history.get("aid")).max(number(item.get("aid"))),
         cid: number(history.get("cid")),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("author_name")),
@@ -530,6 +533,273 @@ pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
         .enumerate()
         .filter_map(|(index, item)| parse_history_video(item, index))
         .collect())
+}
+
+fn api_error(response: &Value, operation: &str) -> String {
+    format!(
+        "{operation}接口返回错误 {}：{}",
+        number(response.get("code")),
+        text(response.get("message"))
+    )
+}
+
+fn csrf_from_cookie(cookie: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        (name == "bili_jct").then(|| value.to_string())
+    })
+}
+
+fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
+    let bvid = text(item.get("bvid"));
+    if bvid.is_empty() {
+        return None;
+    }
+    let stat = item.get("stat");
+    Some(Video {
+        bvid,
+        aid: number(item.get("aid")),
+        cid: number(item.get("cid")),
+        title: clean_search_text(text(item.get("title"))),
+        uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
+        stats: format!(
+            "{}播放  ·  {}弹幕",
+            compact_number(number(stat.and_then(|stat| stat.get("view")))),
+            compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
+        ),
+        duration: duration(item.get("duration")),
+        cover: https_url(text(item.get("pic"))),
+        cover_image: None,
+        accent: accent_for(index),
+        category: "稍后再看".into(),
+    })
+}
+
+pub(crate) fn fetch_watch_later(cookie: &str) -> Result<Vec<Video>, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/v2/history/toview")
+            .header("Referer", "https://www.bilibili.com/watchlater/"),
+        Some(cookie),
+    )
+    .send()
+    .map_err(|error| format!("请求稍后再看失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析稍后再看失败：{error}"))?;
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "稍后再看"));
+    }
+    let items = response
+        .get("data")
+        .and_then(|data| data.get("list").or(Some(data)))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "稍后再看接口没有返回列表".to_string())?;
+    Ok(items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| parse_watch_later_video(item, index))
+        .collect())
+}
+
+fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
+    let bvid = {
+        let bvid = text(item.get("bvid"));
+        if bvid.is_empty() {
+            text(item.get("bv_id"))
+        } else {
+            bvid
+        }
+    };
+    if bvid.is_empty() {
+        return None;
+    }
+    let ugc = item.get("ugc");
+    let upper = item.get("upper");
+    let stat = item.get("cnt_info");
+    Some(Video {
+        bvid,
+        aid: number(item.get("id")),
+        cid: number(ugc.and_then(|ugc| ugc.get("first_cid"))),
+        title: clean_search_text(text(item.get("title"))),
+        uploader: text(upper.and_then(|upper| upper.get("name"))),
+        stats: format!(
+            "{}播放  ·  {}弹幕",
+            compact_number(number(stat.and_then(|stat| stat.get("play")))),
+            compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
+        ),
+        duration: duration(item.get("duration")),
+        cover: https_url(text(item.get("cover"))),
+        cover_image: None,
+        accent: accent_for(index),
+        category: "收藏夹".into(),
+    })
+}
+
+pub(crate) fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let folders: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/v3/fav/folder/created/list-all")
+            .header(
+                "Referer",
+                format!("https://space.bilibili.com/{mid}/favlist"),
+            )
+            .query(&[
+                ("up_mid", mid.to_string()),
+                ("web_location", "333.1387".into()),
+            ]),
+        Some(cookie),
+    )
+    .send()
+    .map_err(|error| format!("请求收藏夹失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析收藏夹失败：{error}"))?;
+    if number(folders.get("code")) != 0 {
+        return Err(api_error(&folders, "收藏夹"));
+    }
+    let folder_id = folders
+        .get("data")
+        .and_then(|data| data.get("list"))
+        .and_then(Value::as_array)
+        .and_then(|folders| {
+            folders.iter().find_map(|folder| {
+                let id = number(folder.get("id")).max(number(folder.get("fid")));
+                (id > 0).then_some(id)
+            })
+        })
+        .ok_or_else(|| "没有找到可用的收藏夹".to_string())?;
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/v3/fav/resource/list")
+            .header(
+                "Referer",
+                format!("https://www.bilibili.com/medialist/detail/ml{folder_id}"),
+            )
+            .query(&[
+                ("media_id", folder_id.to_string()),
+                ("pn", "1".into()),
+                ("ps", "30".into()),
+                ("type", "0".into()),
+                ("tid", "0".into()),
+                ("platform", "web".into()),
+            ]),
+        Some(cookie),
+    )
+    .send()
+    .map_err(|error| format!("请求收藏视频失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析收藏视频失败：{error}"))?;
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "收藏视频"));
+    }
+    let items = response
+        .get("data")
+        .and_then(|data| data.get("medias"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "收藏夹没有返回视频列表".to_string())?;
+    Ok(items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| parse_favorite_video(item, index))
+        .collect())
+}
+
+pub(crate) fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), String> {
+    let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response: Value = with_cookie(
+        client
+            .post("https://api.bilibili.com/x/v2/history/toview/add")
+            .header("Referer", "https://www.bilibili.com/"),
+        Some(cookie),
+    )
+    .form(&[("aid", aid.to_string()), ("csrf", csrf)])
+    .send()
+    .map_err(|error| format!("添加稍后再看失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析稍后再看响应失败：{error}"))?;
+    if number(response.get("code")) == 0 {
+        Ok(())
+    } else {
+        Err(api_error(&response, "添加稍后再看"))
+    }
+}
+
+pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), String> {
+    let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let folders: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/v3/fav/folder/created/list-all")
+            .header(
+                "Referer",
+                format!("https://space.bilibili.com/{mid}/favlist"),
+            )
+            .query(&[
+                ("up_mid", mid.to_string()),
+                ("web_location", "333.1387".into()),
+            ]),
+        Some(cookie),
+    )
+    .send()
+    .map_err(|error| format!("请求默认收藏夹失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析默认收藏夹失败：{error}"))?;
+    if number(folders.get("code")) != 0 {
+        return Err(api_error(&folders, "默认收藏夹"));
+    }
+    let folder_id = folders
+        .get("data")
+        .and_then(|data| data.get("list"))
+        .and_then(Value::as_array)
+        .and_then(|folders| {
+            folders.iter().find_map(|folder| {
+                let id = number(folder.get("id")).max(number(folder.get("fid")));
+                (id > 0).then_some(id)
+            })
+        })
+        .ok_or_else(|| "没有找到可用的收藏夹".to_string())?;
+    let response: Value = with_cookie(
+        client
+            .post("https://api.bilibili.com/x/v3/fav/resource/deal")
+            .header("Referer", "https://www.bilibili.com/"),
+        Some(cookie),
+    )
+    .form(&[
+        ("rid", aid.to_string()),
+        ("type", "2".into()),
+        ("add_media_ids", folder_id.to_string()),
+        ("del_media_ids", String::new()),
+        ("csrf", csrf),
+    ])
+    .send()
+    .map_err(|error| format!("收藏视频失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析收藏响应失败：{error}"))?;
+    if number(response.get("code")) == 0 {
+        Ok(())
+    } else {
+        Err(api_error(&response, "收藏视频"))
+    }
 }
 
 pub(crate) fn resolve_play_url(video: &Video, cookie: Option<&str>) -> Result<String, String> {

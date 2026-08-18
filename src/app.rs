@@ -1,6 +1,7 @@
 use crate::{
     api::{
-        download_cover, fetch_history, fetch_recommendations, fetch_search_results, format_time,
+        add_to_favorites, add_to_watch_later, download_cover, fetch_favorites, fetch_history,
+        fetch_recommendations, fetch_search_results, fetch_watch_later, format_time,
         resolve_play_url,
     },
     login::{self, PollResult, UserSession},
@@ -24,9 +25,13 @@ struct BiliGuga {
     videos: Vec<Video>,
     search_results: Vec<Video>,
     history: Vec<Video>,
+    watch_later: Vec<Video>,
+    favorites: Vec<Video>,
     selected: usize,
     loading: bool,
     history_loading: bool,
+    watch_later_loading: bool,
+    favorites_loading: bool,
     session: Option<UserSession>,
     account_avatar: Option<Arc<RenderImage>>,
     login_image: Option<Arc<RenderImage>>,
@@ -48,6 +53,8 @@ struct BiliGuga {
 enum AppTab {
     Home,
     Search,
+    WatchLater,
+    Favorites,
     History,
     Login,
 }
@@ -74,9 +81,13 @@ impl BiliGuga {
             videos: Vec::new(),
             search_results: Vec::new(),
             history: Vec::new(),
+            watch_later: Vec::new(),
+            favorites: Vec::new(),
             selected: 0,
             loading: true,
             history_loading: false,
+            watch_later_loading: false,
+            favorites_loading: false,
             session,
             account_avatar: None,
             login_image: None,
@@ -99,6 +110,8 @@ impl BiliGuga {
         match self.active_tab {
             AppTab::Home => &self.videos,
             AppTab::Search => &self.search_results,
+            AppTab::WatchLater => &self.watch_later,
+            AppTab::Favorites => &self.favorites,
             AppTab::History => &self.history,
             AppTab::Login => &self.videos,
         }
@@ -108,6 +121,8 @@ impl BiliGuga {
         match self.active_tab {
             AppTab::Home => &mut self.videos,
             AppTab::Search => &mut self.search_results,
+            AppTab::WatchLater => &mut self.watch_later,
+            AppTab::Favorites => &mut self.favorites,
             AppTab::History => &mut self.history,
             AppTab::Login => &mut self.videos,
         }
@@ -201,6 +216,128 @@ impl BiliGuga {
     fn refresh_history(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.history_loading {
             self.load_history(cx);
+        }
+    }
+
+    fn show_watch_later(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.active_tab = AppTab::WatchLater;
+        self.stop_current_playback();
+        if self.session.is_none() {
+            self.message = SharedString::from("请先登录后查看稍后再看");
+            cx.notify();
+            return;
+        }
+        if self.watch_later.is_empty() && !self.watch_later_loading {
+            self.load_watch_later(cx);
+        } else {
+            self.message =
+                SharedString::from(format!("稍后再看 · {} 个视频", self.watch_later.len()));
+            cx.notify();
+        }
+    }
+
+    fn load_watch_later(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后查看稍后再看");
+            cx.notify();
+            return;
+        };
+        self.watch_later_loading = true;
+        self.watch_later.clear();
+        self.selected = 0;
+        self.message = SharedString::from("正在加载稍后再看…");
+        let cookie = session.cookie.clone();
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { fetch_watch_later(&cookie) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.watch_later_loading = false;
+                match result {
+                    Ok(videos) => {
+                        let count = videos.len();
+                        app.watch_later = videos;
+                        app.message = SharedString::from(format!("稍后再看 · {count} 个视频"));
+                        if app.active_tab == AppTab::WatchLater {
+                            app.start_cover_loading(cx);
+                        }
+                    }
+                    Err(error) => {
+                        app.message = SharedString::from(format!("加载稍后再看失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_watch_later(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.watch_later_loading {
+            self.load_watch_later(cx);
+        }
+    }
+
+    fn show_favorites(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.active_tab = AppTab::Favorites;
+        self.stop_current_playback();
+        if self.session.is_none() {
+            self.message = SharedString::from("请先登录后查看收藏夹");
+            cx.notify();
+            return;
+        }
+        if self.favorites.is_empty() && !self.favorites_loading {
+            self.load_favorites(cx);
+        } else {
+            self.message = SharedString::from(format!("收藏夹 · {} 个视频", self.favorites.len()));
+            cx.notify();
+        }
+    }
+
+    fn load_favorites(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后查看收藏夹");
+            cx.notify();
+            return;
+        };
+        self.favorites_loading = true;
+        self.favorites.clear();
+        self.selected = 0;
+        self.message = SharedString::from("正在加载收藏夹…");
+        let cookie = session.cookie.clone();
+        let mid = session.mid;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { fetch_favorites(&cookie, mid) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.favorites_loading = false;
+                match result {
+                    Ok(videos) => {
+                        let count = videos.len();
+                        app.favorites = videos;
+                        app.message = SharedString::from(format!("收藏夹 · {count} 个视频"));
+                        if app.active_tab == AppTab::Favorites {
+                            app.start_cover_loading(cx);
+                        }
+                    }
+                    Err(error) => {
+                        app.message = SharedString::from(format!("加载收藏夹失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_favorites(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.favorites_loading {
+            self.load_favorites(cx);
         }
     }
 
@@ -379,10 +516,94 @@ impl BiliGuga {
         login::clear_session();
         self.session = None;
         self.account_avatar = None;
+        self.history.clear();
+        self.watch_later.clear();
+        self.favorites.clear();
         self.login_image = None;
         self.login_key = None;
         self.login_status = SharedString::from("已退出登录");
         cx.notify();
+    }
+
+    fn add_video_to_watch_later(
+        &mut self,
+        index: usize,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后使用稍后再看");
+            cx.notify();
+            return;
+        };
+        let Some(video) = self.current_videos().get(index).cloned() else {
+            return;
+        };
+        if video.aid <= 0 {
+            self.message = SharedString::from("这个视频没有可用的 AV 号");
+            cx.notify();
+            return;
+        }
+        let cookie = session.cookie.clone();
+        let title = video.title.clone();
+        self.message = SharedString::from(format!("正在添加：{title}"));
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { add_to_watch_later(&cookie, video.aid) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.message = SharedString::from(match result {
+                    Ok(()) => "已添加到稍后再看".to_string(),
+                    Err(error) => format!("添加稍后再看失败：{error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn add_video_to_favorites(
+        &mut self,
+        index: usize,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = &self.session else {
+            self.message = SharedString::from("请先登录后使用收藏功能");
+            cx.notify();
+            return;
+        };
+        let Some(video) = self.current_videos().get(index).cloned() else {
+            return;
+        };
+        if video.aid <= 0 {
+            self.message = SharedString::from("这个视频没有可用的 AV 号");
+            cx.notify();
+            return;
+        }
+        let cookie = session.cookie.clone();
+        let mid = session.mid;
+        let title = video.title.clone();
+        self.message = SharedString::from(format!("正在收藏：{title}"));
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { add_to_favorites(&cookie, mid, video.aid) })
+                .await;
+            view.update(cx, |app, cx| {
+                app.message = SharedString::from(match result {
+                    Ok(()) => "已收藏到默认收藏夹".to_string(),
+                    Err(error) => format!("收藏失败：{error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_cover_loading(&self, cx: &mut Context<Self>) {
@@ -695,7 +916,18 @@ impl BiliGuga {
                 cx.listener(Self::show_home),
             ))
             .child(sidebar_item("▣", "动态", false))
-            .child(sidebar_item("♡", "收藏", false))
+            .child(clickable_sidebar_item(
+                "♡",
+                "收藏",
+                self.active_tab == AppTab::Favorites,
+                cx.listener(Self::show_favorites),
+            ))
+            .child(clickable_sidebar_item(
+                "＋",
+                "稍后",
+                self.active_tab == AppTab::WatchLater,
+                cx.listener(Self::show_watch_later),
+            ))
             .child(clickable_sidebar_item(
                 "◷",
                 "历史",
@@ -727,7 +959,9 @@ impl BiliGuga {
         entity: Entity<BiliGuga>,
     ) -> impl IntoElement + use<> {
         let title = video.title.clone();
-        let click_entity = entity;
+        let click_entity = entity.clone();
+        let later_entity = entity.clone();
+        let favorite_entity = entity.clone();
         div()
             .id(SharedString::from(format!("video-card-{index}")))
             .w_full()
@@ -758,9 +992,53 @@ impl BiliGuga {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(0xa9afbc))
-                            .child(format!("{}  ·  {}", video.uploader, video.duration)),
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xa9afbc))
+                                    .text_ellipsis()
+                                    .child(format!("{}  ·  {}", video.uploader, video.duration)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .text_xs()
+                                    .text_color(rgb(0x878a98))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("later-{index}")))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0x74ade8)))
+                                            .child("稍后")
+                                            .on_click(move |event, window, cx| {
+                                                later_entity.update(cx, |this, cx| {
+                                                    this.add_video_to_watch_later(
+                                                        index, event, window, cx,
+                                                    );
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("favorite-{index}")))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(0x74ade8)))
+                                            .child("收藏")
+                                            .on_click(move |event, window, cx| {
+                                                favorite_entity.update(cx, |this, cx| {
+                                                    this.add_video_to_favorites(
+                                                        index, event, window, cx,
+                                                    );
+                                                });
+                                            }),
+                                    ),
+                            ),
                     ),
             )
             .on_click(move |event, window, cx| {
@@ -887,8 +1165,14 @@ impl BiliGuga {
             return self.render_login(cx);
         }
         let is_search = self.active_tab == AppTab::Search;
+        let is_watch_later = self.active_tab == AppTab::WatchLater;
+        let is_favorites = self.active_tab == AppTab::Favorites;
         let is_history = self.active_tab == AppTab::History;
-        let is_loading = if is_history {
+        let is_loading = if is_watch_later {
+            self.watch_later_loading
+        } else if is_favorites {
+            self.favorites_loading
+        } else if is_history {
             self.history_loading
         } else {
             self.loading
@@ -909,6 +1193,10 @@ impl BiliGuga {
                     .text_color(rgb(0xa9afbc))
                     .child(if is_search {
                         "正在搜索 B 站视频…"
+                    } else if is_watch_later {
+                        "正在加载稍后再看…"
+                    } else if is_favorites {
+                        "正在加载收藏夹…"
                     } else if is_history {
                         "正在加载观看历史…"
                     } else {
@@ -925,6 +1213,18 @@ impl BiliGuga {
                     .text_color(rgb(0xd07277))
                     .child(if is_search {
                         "没有找到视频，请换个关键词试试"
+                    } else if is_watch_later {
+                        if self.session.is_some() {
+                            "还没有稍后再看"
+                        } else {
+                            "请先登录后查看稍后再看"
+                        }
+                    } else if is_favorites {
+                        if self.session.is_some() {
+                            "还没有收藏视频"
+                        } else {
+                            "请先登录后查看收藏夹"
+                        }
                     } else if is_history {
                         if self.session.is_some() {
                             "还没有观看历史"
@@ -971,6 +1271,10 @@ impl BiliGuga {
                     .text_color(rgb(0xdce0e5))
                     .child(if is_search {
                         "搜索"
+                    } else if is_watch_later {
+                        "稍后再看"
+                    } else if is_favorites {
+                        "收藏夹"
                     } else if is_history {
                         "观看历史"
                     } else {
@@ -989,7 +1293,11 @@ impl BiliGuga {
                     .hover(|style| style.bg(rgb(0x363c46)))
                     .child("刷新")
                     .on_click(cx.listener(move |app, event, window, cx| {
-                        if is_history {
+                        if is_watch_later {
+                            app.refresh_watch_later(event, window, cx);
+                        } else if is_favorites {
+                            app.refresh_favorites(event, window, cx);
+                        } else if is_history {
                             app.refresh_history(event, window, cx);
                         } else {
                             app.refresh(event, window, cx);

@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub(crate) struct Video {
     pub(crate) bvid: String,
+    pub(crate) aid: i64,
     pub(crate) cid: i64,
     pub(crate) title: String,
     pub(crate) uploader: String,
@@ -17,6 +18,7 @@ pub(crate) struct Video {
 
 pub(crate) static LOADING_VIDEO: Video = Video {
     bvid: String::new(),
+    aid: 0,
     cid: 0,
     title: String::new(),
     uploader: String::new(),
