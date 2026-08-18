@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libmpv-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            pkg-config
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-mpv
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install mpv
+
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:/usr/bin:$PATH"
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        run: |
+          export LIBRARY_PATH="$(brew --prefix mpv)/lib"
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: runner.os != 'Windows'
+        run: cargo test --target ${{ matrix.target }}

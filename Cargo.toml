@@ -10,7 +10,7 @@ gpui = { path = "vendor/gpui" }
 
 [dependencies]
 futures = "0.3"
-gpui = "0.2.2"
+gpui = { version = "0.2.2", features = ["macos-blade"] }
 image = "0.25"
 md-5 = "0.10"
 percent-encoding = "2"

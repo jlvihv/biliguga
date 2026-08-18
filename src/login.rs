@@ -206,11 +206,24 @@ fn fetch_user(cookie: &str) -> Result<UserSession, String> {
 }
 
 fn session_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("biliguga")
-        .join("session")
+        .join("Library")
+        .join("Application Support");
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    base.join("biliguga").join("session")
 }
 
 pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
