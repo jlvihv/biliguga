@@ -22,7 +22,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - name: windows-x86_64
             os: windows-latest
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
@@ -42,6 +42,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libmpv-dev \
+            libjemalloc-dev \
             libfontconfig1-dev \
             libfreetype6-dev \
             libx11-xcb-dev \
@@ -54,15 +55,23 @@ jobs:
             libxcb-xfixes0-dev \
             pkg-config
 
-      - name: Install Windows dependencies
+      - name: Install Windows libmpv
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-mpv
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-(?!v3-).*\.7z$' } | Select-Object -First 1
+          if (-not $asset) {
+            $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-.*\.7z$' } | Select-Object -First 1
+          }
+          if (-not $asset) { throw 'No x86_64 mpv-dev asset found' }
+          Invoke-WebRequest $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\mpv-dev.7z"
+          7z x "$env:RUNNER_TEMP\mpv-dev.7z" -o"$env:RUNNER_TEMP\mpv-dev" -y | Out-Null
+          $root = Get-ChildItem "$env:RUNNER_TEMP\mpv-dev" -Directory | Select-Object -First 1
+          if (-not $root) { $root = Get-Item "$env:RUNNER_TEMP\mpv-dev" }
+          "MPV_ROOT=$($root.FullName)" >> $env:GITHUB_ENV
+          "LIB=$($root.FullName)\lib;$env:LIB" >> $env:GITHUB_ENV
+          "PATH=$($root.FullName)\bin;$env:PATH" >> $env:GITHUB_ENV
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -74,10 +83,7 @@ jobs:
 
       - name: Build Windows
         if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: |
-          export PATH="/c/Users/runneradmin/.cargo/bin:/mingw64/bin:/usr/bin:$PATH"
-          cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build macOS
         if: runner.os == 'macOS'
@@ -103,14 +109,13 @@ jobs:
 
       - name: Package Windows
         if: runner.os == 'Windows'
-        shell: msys2 {0}
+        shell: pwsh
         run: |
-          export PATH="/c/Users/runneradmin/.cargo/bin:/mingw64/bin:/usr/bin:$PATH"
-          mkdir -p dist/biliguga
-          cp target/${{ matrix.target }}/release/biliguga.exe dist/biliguga/
-          cp README.md dist/biliguga/
-          cp /mingw64/bin/libmpv-2.dll dist/biliguga/
-          7z a biliguga-${{ matrix.name }}.zip ./dist/biliguga/*
+          New-Item -ItemType Directory -Force dist/biliguga | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/biliguga.exe dist/biliguga/
+          Copy-Item README.md dist/biliguga/
+          Copy-Item "$env:MPV_ROOT\bin\*.dll" dist/biliguga/ -ErrorAction SilentlyContinue
+          7z a biliguga-${{ matrix.name }}.zip .\dist\biliguga\* | Out-Null
 
       - name: Upload package
         uses: actions/upload-artifact@v4

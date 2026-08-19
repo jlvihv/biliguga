@@ -19,7 +19,7 @@
 | 平台 | 构建依赖 | 运行时依赖 |
 | --- | --- | --- |
 | Linux | Rust、`libmpv-dev`、GPUI 的图形依赖 | `libmpv.so` |
-| Windows | Rust GNU toolchain、MSYS2 `mingw-w64-x86_64-mpv` | `libmpv-2.dll` 及其依赖 |
+| Windows | Rust MSVC toolchain、Visual Studio Build Tools、mpv-dev | `libmpv-2.dll` 及其依赖 |
 | macOS | Rust、Homebrew `mpv` | Homebrew mpv 的动态库 |
 
 ## 本地构建
@@ -38,13 +38,14 @@ brew install mpv
 LIBRARY_PATH="$(brew --prefix mpv)/lib" cargo run --release
 ```
 
-Windows 建议使用 MSYS2 的 MINGW64 环境：
+Windows 需要 Visual Studio Build Tools，并下载对应架构的 `mpv-dev` 压缩包：
 
 ```bash
-pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-mpv
-rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
+rustup target add x86_64-pc-windows-msvc
+cargo build --release --target x86_64-pc-windows-msvc
 ```
+
+将 `mpv-dev` 中的 `mpv.lib` 加入库搜索路径，并将 `libmpv-2.dll` 放到程序旁边。GitHub Actions 会自动下载并配置它。
 
 ## 登录状态
 
