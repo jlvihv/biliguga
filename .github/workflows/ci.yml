@@ -65,15 +65,24 @@ jobs:
           $extract = "$env:RUNNER_TEMP\mpv-dev"
           7z x "$env:RUNNER_TEMP\mpv-dev.7z" -o"$extract" -y | Out-Null
           $root = Get-Item $extract
-          if (-not (Test-Path "$root\lib\mpv.lib")) {
+          if (-not (Test-Path "$root\libmpv.dll.a")) {
             $root = Get-ChildItem $extract -Directory |
-              Where-Object { Test-Path "$($_.FullName)\lib\mpv.lib" } |
+              Where-Object { Test-Path "$($_.FullName)\libmpv.dll.a" } |
               Select-Object -First 1
           }
           if (-not $root) {
             Get-ChildItem $extract -Recurse -File | Select-Object -First 80 | ForEach-Object FullName
-            throw 'Could not locate lib\\mpv.lib in the extracted mpv development package'
+            throw 'Could not locate libmpv.dll.a in the extracted mpv development package'
           }
+          New-Item -ItemType Directory -Force "$($root.FullName)\lib" | Out-Null
+          $exports = llvm-nm --extern-only --defined-only "$($root.FullName)\libmpv.dll.a" |
+            ForEach-Object {
+              $parts = $_ -split '\s+'
+              if ($parts.Length -ge 3 -and $parts[2] -match '^mpv_') { $parts[2] }
+            } | Sort-Object -Unique
+          @('LIBRARY libmpv-2.dll', 'EXPORTS') + $exports |
+            Set-Content "$($root.FullName)\mpv.def"
+          llvm-dlltool -m i386:x86-64 -d "$($root.FullName)\mpv.def" -l "$($root.FullName)\lib\mpv.lib"
           "MPV_ROOT=$($root.FullName)" >> $env:GITHUB_ENV
           "LIB=$($root.FullName)\lib;$env:LIB" >> $env:GITHUB_ENV
           "PATH=$($root.FullName)\bin;$env:PATH" >> $env:GITHUB_ENV
