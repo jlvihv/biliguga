@@ -29,5 +29,5 @@ install -D -m 0644 %{_sourcedir}/biliguga.desktop %{buildroot}%{_datadir}/applic
 %{_datadir}/applications/biliguga.desktop
 
 %changelog
-* Tue Aug 19 2026 jlvihv - 0.1.1-1
+* Wed Aug 19 2026 jlvihv - 0.1.1-1
 - Initial package.

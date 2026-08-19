@@ -142,7 +142,10 @@ jobs:
             -v "$arch_root:/build" \
             archlinux:base-devel \
             bash -lc 'useradd --create-home builder && chown -R builder:builder /build && su builder -c "cd /build && makepkg --nodeps --noconfirm --clean"'
-          cp "$arch_root/"*.pkg.tar.zst "biliguga-${{ matrix.name }}.pkg.tar.zst"
+          arch_package=$(find "$arch_root" -maxdepth 1 -type f \
+            -name 'biliguga-bin-[0-9]*-x86_64.pkg.tar.zst' -print -quit)
+          test -n "$arch_package"
+          cp "$arch_package" "biliguga-${{ matrix.name }}.pkg.tar.zst"
 
       - name: Package macOS
         if: runner.os == 'macOS'
