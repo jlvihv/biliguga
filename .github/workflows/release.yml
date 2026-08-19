@@ -53,7 +53,8 @@ jobs:
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
-            pkg-config
+            pkg-config \
+            rpm
 
       - name: Install Windows libmpv
         if: runner.os == 'Windows'
@@ -112,10 +113,36 @@ jobs:
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
+          version="${GITHUB_REF_NAME#v}"
           mkdir -p dist/biliguga
           cp target/${{ matrix.target }}/release/biliguga dist/biliguga/
           cp README.md dist/biliguga/
           tar -C dist -czf biliguga-${{ matrix.name }}.tar.gz biliguga
+
+          mkdir -p dist/deb-root/DEBIAN dist/deb-root/usr/bin dist/deb-root/usr/share/applications
+          sed "s/^Version:.*/Version: ${version}/" packaging/debian/control > dist/deb-root/DEBIAN/control
+          install -m 0755 target/${{ matrix.target }}/release/biliguga dist/deb-root/usr/bin/biliguga
+          install -m 0644 packaging/common/biliguga.desktop dist/deb-root/usr/share/applications/biliguga.desktop
+          dpkg-deb --build --root-owner-group dist/deb-root "biliguga-${{ matrix.name }}.deb"
+
+          rpm_root="$PWD/dist/rpm"
+          mkdir -p "$rpm_root"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp target/${{ matrix.target }}/release/biliguga "$rpm_root/SOURCES/biliguga"
+          cp packaging/common/biliguga.desktop "$rpm_root/SOURCES/biliguga.desktop"
+          sed "s/^Version:.*/Version:        ${version}/" packaging/rpm/biliguga.spec > "$rpm_root/SPECS/biliguga.spec"
+          rpmbuild --define "_topdir $rpm_root" --target x86_64 -bb "$rpm_root/SPECS/biliguga.spec"
+          cp "$rpm_root/RPMS/x86_64/"*.rpm "biliguga-${{ matrix.name }}.rpm"
+
+          arch_root="$PWD/dist/arch-bin"
+          mkdir -p "$arch_root"
+          cp target/${{ matrix.target }}/release/biliguga "$arch_root/biliguga"
+          cp packaging/common/biliguga.desktop "$arch_root/biliguga.desktop"
+          sed "s/^pkgver=.*/pkgver=${version}/" packaging/arch/PKGBUILD-bin > "$arch_root/PKGBUILD"
+          docker run --rm \
+            -v "$arch_root:/build" \
+            archlinux:base-devel \
+            bash -lc 'useradd --create-home builder && chown -R builder:builder /build && su builder -c "cd /build && makepkg --nodeps --noconfirm --clean"'
+          cp "$arch_root/"*.pkg.tar.zst "biliguga-${{ matrix.name }}.pkg.tar.zst"
 
       - name: Package macOS
         if: runner.os == 'macOS'
@@ -158,12 +185,35 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download packages
         uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: biliguga-*
           merge-multiple: true
+
+      - name: Generate AUR binary package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive_sha=$(sha256sum dist/biliguga-linux-x86_64.tar.gz | awk '{print $1}')
+          desktop_sha=$(sha256sum packaging/common/biliguga.desktop | awk '{print $1}')
+          mkdir -p dist/aur
+          sed \
+            -e "s/^pkgver=.*/pkgver=${version}/" \
+            -e "s/sha256sums=('SKIP' 'SKIP')/sha256sums=('${archive_sha}' '${desktop_sha}')/" \
+            packaging/arch/PKGBUILD > dist/aur/PKGBUILD
+          sed \
+            -e "s/^pkgver = .*/\\tpkgver = ${version}/" \
+            -e "s|/v[0-9][^/]*/|/v${version}/|g" \
+            -e "0,/sha256sums = SKIP/s//sha256sums = ${archive_sha}/" \
+            -e "s/sha256sums = SKIP/sha256sums = ${desktop_sha}/" \
+            packaging/arch/.SRCINFO > dist/aur/.SRCINFO
+          tar -C dist/aur -czf biliguga-linux-x86_64-aur.tar.gz PKGBUILD .SRCINFO
 
       - name: Create release
         env:
@@ -173,3 +223,36 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             --title "biliguga $GITHUB_REF_NAME"
+
+      - name: Publish binary package to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${AUR_SSH_PRIVATE_KEY:-}" ]]; then
+            echo 'AUR_SSH_PRIVATE_KEY is not configured; the AUR package was generated in the Release assets only.'
+            exit 0
+          fi
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          ssh-keyscan -H aur.archlinux.org >> "$HOME/.ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+
+          if ! git clone "ssh://aur@aur.archlinux.org/biliguga-bin.git" aur-repo; then
+            mkdir -p aur-repo
+            git -C aur-repo init -b master
+            git -C aur-repo remote add origin "ssh://aur@aur.archlinux.org/biliguga-bin.git"
+          fi
+          cp dist/aur/PKGBUILD dist/aur/.SRCINFO aur-repo/
+          git -C aur-repo config user.name 'jlvihv'
+          git -C aur-repo config user.email 'jlvihv@users.noreply.github.com'
+          git -C aur-repo add PKGBUILD .SRCINFO
+          if git -C aur-repo diff --cached --quiet; then
+            echo 'AUR package is already up to date.'
+            exit 0
+          fi
+          git -C aur-repo commit -m "更新至 ${GITHUB_REF_NAME}"
+          git -C aur-repo push origin master

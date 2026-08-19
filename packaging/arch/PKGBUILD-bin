@@ -1,0 +1,16 @@
+pkgname=biliguga-bin
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='哔哩咕嘎 Bilibili desktop client binary'
+arch=('x86_64')
+url='https://github.com/jlvihv/biliguga'
+license=('MIT')
+depends=('mpv' 'fontconfig' 'freetype2' 'libx11' 'libxkbcommon' 'wayland' 'libxcb' 'vulkan-icd-loader')
+source=('biliguga' 'biliguga.desktop')
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+  install -Dm755 "$srcdir/biliguga" "$pkgdir/usr/bin/biliguga"
+  install -Dm644 "$srcdir/biliguga.desktop" \
+    "$pkgdir/usr/share/applications/biliguga.desktop"
+}

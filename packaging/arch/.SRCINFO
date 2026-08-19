@@ -1,0 +1,21 @@
+pkgbase = biliguga-bin
+	pkgdesc = 哔哩咕嘎 Bilibili desktop client binary
+	pkgver = 0.1.1
+	pkgrel = 1
+	url = https://github.com/jlvihv/biliguga
+	arch = x86_64
+	license = MIT
+	depends = mpv
+	depends = fontconfig
+	depends = freetype2
+	depends = libx11
+	depends = libxkbcommon
+	depends = wayland
+	depends = libxcb
+	depends = vulkan-icd-loader
+	source = biliguga-linux-x86_64.tar.gz::https://github.com/jlvihv/biliguga/releases/download/v0.1.1/biliguga-linux-x86_64.tar.gz
+	source = biliguga.desktop::https://raw.githubusercontent.com/jlvihv/biliguga/v0.1.1/packaging/common/biliguga.desktop
+	sha256sums = SKIP
+	sha256sums = SKIP
+
+pkgname = biliguga-bin

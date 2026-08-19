@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=哔哩咕嘎
+Comment=Bilibili 桌面客户端
+Exec=biliguga
+Icon=multimedia-video-player
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Network;

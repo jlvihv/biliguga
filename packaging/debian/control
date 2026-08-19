@@ -1,0 +1,9 @@
+Package: biliguga
+Version: 0.1.1
+Section: video
+Priority: optional
+Architecture: amd64
+Depends: libmpv2 | libmpv1, libfontconfig1, libfreetype6, libx11-6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libxcb1, libxcb-render0, libxcb-shape0, libxcb-xfixes0, libvulkan1
+Maintainer: jlvihv
+Description: Native Bilibili desktop client
+ A small native Bilibili client built with Rust, GPUI and libmpv.
