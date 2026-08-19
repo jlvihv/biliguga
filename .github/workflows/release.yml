@@ -181,7 +181,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: biliguga-${{ matrix.name }}
-          path: biliguga-${{ matrix.name }}.*
+          path: |
+            biliguga-${{ matrix.name }}.*
+            biliguga-${{ matrix.name }}-setup.exe
 
   publish:
     name: Publish GitHub Release
@@ -222,7 +224,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          mapfile -t assets < <(find dist -maxdepth 1 -type f -print)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             --title "biliguga $GITHUB_REF_NAME"
