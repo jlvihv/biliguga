@@ -66,9 +66,18 @@ jobs:
           }
           if (-not $asset) { throw 'No x86_64 mpv-dev asset found' }
           Invoke-WebRequest $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\mpv-dev.7z"
-          7z x "$env:RUNNER_TEMP\mpv-dev.7z" -o"$env:RUNNER_TEMP\mpv-dev" -y | Out-Null
-          $root = Get-ChildItem "$env:RUNNER_TEMP\mpv-dev" -Directory | Select-Object -First 1
-          if (-not $root) { $root = Get-Item "$env:RUNNER_TEMP\mpv-dev" }
+          $extract = "$env:RUNNER_TEMP\mpv-dev"
+          7z x "$env:RUNNER_TEMP\mpv-dev.7z" -o"$extract" -y | Out-Null
+          $root = Get-Item $extract
+          if (-not (Test-Path "$root\lib\mpv.lib")) {
+            $root = Get-ChildItem $extract -Directory |
+              Where-Object { Test-Path "$($_.FullName)\lib\mpv.lib" } |
+              Select-Object -First 1
+          }
+          if (-not $root) {
+            Get-ChildItem $extract -Recurse -File | Select-Object -First 80 | ForEach-Object FullName
+            throw 'Could not locate lib\\mpv.lib in the extracted mpv development package'
+          }
           "MPV_ROOT=$($root.FullName)" >> $env:GITHUB_ENV
           "LIB=$($root.FullName)\lib;$env:LIB" >> $env:GITHUB_ENV
           "PATH=$($root.FullName)\bin;$env:PATH" >> $env:GITHUB_ENV
