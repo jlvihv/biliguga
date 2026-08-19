@@ -218,7 +218,7 @@ jobs:
             -e "0,/sha256sums = SKIP/s//sha256sums = ${archive_sha}/" \
             -e "s/sha256sums = SKIP/sha256sums = ${desktop_sha}/" \
             packaging/arch/.SRCINFO > dist/aur/.SRCINFO
-          tar -C dist/aur -czf biliguga-linux-x86_64-aur.tar.gz PKGBUILD .SRCINFO
+          tar -C dist/aur -czf dist/biliguga-linux-x86_64-aur.tar.gz PKGBUILD .SRCINFO
 
       - name: Create release
         env:
