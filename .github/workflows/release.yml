@@ -134,6 +134,17 @@ jobs:
           Copy-Item README.md dist/biliguga/
           Copy-Item "$env:MPV_ROOT\*.dll" dist/biliguga/ -ErrorAction SilentlyContinue
           Copy-Item "$env:MPV_ROOT\bin\*.dll" dist/biliguga/ -ErrorAction SilentlyContinue
+          $inno = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $inno)) {
+            choco install innosetup --no-progress --yes
+          }
+          if (-not (Test-Path $inno)) {
+            $inno = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $inno)) { throw 'Inno Setup compiler was not found' }
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          & $inno "/DAppVersion=$version" "installer\biliguga.iss"
+          Copy-Item dist/biliguga-windows-x86_64-setup.exe .
           7z a biliguga-${{ matrix.name }}.zip .\dist\biliguga\* | Out-Null
 
       - name: Upload package

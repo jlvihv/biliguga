@@ -51,6 +51,8 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 程序使用二维码登录，登录状态保存在当前用户的数据目录中。Cookie 只用于访问 B 站接口，请不要把 session 文件提交到仓库。
 
+Windows Release 同时提供 `biliguga-windows-x86_64-setup.exe` 安装程序，安装后可从开始菜单启动；Windows 安装包已包含播放器运行库。
+
 ## GitHub Actions
 
 推送普通分支或 Pull Request 会构建并测试三个平台。推送 `v*` 格式的 tag 会构建发布包并自动创建 GitHub Release。
