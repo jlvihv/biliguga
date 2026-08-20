@@ -1419,7 +1419,7 @@ pub(crate) fn fetch_comments(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_history_video, parse_video, thumbnail_url};
+    use super::{parse_history_video, parse_play_url, parse_video, thumbnail_url};
     use serde_json::json;
 
     #[test]
@@ -1480,12 +1480,35 @@ mod tests {
             "https://example.com/cover.jpg",
         );
     }
+
+    #[test]
+    fn play_url_uses_bilibili_quality_metadata() {
+        let result = parse_play_url(
+            &json!({
+                "data": {
+                    "quality": 64,
+                    "durl": [{"url": "https://cdn.example/video.mp4"}],
+                    "accept_quality": [16, 32, 64],
+                    "accept_description": ["360P", "480P", "720P"]
+                }
+            }),
+            789,
+            123456,
+        )
+        .expect("play url should parse");
+
+        assert_eq!(result.actual_quality, 64);
+        assert_eq!(result.qualities.len(), 3);
+        assert_eq!(result.qualities[1].qn, 32);
+        assert_eq!(result.qualities[1].label, "480P");
+    }
 }
 
 pub(crate) fn resolve_play_url(
     video: &Video,
     cookie: Option<&str>,
-) -> Result<(String, i64, i64), String> {
+    quality: u32,
+) -> Result<PlayUrlResult, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(3))
@@ -1532,7 +1555,7 @@ pub(crate) fn resolve_play_url(
     let mut params = BTreeMap::new();
     params.insert("bvid".into(), video.bvid.clone());
     params.insert("cid".into(), cid.to_string());
-    params.insert("qn".into(), "64".into());
+    params.insert("qn".into(), quality.to_string());
     params.insert("fnval".into(), "1".into());
     params.insert("fnver".into(), "0".into());
     params.insert("fourk".into(), "1".into());
@@ -1581,8 +1604,8 @@ pub(crate) fn resolve_play_url(
                     .and_then(|response| response.json::<Value>())
                     {
                         Ok(response) if number(response.get("code")) == 0 => {
-                            if let Some(url) = first_durl(&response) {
-                                return Ok((url, cid, aid));
+                            if let Some(result) = parse_play_url(&response, cid, aid) {
+                                return Ok(result);
                             }
                             errors.push("WBI 接口没有返回 MP4 地址".to_string());
                         }
@@ -1615,8 +1638,8 @@ pub(crate) fn resolve_play_url(
     .and_then(|response| response.json::<Value>())
     {
         Ok(response) if number(response.get("code")) == 0 => {
-            if let Some(url) = first_durl(&response) {
-                return Ok((url, cid, aid));
+            if let Some(result) = parse_play_url(&response, cid, aid) {
+                return Ok(result);
             }
             errors.push("旧播放接口没有返回 MP4 地址".to_string());
         }
@@ -1631,12 +1654,82 @@ pub(crate) fn resolve_play_url(
     Err(format!("无法获取播放地址：{}", errors.join("；")))
 }
 
-fn first_durl(response: &Value) -> Option<String> {
-    response
-        .get("data")
-        .and_then(|data| data.get("durl"))
+#[derive(Clone, Debug)]
+pub(crate) struct PlayQuality {
+    pub(crate) qn: u32,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlayUrlResult {
+    pub(crate) url: String,
+    pub(crate) cid: i64,
+    pub(crate) aid: i64,
+    pub(crate) actual_quality: u32,
+    pub(crate) qualities: Vec<PlayQuality>,
+}
+
+fn parse_play_url(response: &Value, cid: i64, aid: i64) -> Option<PlayUrlResult> {
+    let data = response.get("data")?;
+    let url = data
+        .get("durl")
         .and_then(Value::as_array)
         .and_then(|durl| durl.first())
         .map(|durl| text(durl.get("url")))
-        .filter(|url| !url.is_empty())
+        .filter(|url| !url.is_empty())?;
+    let actual_quality = number(data.get("quality")).max(0) as u32;
+    let mut qualities = Vec::new();
+    if let Some(accepted) = data.get("accept_quality").and_then(Value::as_array) {
+        let descriptions = data
+            .get("accept_description")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for (index, value) in accepted.iter().enumerate() {
+            let qn = number(Some(value)).max(0) as u32;
+            if qn == 0
+                || qualities
+                    .iter()
+                    .any(|quality: &PlayQuality| quality.qn == qn)
+            {
+                continue;
+            }
+            let label = descriptions
+                .get(index)
+                .map(|description| text(Some(description)))
+                .filter(|description| !description.is_empty())
+                .unwrap_or_else(|| quality_label(qn));
+            qualities.push(PlayQuality { qn, label });
+        }
+    }
+    if qualities.is_empty() && actual_quality > 0 {
+        qualities.push(PlayQuality {
+            qn: actual_quality,
+            label: quality_label(actual_quality),
+        });
+    }
+    Some(PlayUrlResult {
+        url,
+        cid,
+        aid,
+        actual_quality,
+        qualities,
+    })
+}
+
+pub(crate) fn quality_label(qn: u32) -> String {
+    match qn {
+        6 => "240P".into(),
+        16 => "360P".into(),
+        32 => "480P".into(),
+        64 => "720P".into(),
+        80 => "1080P".into(),
+        112 => "1080P+".into(),
+        116 => "1080P60".into(),
+        120 => "4K".into(),
+        125 => "HDR".into(),
+        126 => "杜比视界".into(),
+        127 => "8K".into(),
+        _ => format!("QN {qn}"),
+    }
 }

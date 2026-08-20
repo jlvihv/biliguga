@@ -1,9 +1,10 @@
 use crate::{
     api::{
-        add_to_favorites, add_to_watch_later, coin_video, download_avatar, fetch_comments,
-        fetch_dynamic_feed, fetch_favorites, fetch_history, fetch_last_play_progress,
-        fetch_recommendations, fetch_search_results, fetch_watch_later, format_time, like_video,
-        queue_cover_download, report_video_heartbeat, report_video_progress, resolve_play_url,
+        PlayQuality, add_to_favorites, add_to_watch_later, coin_video, download_avatar,
+        fetch_comments, fetch_dynamic_feed, fetch_favorites, fetch_history,
+        fetch_last_play_progress, fetch_recommendations, fetch_search_results, fetch_watch_later,
+        format_time, like_video, quality_label, queue_cover_download, report_video_heartbeat,
+        report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
     model::{Comment, LOADING_VIDEO, Video},
@@ -16,10 +17,10 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, DispatchPhase, Entity, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, RenderImage, ScrollWheelEvent,
-    SharedString, Timer, UniformListScrollHandle, Window, WindowBounds, WindowOptions, canvas, div,
-    img, point, prelude::*, px, relative, rgb, size, uniform_list,
+    App, Application, AssetSource, Bounds, ClickEvent, Context, DispatchPhase, Entity, FontWeight,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, RenderImage,
+    ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, size, svg, uniform_list,
 };
 use std::{
     fs,
@@ -34,6 +35,38 @@ use std::{
 const HOME_MAX_ITEMS: usize = 120;
 const HOME_PREFETCH_ITEMS: usize = 4;
 const VIDEO_ROW_HEIGHT: f32 = 76.;
+const SPEED_OPTIONS: [f64; 5] = [0.5, 1., 1.25, 1.5, 2.];
+const WINDOW_FULLSCREEN_ICON: &str = "icons/window-fullscreen.svg";
+const WINDOW_FULLSCREEN_EXIT_ICON: &str = "icons/window-fullscreen-exit.svg";
+const SCREEN_FULLSCREEN_ICON: &str = "icons/screen-fullscreen.svg";
+const SCREEN_FULLSCREEN_EXIT_ICON: &str = "icons/screen-fullscreen-exit.svg";
+
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let asset = match path {
+            WINDOW_FULLSCREEN_ICON => {
+                include_bytes!("../assets/icons/window-fullscreen.svg").as_slice()
+            }
+            WINDOW_FULLSCREEN_EXIT_ICON => {
+                include_bytes!("../assets/icons/window-fullscreen-exit.svg").as_slice()
+            }
+            SCREEN_FULLSCREEN_ICON => {
+                include_bytes!("../assets/icons/screen-fullscreen.svg").as_slice()
+            }
+            SCREEN_FULLSCREEN_EXIT_ICON => {
+                include_bytes!("../assets/icons/screen-fullscreen-exit.svg").as_slice()
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(std::borrow::Cow::Borrowed(asset)))
+    }
+
+    fn list(&self, _: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
 
 struct BiliGuga {
     search_input: Entity<SearchInput>,
@@ -74,6 +107,11 @@ struct BiliGuga {
     playback_request: u64,
     volume: f64,
     speed: f64,
+    quality: u32,
+    quality_options: Vec<PlayQuality>,
+    speed_menu_open: bool,
+    quality_menu_open: bool,
+    volume_dragging: bool,
     controls_visible: bool,
     controls_generation: u64,
     player_fullscreen: bool,
@@ -81,6 +119,7 @@ struct BiliGuga {
     playing_video: Option<Video>,
     cloud_resume_progress: Option<f64>,
     cloud_resume_applied: bool,
+    pending_seek: Option<f64>,
     history_report_at: Instant,
     history_report_in_flight: bool,
     pending_cover_drops: Vec<Arc<RenderImage>>,
@@ -161,6 +200,11 @@ impl BiliGuga {
             playback_request: 0,
             volume: 100.,
             speed: 1.,
+            quality: 64,
+            quality_options: Vec::new(),
+            speed_menu_open: false,
+            quality_menu_open: false,
+            volume_dragging: false,
             controls_visible: false,
             controls_generation: 0,
             player_fullscreen: false,
@@ -168,6 +212,7 @@ impl BiliGuga {
             playing_video: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
+            pending_seek: None,
             history_report_at: Instant::now(),
             history_report_in_flight: false,
             pending_cover_drops: Vec::new(),
@@ -421,6 +466,8 @@ impl BiliGuga {
         self.playing_video = None;
         self.cloud_resume_progress = None;
         self.cloud_resume_applied = false;
+        self.pending_seek = None;
+        self.quality_options.clear();
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1451,6 +1498,8 @@ impl BiliGuga {
         self.playing_video = None;
         self.cloud_resume_progress = None;
         self.cloud_resume_applied = false;
+        self.pending_seek = None;
+        self.quality_options.clear();
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1497,6 +1546,8 @@ impl BiliGuga {
         self.playing_video = None;
         self.cloud_resume_progress = None;
         self.cloud_resume_applied = false;
+        self.pending_seek = None;
+        self.quality_options.clear();
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
@@ -1536,9 +1587,13 @@ impl BiliGuga {
         self.drop_player_frames(frames, window);
         self.debug_memory("after-video-stop");
         self.playback = PlaybackState::Idle;
+        self.pending_seek = None;
+        self.quality_options.clear();
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
+        self.speed_menu_open = false;
+        self.quality_menu_open = false;
         self.begin_play_selected(cx);
     }
 
@@ -1574,19 +1629,20 @@ impl BiliGuga {
         let cookie = self.session.as_ref().map(|session| session.cookie.clone());
         self.playback_request = self.playback_request.wrapping_add(1);
         let playback_request = self.playback_request;
+        let quality = self.quality;
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let result = resolve_play_url(&video, cookie.as_deref())?;
+                    let result = resolve_play_url(&video, cookie.as_deref(), quality)?;
                     let mut resolved_video = video.clone();
-                    resolved_video.cid = result.1;
-                    resolved_video.aid = result.2;
+                    resolved_video.cid = result.cid;
+                    resolved_video.aid = result.aid;
                     let progress = fetch_last_play_progress(&resolved_video, cookie.as_deref());
-                    Ok::<_, String>((result.0, result.1, result.2, progress))
+                    Ok::<_, String>((result, progress))
                 })
                 .await;
             let message = match result {
-                Ok((url, cid, aid, progress)) => {
+                Ok((play_url, progress)) => {
                     view.update(cx, |app, cx| {
                         if app.playback_request != playback_request
                             || app
@@ -1596,15 +1652,33 @@ impl BiliGuga {
                         {
                             return;
                         }
+                        let explicit_quality = !app.quality_options.is_empty();
+                        if explicit_quality
+                            && play_url.actual_quality > 0
+                            && play_url.actual_quality != quality
+                        {
+                            app.playback = PlaybackState::Idle;
+                            app.message = SharedString::from(format!(
+                                "B 站没有返回 {}，实际返回 {}",
+                                quality_label(quality),
+                                quality_label(play_url.actual_quality),
+                            ));
+                            cx.notify();
+                            return;
+                        }
                         if let Some(playing_video) = app.playing_video.as_mut() {
-                            playing_video.cid = cid;
-                            playing_video.aid = aid;
+                            playing_video.cid = play_url.cid;
+                            playing_video.aid = play_url.aid;
+                        }
+                        app.quality_options = play_url.qualities.clone();
+                        if play_url.actual_quality > 0 {
+                            app.quality = play_url.actual_quality;
                         }
                         if let Some(progress) = progress {
                             app.cloud_resume_progress = Some(progress as f64);
                         }
                         app.debug_memory("before-video-load");
-                        app.player.load(url, app.volume, app.speed);
+                        app.player.load(play_url.url, app.volume, app.speed);
                         app.cloud_resume_applied = false;
                         app.playback = PlaybackState::Buffering;
                         app.message = SharedString::from("已获取播放地址，libmpv 正在缓冲");
@@ -1651,26 +1725,66 @@ impl BiliGuga {
         }
     }
 
-    fn adjust_volume(
+    fn set_volume_from_position(
         &mut self,
-        delta: f64,
-        _: &ClickEvent,
-        _: &mut Window,
+        position: gpui::Point<Pixels>,
+        bounds: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.volume = (self.volume + delta).clamp(0., 100.);
+        if bounds.size.width <= px(0.) {
+            return;
+        }
+        let volume =
+            (((position.x - bounds.origin.x) / bounds.size.width).clamp(0., 1.) * 100.) as f64;
+        self.volume = volume.clamp(0., 100.);
         self.player.set_volume(self.volume);
         cx.notify();
     }
 
-    fn cycle_speed(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        const SPEEDS: [f64; 5] = [0.5, 1., 1.25, 1.5, 2.];
-        let index = SPEEDS
-            .iter()
-            .position(|speed| (*speed - self.speed).abs() < 0.01)
-            .unwrap_or(1);
-        self.speed = SPEEDS[(index + 1) % SPEEDS.len()];
+    fn toggle_speed_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.speed_menu_open = !self.speed_menu_open;
+        self.quality_menu_open = false;
+        cx.notify();
+    }
+
+    fn select_speed(&mut self, speed: f64, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.speed = speed;
         self.player.set_speed(self.speed);
+        self.speed_menu_open = false;
+        cx.notify();
+    }
+
+    fn toggle_quality_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.quality_menu_open = !self.quality_menu_open;
+        self.speed_menu_open = false;
+        cx.notify();
+    }
+
+    fn select_quality(
+        &mut self,
+        quality: u32,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quality_menu_open = false;
+        if self.quality == quality {
+            cx.notify();
+            return;
+        }
+        self.quality = quality;
+        let status = self.player.status();
+        if self.playback != PlaybackState::Idle {
+            if status.time_pos.is_finite() {
+                self.pending_seek = Some(status.time_pos.max(0.));
+            }
+            self.queue_history_report(cx, 2);
+            let frames = self.player.stop_playback();
+            self.drop_player_frames(frames, window);
+            self.playback = PlaybackState::Idle;
+            self.playback_request = self.playback_request.wrapping_add(1);
+            self.begin_play_selected(cx);
+        }
         cx.notify();
     }
 
@@ -2365,8 +2479,6 @@ impl BiliGuga {
         let entity = cx.entity();
         let mut stage = div()
             .w_full()
-            .h(px(480.))
-            .when(self.player_fullscreen, |this| this.h_full())
             .overflow_hidden()
             .bg(rgb(0x000000))
             .flex()
@@ -2374,6 +2486,13 @@ impl BiliGuga {
             .justify_center()
             .relative()
             .on_mouse_move(cx.listener(Self::show_player_controls));
+        if self.player_fullscreen {
+            stage = stage.h_full();
+        } else {
+            // Keep the normal player at the video's native 16:9 ratio instead of
+            // imposing a height that only happens to fit one window size.
+            stage.style().aspect_ratio = Some(16. / 9.);
+        }
 
         if let Some(frame) = frame {
             stage = stage.child(
@@ -2455,6 +2574,150 @@ impl BiliGuga {
             } else {
                 Self::play_selected
             };
+            let volume_entity = entity.clone();
+            let volume_slider = div()
+                .relative()
+                .w(px(82.))
+                .h(px(16.))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(6.))
+                        .h(px(4.))
+                        .bg(rgb(0x464b57)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(6.))
+                        .h(px(4.))
+                        .w(relative((self.volume / 100.).clamp(0., 1.) as f32))
+                        .bg(rgb(0x74ade8)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .left(relative((self.volume / 100.).clamp(0., 1.) as f32))
+                        .w(px(7.))
+                        .h(px(8.))
+                        .bg(rgb(0xdce0e5)),
+                )
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let entity = volume_entity.clone();
+                            window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble
+                                    && event.button == MouseButton::Left
+                                    && bounds.contains(&event.position)
+                                {
+                                    entity.update(cx, |app, cx| {
+                                        app.volume_dragging = true;
+                                        app.set_volume_from_position(event.position, bounds, cx);
+                                    });
+                                }
+                            });
+                            let entity = volume_entity.clone();
+                            window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                                entity.update(cx, |app, cx| {
+                                    if app.volume_dragging
+                                        && event.pressed_button == Some(MouseButton::Left)
+                                    {
+                                        app.set_volume_from_position(event.position, bounds, cx);
+                                    }
+                                });
+                            });
+                            let entity = volume_entity.clone();
+                            window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
+                                if event.button == MouseButton::Left {
+                                    entity.update(cx, |app, _| app.volume_dragging = false);
+                                }
+                            });
+                        },
+                    )
+                    .size_full(),
+                );
+
+            let mut speed_popup = div()
+                .absolute()
+                .bottom(px(34.))
+                .right_0()
+                .w(px(72.))
+                .p_1()
+                .bg(rgb(0x252a33))
+                .flex()
+                .flex_col();
+            for speed in SPEED_OPTIONS {
+                let selected_speed = (speed - self.speed).abs() < 0.01;
+                speed_popup = speed_popup.child(
+                    div()
+                        .id(SharedString::from(format!("speed-option-{speed}")))
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(if selected_speed {
+                            rgb(0x74ade8)
+                        } else {
+                            rgb(0xdce0e5)
+                        })
+                        .when(!selected_speed, |this| {
+                            this.hover(|style| style.bg(rgb(0x363c46)))
+                        })
+                        .cursor_pointer()
+                        .child(format!("{speed:.2}x"))
+                        .on_click(cx.listener(move |app, event, window, cx| {
+                            app.select_speed(speed, event, window, cx);
+                        })),
+                );
+            }
+
+            let quality_text = self
+                .quality_options
+                .iter()
+                .find(|option| option.qn == self.quality)
+                .map(|option| option.label.clone())
+                .unwrap_or_else(|| quality_label(self.quality));
+            let mut quality_popup = div()
+                .absolute()
+                .bottom(px(34.))
+                .right_0()
+                .w(px(84.))
+                .p_1()
+                .bg(rgb(0x252a33))
+                .flex()
+                .flex_col();
+            for option in self.quality_options.iter().cloned() {
+                let quality = option.qn;
+                let selected_quality = quality == self.quality;
+                quality_popup = quality_popup.child(
+                    div()
+                        .id(SharedString::from(format!("quality-option-{quality}")))
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(if selected_quality {
+                            rgb(0x74ade8)
+                        } else {
+                            rgb(0xdce0e5)
+                        })
+                        .when(!selected_quality, |this| {
+                            this.hover(|style| style.bg(rgb(0x363c46)))
+                        })
+                        .cursor_pointer()
+                        .child(option.label)
+                        .on_click(cx.listener(move |app, event, window, cx| {
+                            app.select_quality(quality, event, window, cx);
+                        })),
+                );
+            }
+
             let controls = div()
                 .absolute()
                 .left_0()
@@ -2515,67 +2778,85 @@ impl BiliGuga {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_1()
+                                .gap_2()
                                 .text_xs()
-                                .child(
-                                    div()
-                                        .id("volume-down")
-                                        .px_1()
-                                        .cursor_pointer()
-                                        .child("−")
-                                        .on_click(cx.listener(|app, event, window, cx| {
-                                            app.adjust_volume(-10., event, window, cx);
-                                        })),
-                                )
-                                .child(format!("🔊 {:.0}%", self.volume))
-                                .child(
-                                    div()
-                                        .id("volume-up")
-                                        .px_1()
-                                        .cursor_pointer()
-                                        .child("+")
-                                        .on_click(cx.listener(|app, event, window, cx| {
-                                            app.adjust_volume(10., event, window, cx);
-                                        })),
-                                ),
+                                .child("音量")
+                                .child(volume_slider),
                         )
                         .child(
                             div()
-                                .id("player-speed")
-                                .px_2()
-                                .py_1()
-                                .bg(rgb(0x454a56))
-                                .cursor_pointer()
-                                .text_xs()
-                                .child(format!("{:.2}x", self.speed))
-                                .on_click(cx.listener(Self::cycle_speed)),
+                                .relative()
+                                .child(
+                                    div()
+                                        .id("player-speed")
+                                        .px_2()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .hover(|style| style.bg(rgb(0x363c46)))
+                                        .child(format!("倍速 {:.2}x", self.speed))
+                                        .on_click(cx.listener(Self::toggle_speed_menu)),
+                                )
+                                .when(self.speed_menu_open, |this| this.child(speed_popup)),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .child(
+                                    div()
+                                        .id("player-quality")
+                                        .px_2()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .hover(|style| style.bg(rgb(0x363c46)))
+                                        .child(quality_text.clone())
+                                        .on_click(cx.listener(Self::toggle_quality_menu)),
+                                )
+                                .when(self.quality_menu_open, |this| this.child(quality_popup)),
                         )
                         .child(
                             div()
                                 .id("player-window-fullscreen")
-                                .px_2()
-                                .py_1()
+                                .w(px(24.))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .cursor_pointer()
-                                .text_xs()
-                                .child(if self.player_fullscreen {
-                                    "退出窗口全屏"
-                                } else {
-                                    "窗口全屏"
-                                })
+                                .hover(|style| style.bg(rgb(0x363c46)))
+                                .child(
+                                    svg()
+                                        .path(if self.player_fullscreen {
+                                            WINDOW_FULLSCREEN_EXIT_ICON
+                                        } else {
+                                            WINDOW_FULLSCREEN_ICON
+                                        })
+                                        .size(px(16.))
+                                        .text_color(rgb(0xdce0e5)),
+                                )
                                 .on_click(cx.listener(Self::toggle_player_fullscreen)),
                         )
                         .child(
                             div()
                                 .id("player-screen-fullscreen")
-                                .px_2()
-                                .py_1()
+                                .w(px(24.))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .cursor_pointer()
-                                .text_xs()
-                                .child(if self.screen_fullscreen {
-                                    "退出屏幕全屏"
-                                } else {
-                                    "屏幕全屏"
-                                })
+                                .hover(|style| style.bg(rgb(0x363c46)))
+                                .child(
+                                    svg()
+                                        .path(if self.screen_fullscreen {
+                                            SCREEN_FULLSCREEN_EXIT_ICON
+                                        } else {
+                                            SCREEN_FULLSCREEN_ICON
+                                        })
+                                        .size(px(16.))
+                                        .text_color(rgb(0xdce0e5)),
+                                )
                                 .on_click(cx.listener(Self::toggle_screen_fullscreen)),
                         ),
                 );
@@ -2756,137 +3037,148 @@ fn thumbnail(video: &Video, width: f32, height: f32) -> impl IntoElement {
 }
 
 pub(crate) fn launch() {
-    Application::new().run(|cx: &mut App| {
-        bind_search_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1360.), px(820.)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                |_, cx| cx.new(BiliGuga::new),
-            )
-            .expect("failed to open biliguga window");
-        let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        let window_handle = window
-            .update(cx, |_, window, _| window.window_handle())
-            .unwrap();
-        let frame_view = view.clone();
-        cx.spawn(async move |cx| {
-            let mut last_memory_log = Instant::now();
-            loop {
-                Timer::after(Duration::from_millis(50)).await;
-                if cx
-                    .update_window(window_handle.clone(), |_, window, cx| {
-                        let expired_frames = frame_view.update(cx, |app, cx| {
-                            let was_active = app.playback != PlaybackState::Idle;
-                            if !was_active {
-                                app.player.discard_pending_frames();
-                            } else {
-                                app.player.poll_frame();
-                            }
-                            let status = app.player.status();
-                            if app.playback != PlaybackState::Idle && status.time_pos.is_finite() {
-                                if !app.cloud_resume_applied {
-                                    let duration_ready = app.cloud_resume_progress.is_none()
-                                        || (status.duration.is_finite() && status.duration > 0.);
-                                    if duration_ready {
-                                        if let Some(progress) = app.cloud_resume_progress {
-                                            if progress > 3. && progress < status.duration - 3. {
-                                                app.player.seek_seconds(progress);
+    Application::new()
+        .with_assets(AppAssets)
+        .run(|cx: &mut App| {
+            bind_search_keys(cx);
+            let bounds = Bounds::centered(None, size(px(1360.), px(820.)), cx);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(BiliGuga::new),
+                )
+                .expect("failed to open biliguga window");
+            let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+            let window_handle = window
+                .update(cx, |_, window, _| window.window_handle())
+                .unwrap();
+            let frame_view = view.clone();
+            cx.spawn(async move |cx| {
+                let mut last_memory_log = Instant::now();
+                loop {
+                    Timer::after(Duration::from_millis(50)).await;
+                    if cx
+                        .update_window(window_handle.clone(), |_, window, cx| {
+                            let expired_frames = frame_view.update(cx, |app, cx| {
+                                let was_active = app.playback != PlaybackState::Idle;
+                                if !was_active {
+                                    app.player.discard_pending_frames();
+                                } else {
+                                    app.player.poll_frame();
+                                }
+                                let status = app.player.status();
+                                if app.playback != PlaybackState::Idle
+                                    && status.time_pos.is_finite()
+                                {
+                                    if !app.cloud_resume_applied {
+                                        let duration_ready = app.cloud_resume_progress.is_none()
+                                            || (status.duration.is_finite()
+                                                && status.duration > 0.);
+                                        if duration_ready {
+                                            if let Some(progress) = app
+                                                .pending_seek
+                                                .take()
+                                                .or(app.cloud_resume_progress)
+                                            {
+                                                if progress > 3. && progress < status.duration - 3.
+                                                {
+                                                    app.player.seek_seconds(progress);
+                                                }
                                             }
+                                            app.cloud_resume_applied = true;
                                         }
-                                        app.cloud_resume_applied = true;
+                                    }
+                                    app.playback = if status.paused {
+                                        PlaybackState::Paused
+                                    } else {
+                                        PlaybackState::Playing
+                                    };
+                                    if status.volume.is_finite() {
+                                        app.volume = status.volume.clamp(0., 100.);
+                                    }
+                                    if status.speed.is_finite() {
+                                        app.speed = status.speed.max(0.1);
+                                    }
+                                    if app.playback == PlaybackState::Playing
+                                        && app.history_report_at.elapsed()
+                                            >= Duration::from_secs(15)
+                                    {
+                                        app.queue_history_report(cx, 0);
                                     }
                                 }
-                                app.playback = if status.paused {
-                                    PlaybackState::Paused
-                                } else {
-                                    PlaybackState::Playing
-                                };
-                                if status.volume.is_finite() {
-                                    app.volume = status.volume.clamp(0., 100.);
+                                let expired_frames = app.player.take_expired_frames();
+                                if was_active || !expired_frames.is_empty() {
+                                    cx.notify();
                                 }
-                                if status.speed.is_finite() {
-                                    app.speed = status.speed.max(0.1);
+                                if last_memory_log.elapsed() >= Duration::from_secs(2) {
+                                    app.debug_memory("tick");
+                                    last_memory_log = Instant::now();
                                 }
-                                if app.playback == PlaybackState::Playing
-                                    && app.history_report_at.elapsed() >= Duration::from_secs(15)
-                                {
-                                    app.queue_history_report(cx, 0);
+                                app.maybe_load_home_page(cx);
+                                expired_frames
+                            });
+                            for frame in &expired_frames {
+                                let _ = window.drop_image(frame.clone());
+                            }
+                            let pending_cover_drops = frame_view
+                                .update(cx, |app, _| std::mem::take(&mut app.pending_cover_drops));
+                            for image in pending_cover_drops {
+                                let _ = window.drop_image(image);
+                            }
+                            frame_view.update(cx, |app, _| {
+                                for frame in expired_frames {
+                                    app.player.recycle_frame(frame);
                                 }
-                            }
-                            let expired_frames = app.player.take_expired_frames();
-                            if was_active || !expired_frames.is_empty() {
-                                cx.notify();
-                            }
-                            if last_memory_log.elapsed() >= Duration::from_secs(2) {
-                                app.debug_memory("tick");
-                                last_memory_log = Instant::now();
-                            }
-                            app.maybe_load_home_page(cx);
-                            expired_frames
-                        });
-                        for frame in &expired_frames {
-                            let _ = window.drop_image(frame.clone());
-                        }
-                        let pending_cover_drops = frame_view
-                            .update(cx, |app, _| std::mem::take(&mut app.pending_cover_drops));
-                        for image in pending_cover_drops {
-                            let _ = window.drop_image(image);
-                        }
-                        frame_view.update(cx, |app, _| {
-                            for frame in expired_frames {
-                                app.player.recycle_frame(frame);
-                            }
-                        });
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        let initial_cookie = view
-            .read(cx)
-            .session
-            .as_ref()
-            .map(|session| session.cookie.clone());
-        cx.spawn(async move |cx| {
-            let result = cx
-                .background_spawn(
-                    async move { fetch_recommendations(1, initial_cookie.as_deref()) },
-                )
-                .await;
-            view.update(cx, |app, cx| {
-                if app.home_generation != 0 || app.active_tab != AppTab::Home {
-                    return;
-                }
-                app.home_loading = false;
-                app.loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.message = SharedString::from(format!(
-                            "已加载 {} 个真实视频",
-                            videos.videos.len()
-                        ));
-                        app.home_page = 1;
-                        app.home_has_more = videos.has_more;
-                        app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
-                        app.videos = videos.videos;
-                        app.start_cover_loading(cx);
-                    }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载失败：{error}"));
+                            });
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
-                cx.notify();
             })
-            .ok();
-        })
-        .detach();
-        cx.activate(true);
-    });
+            .detach();
+            let initial_cookie = view
+                .read(cx)
+                .session
+                .as_ref()
+                .map(|session| session.cookie.clone());
+            cx.spawn(async move |cx| {
+                let result = cx
+                    .background_spawn(
+                        async move { fetch_recommendations(1, initial_cookie.as_deref()) },
+                    )
+                    .await;
+                view.update(cx, |app, cx| {
+                    if app.home_generation != 0 || app.active_tab != AppTab::Home {
+                        return;
+                    }
+                    app.home_loading = false;
+                    app.loading = false;
+                    match result {
+                        Ok(videos) => {
+                            app.message = SharedString::from(format!(
+                                "已加载 {} 个真实视频",
+                                videos.videos.len()
+                            ));
+                            app.home_page = 1;
+                            app.home_has_more = videos.has_more;
+                            app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
+                            app.videos = videos.videos;
+                            app.start_cover_loading(cx);
+                        }
+                        Err(error) => {
+                            app.message = SharedString::from(format!("加载失败：{error}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            cx.activate(true);
+        });
 }
