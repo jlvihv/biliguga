@@ -8,7 +8,7 @@ use crate::{
     },
     login::{self, PollResult, UserSession},
     model::{Comment, LOADING_VIDEO, Video, VideoCollection},
-    mpv,
+    mpv, network,
     search_input::{SearchInput, bind_search_keys},
 };
 use futures::{
@@ -416,7 +416,12 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_recommendations(page, cookie.as_deref()) })
+                .background_spawn(async move {
+                    network::run(
+                        async move { fetch_recommendations(page, cookie.as_deref()).await },
+                    )
+                    .await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 if app.home_generation != generation || app.active_tab != AppTab::Home {
@@ -523,10 +528,22 @@ impl BiliGuga {
         cx.spawn(async move |view, cx| {
             let (heartbeat_result, progress_result) = cx
                 .background_spawn(async move {
-                    let heartbeat =
-                        report_video_heartbeat(&cookie, &heartbeat_video, progress, play_type);
-                    let progress_result = report_video_progress(&cookie, aid, cid, progress);
-                    (heartbeat, progress_result)
+                    let heartbeat_cookie = cookie.clone();
+                    let progress_cookie = cookie;
+                    futures::join!(
+                        network::run(async move {
+                            report_video_heartbeat(
+                                &heartbeat_cookie,
+                                &heartbeat_video,
+                                progress,
+                                play_type,
+                            )
+                            .await
+                        }),
+                        network::run(async move {
+                            report_video_progress(&progress_cookie, aid, cid, progress).await
+                        })
+                    )
                 })
                 .await;
             view.update(cx, |app, _| {
@@ -638,7 +655,12 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_comments(&video, cookie.as_deref(), page) })
+                .background_spawn(async move {
+                    network::run(
+                        async move { fetch_comments(&video, cookie.as_deref(), page).await },
+                    )
+                    .await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 if app.comments_generation != generation
@@ -907,7 +929,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_dynamic_feed(&cookie) })
+                .background_spawn(async move {
+                    network::run(async move { fetch_dynamic_feed(&cookie).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.dynamic_loading = false;
@@ -970,7 +994,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_history(&cookie) })
+                .background_spawn(async move {
+                    network::run(async move { fetch_history(&cookie).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.history_loading = false;
@@ -1034,7 +1060,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_watch_later(&cookie) })
+                .background_spawn(async move {
+                    network::run(async move { fetch_watch_later(&cookie).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.watch_later_loading = false;
@@ -1098,7 +1126,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_favorites(&cookie, mid) })
+                .background_spawn(async move {
+                    network::run(async move { fetch_favorites(&cookie, mid).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.favorites_loading = false;
@@ -1176,7 +1206,12 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_author_videos(mid, page, cookie.as_deref()) })
+                .background_spawn(async move {
+                    network::run(
+                        async move { fetch_author_videos(mid, page, cookie.as_deref()).await },
+                    )
+                    .await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 if app.author_generation != generation || app.active_tab != AppTab::Author {
@@ -1265,7 +1300,9 @@ impl BiliGuga {
         };
         cx.spawn(async move |view, cx| {
             let image = cx
-                .background_spawn(async move { download_avatar(&face_url) })
+                .background_spawn(async move {
+                    network::run(async move { download_avatar(&face_url).await }).await
+                })
                 .await;
             if let Some(image) = image {
                 view.update(cx, |app, cx| {
@@ -1291,7 +1328,9 @@ impl BiliGuga {
         cx.notify();
 
         cx.spawn(async move |view, cx| {
-            let qr = cx.background_spawn(async { login::fetch_qr_code() }).await;
+            let qr = cx
+                .background_spawn(async { network::run(login::fetch_qr_code()).await })
+                .await;
             let qr = match qr {
                 Ok(qr) => qr,
                 Err(error) => {
@@ -1335,7 +1374,9 @@ impl BiliGuga {
                 }
                 let poll_key = key.clone();
                 let result = cx
-                    .background_spawn(async move { login::poll_qr_code(&poll_key) })
+                    .background_spawn(async move {
+                        network::run(async move { login::poll_qr_code(&poll_key).await }).await
+                    })
                     .await;
                 match result {
                     Ok(PollResult::Waiting) => {}
@@ -1456,7 +1497,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { add_to_watch_later(&cookie, video.aid) })
+                .background_spawn(async move {
+                    network::run(async move { add_to_watch_later(&cookie, video.aid).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.message = SharedString::from(match result {
@@ -1497,7 +1540,10 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { add_to_favorites(&cookie, mid, video.aid) })
+                .background_spawn(async move {
+                    network::run(async move { add_to_favorites(&cookie, mid, video.aid).await })
+                        .await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.message = SharedString::from(match result {
@@ -1530,7 +1576,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { like_video(&cookie, video.aid) })
+                .background_spawn(async move {
+                    network::run(async move { like_video(&cookie, video.aid).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.message = SharedString::from(match result {
@@ -1563,7 +1611,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { coin_video(&cookie, video.aid) })
+                .background_spawn(async move {
+                    network::run(async move { coin_video(&cookie, video.aid).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 app.message = SharedString::from(match result {
@@ -1598,7 +1648,7 @@ impl BiliGuga {
     }
 
     fn start_collection_cover_loading(&mut self, cx: &mut Context<Self>) {
-        const MAX_IN_FLIGHT: usize = 2;
+        const MAX_IN_FLIGHT: usize = 8;
 
         if self.collection_cover_loading {
             return;
@@ -1693,7 +1743,7 @@ impl BiliGuga {
     }
 
     fn start_cover_loading(&mut self, cx: &mut Context<Self>) {
-        const MAX_IN_FLIGHT: usize = 2;
+        const MAX_IN_FLIGHT: usize = 8;
 
         if self.cover_loading {
             return;
@@ -1831,7 +1881,9 @@ impl BiliGuga {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
-                .background_spawn(async move { fetch_search_results(&keyword) })
+                .background_spawn(async move {
+                    network::run(async move { fetch_search_results(&keyword).await }).await
+                })
                 .await;
             view.update(cx, |app, cx| {
                 if app.feed_generation != feed_generation {
@@ -2013,20 +2065,25 @@ impl BiliGuga {
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let context = fetch_video_context(&video, cookie.as_deref()).ok();
-                    let mut resolved_video = video.clone();
-                    if let Some(context) = &context {
-                        resolved_video.aid = context.aid;
-                        resolved_video.cid = context.cid;
-                        resolved_video.uploader = context.uploader.clone();
-                        resolved_video.uploader_mid = context.uploader_mid;
-                    }
-                    let result = resolve_play_url(&resolved_video, cookie.as_deref(), quality)?;
-                    let mut resolved_video = video.clone();
-                    resolved_video.cid = result.cid;
-                    resolved_video.aid = result.aid;
-                    let progress = fetch_last_play_progress(&resolved_video, cookie.as_deref());
-                    Ok::<_, String>((result, progress, context))
+                    network::run(async move {
+                        let context = fetch_video_context(&video, cookie.as_deref()).await.ok();
+                        let mut resolved_video = video.clone();
+                        if let Some(context) = &context {
+                            resolved_video.aid = context.aid;
+                            resolved_video.cid = context.cid;
+                            resolved_video.uploader = context.uploader.clone();
+                            resolved_video.uploader_mid = context.uploader_mid;
+                        }
+                        let result =
+                            resolve_play_url(&resolved_video, cookie.as_deref(), quality).await?;
+                        let mut resolved_video = video.clone();
+                        resolved_video.cid = result.cid;
+                        resolved_video.aid = result.aid;
+                        let progress =
+                            fetch_last_play_progress(&resolved_video, cookie.as_deref()).await;
+                        Ok::<_, String>((result, progress, context))
+                    })
+                    .await
                 })
                 .await;
             let message = match result {
@@ -3786,9 +3843,12 @@ pub(crate) fn launch() {
                 .map(|session| session.cookie.clone());
             cx.spawn(async move |cx| {
                 let result = cx
-                    .background_spawn(
-                        async move { fetch_recommendations(1, initial_cookie.as_deref()) },
-                    )
+                    .background_spawn(async move {
+                        network::run(async move {
+                            fetch_recommendations(1, initial_cookie.as_deref()).await
+                        })
+                        .await
+                    })
                     .await;
                 view.update(cx, |app, cx| {
                     if app.home_generation != 0 || app.active_tab != AppTab::Home {

@@ -1,8 +1,8 @@
 use gpui::RenderImage;
 use image::{Frame, Luma};
 use qrcode::QrCode;
-use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::SET_COOKIE;
+use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
@@ -59,14 +59,16 @@ fn number(value: Option<&Value>) -> i64 {
         .unwrap_or_default()
 }
 
-pub(crate) fn fetch_qr_code() -> Result<QrCodeData, String> {
+pub(crate) async fn fetch_qr_code() -> Result<QrCodeData, String> {
     let client = client()?;
     let response: Value = client
         .get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
         .header("Referer", "https://www.bilibili.com/")
         .send()
+        .await
         .map_err(|error| format!("获取登录二维码失败：{error}"))?
         .json()
+        .await
         .map_err(|error| format!("解析登录二维码失败：{error}"))?;
     let code = number(response.get("code"));
     if code != 0 {
@@ -96,13 +98,14 @@ pub(crate) fn fetch_qr_code() -> Result<QrCodeData, String> {
     })
 }
 
-pub(crate) fn poll_qr_code(key: &str) -> Result<PollResult, String> {
+pub(crate) async fn poll_qr_code(key: &str) -> Result<PollResult, String> {
     let client = client()?;
     let response = client
         .get("https://passport.bilibili.com/x/passport-login/web/qrcode/poll")
         .header("Referer", "https://www.bilibili.com/")
         .query(&[("qrcode_key", key)])
         .send()
+        .await
         .map_err(|error| format!("轮询登录状态失败：{error}"))?;
     let header_cookie = response
         .headers()
@@ -114,6 +117,7 @@ pub(crate) fn poll_qr_code(key: &str) -> Result<PollResult, String> {
         .join("; ");
     let body: Value = response
         .json()
+        .await
         .map_err(|error| format!("解析登录状态失败：{error}"))?;
     let data = body.get("data").unwrap_or(&Value::Null);
     match number(data.get("code")) {
@@ -125,7 +129,7 @@ pub(crate) fn poll_qr_code(key: &str) -> Result<PollResult, String> {
             let cookie_mid = cookie_value(&cookie, "DedeUserID")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default();
-            let user = fetch_user(&cookie).ok();
+            let user = fetch_user(&cookie).await.ok();
             Ok(PollResult::LoggedIn(UserSession {
                 cookie,
                 mid: user.as_ref().map(|user| user.mid).unwrap_or(cookie_mid),
@@ -181,7 +185,7 @@ fn cookie_value(cookie: &str, name: &str) -> Option<String> {
     })
 }
 
-fn fetch_user(cookie: &str) -> Result<UserSession, String> {
+async fn fetch_user(cookie: &str) -> Result<UserSession, String> {
     let client = client()?;
     let response: Value = with_cookie(
         client
@@ -190,8 +194,10 @@ fn fetch_user(cookie: &str) -> Result<UserSession, String> {
         cookie,
     )
     .send()
+    .await
     .map_err(|error| format!("获取用户信息失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析用户信息失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(text(response.get("message")));

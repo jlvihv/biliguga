@@ -6,6 +6,7 @@ mod app;
 mod login;
 mod model;
 mod mpv;
+mod network;
 mod search_input;
 
 fn main() {

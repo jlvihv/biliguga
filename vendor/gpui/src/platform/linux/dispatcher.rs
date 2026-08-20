@@ -16,7 +16,7 @@ struct TimerAfter {
     runnable: Runnable,
 }
 
-const MAX_BACKGROUND_THREADS: usize = 8;
+const MAX_BACKGROUND_THREADS: usize = 1;
 
 pub(crate) struct LinuxDispatcher {
     main_sender: Sender<Runnable>,

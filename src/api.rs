@@ -1,10 +1,16 @@
-use crate::model::{Comment, CommentPage, Video, VideoCollection};
-use futures::channel::oneshot;
+use crate::{
+    model::{Comment, CommentPage, Video, VideoCollection},
+    network,
+};
+use futures::{
+    StreamExt,
+    channel::{mpsc as async_mpsc, oneshot},
+};
 use gpui::RenderImage;
 use image::Frame;
 use md5::{Digest, Md5};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::{
@@ -12,9 +18,7 @@ use std::{
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
     },
-    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -154,20 +158,6 @@ fn https_url(value: String) -> String {
     }
 }
 
-fn image_client() -> Option<&'static Client> {
-    static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            Client::builder()
-                .user_agent("Mozilla/5.0 biliguga/0.1")
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(15))
-                .build()
-                .ok()
-        })
-        .as_ref()
-}
-
 fn thumbnail_url(url: &str, width: u32, height: u32) -> String {
     let normalized = https_url(url.to_string());
     if !(normalized.contains(".hdslb.com/") || normalized.contains(".biliimg.com/")) {
@@ -184,23 +174,9 @@ fn thumbnail_url(url: &str, width: u32, height: u32) -> String {
     format!("{base}@{width}w_{height}h_1c.webp")
 }
 
-fn download_image(url: &str, width: u32, height: u32) -> Option<Arc<RenderImage>> {
-    if url.is_empty() {
-        return None;
-    }
-    let request_url = thumbnail_url(url, width, height);
-    let response = image_client()?
-        .get(&request_url)
-        .header("Referer", "https://www.bilibili.com/")
-        .send()
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let bytes = response.bytes().ok()?;
+fn decode_image(bytes: &[u8], width: u32, height: u32) -> Option<Arc<RenderImage>> {
     let compressed_len = bytes.len();
-    let source = image::load_from_memory(&bytes).ok()?.into_rgba8();
-    drop(bytes);
+    let source = image::load_from_memory(bytes).ok()?.into_rgba8();
     if std::env::var_os("BILIGUGA_IMAGE_DEBUG").is_some() {
         eprintln!(
             "[biliguga-image] decode bytes={} source={}x{} target={}x{}",
@@ -223,8 +199,38 @@ fn download_image(url: &str, width: u32, height: u32) -> Option<Arc<RenderImage>
     ))))
 }
 
-pub(crate) fn download_cover(url: &str) -> Option<Arc<RenderImage>> {
-    download_image(url, 160, 90)
+fn cover_image_client() -> Option<Client> {
+    Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()
+}
+
+async fn download_cover_async(
+    client: &Client,
+    url: &str,
+    cancelled: &AtomicBool,
+) -> Option<Arc<RenderImage>> {
+    if cancelled.load(Ordering::Acquire) || url.is_empty() {
+        return None;
+    }
+    let request_url = thumbnail_url(url, 160, 90);
+    let response = client
+        .get(&request_url)
+        .header("Referer", "https://www.bilibili.com/")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() || cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    decode_image(&bytes, 160, 90)
 }
 
 struct CoverRequest {
@@ -234,32 +240,40 @@ struct CoverRequest {
 }
 
 struct CoverWorkers {
-    senders: Vec<mpsc::Sender<CoverRequest>>,
+    senders: Vec<async_mpsc::UnboundedSender<CoverRequest>>,
     next: AtomicUsize,
 }
 
+const COVER_WORKER_COUNT: usize = 2;
+const COVER_REQUESTS_PER_WORKER: usize = 4;
+
 fn cover_workers() -> Option<&'static CoverWorkers> {
-    const WORKER_COUNT: usize = 2;
     static WORKERS: OnceLock<Option<CoverWorkers>> = OnceLock::new();
 
     WORKERS
         .get_or_init(|| {
-            let mut senders = Vec::with_capacity(WORKER_COUNT);
-            for index in 0..WORKER_COUNT {
-                let (sender, receiver) = mpsc::channel::<CoverRequest>();
-                thread::Builder::new()
-                    .name(format!("biliguga-cover-{index}"))
-                    .spawn(move || {
-                        while let Ok(request) = receiver.recv() {
-                            let image = if request.cancelled.load(Ordering::Acquire) {
-                                None
-                            } else {
-                                download_cover(&request.url)
-                            };
-                            let _ = request.reply.send(image);
-                        }
-                    })
-                    .ok()?;
+            let mut senders = Vec::with_capacity(COVER_WORKER_COUNT);
+            for _ in 0..COVER_WORKER_COUNT {
+                let (sender, receiver) = async_mpsc::unbounded::<CoverRequest>();
+                network::detach(async move {
+                    let Some(client) = cover_image_client() else {
+                        return;
+                    };
+                    let mut results = receiver
+                        .map(|request| {
+                            let client = client.clone();
+                            async move {
+                                let image =
+                                    download_cover_async(&client, &request.url, &request.cancelled)
+                                        .await;
+                                (request.reply, image)
+                            }
+                        })
+                        .buffer_unordered(COVER_REQUESTS_PER_WORKER);
+                    while let Some((reply, image)) = results.next().await {
+                        let _ = reply.send(image);
+                    }
+                });
                 senders.push(sender);
             }
             Some(CoverWorkers {
@@ -278,7 +292,7 @@ pub(crate) fn queue_cover_download(
     let (reply, receiver) = oneshot::channel();
     let index = workers.next.fetch_add(1, Ordering::Relaxed) % workers.senders.len();
     workers.senders[index]
-        .send(CoverRequest {
+        .unbounded_send(CoverRequest {
             url,
             cancelled,
             reply,
@@ -287,8 +301,23 @@ pub(crate) fn queue_cover_download(
     Some(receiver)
 }
 
-pub(crate) fn download_avatar(url: &str) -> Option<Arc<RenderImage>> {
-    download_image(url, 160, 160)
+pub(crate) async fn download_avatar(url: &str) -> Option<Arc<RenderImage>> {
+    if url.is_empty() {
+        return None;
+    }
+    let client = cover_image_client()?;
+    let request_url = thumbnail_url(url, 160, 160);
+    let response = client
+        .get(&request_url)
+        .header("Referer", "https://www.bilibili.com/")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    decode_image(&bytes, 160, 160)
 }
 
 fn parse_video(item: &Value, index: usize) -> Option<Video> {
@@ -424,14 +453,16 @@ fn wbi_sign(
     signed
 }
 
-fn fetch_wbi_keys(client: &Client, cookie: Option<&str>) -> Result<(String, String), String> {
+async fn fetch_wbi_keys(client: &Client, cookie: Option<&str>) -> Result<(String, String), String> {
     let nav: Value = with_cookie(
         client.get("https://api.bilibili.com/x/web-interface/nav"),
         cookie,
     )
     .send()
+    .await
     .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
     let wbi_img = nav
         .get("data")
@@ -562,7 +593,7 @@ fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<
     })
 }
 
-pub(crate) fn fetch_video_context(
+pub(crate) async fn fetch_video_context(
     video: &Video,
     cookie: Option<&str>,
 ) -> Result<VideoContext, String> {
@@ -588,8 +619,10 @@ pub(crate) fn fetch_video_context(
         cookie,
     )
     .send()
+    .await
     .map_err(|error| format!("获取视频详情失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析视频详情失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(api_error(&response, "获取视频详情"));
@@ -655,7 +688,7 @@ fn parse_author_video(item: &Value, index: usize, mid: i64) -> Option<Video> {
     })
 }
 
-pub(crate) fn fetch_author_videos(
+pub(crate) async fn fetch_author_videos(
     mid: i64,
     page: usize,
     cookie: Option<&str>,
@@ -670,7 +703,7 @@ pub(crate) fn fetch_author_videos(
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
-    let (img_key, sub_key) = fetch_wbi_keys(&client, cookie)?;
+    let (img_key, sub_key) = fetch_wbi_keys(&client, cookie).await?;
     let mut params = BTreeMap::new();
     params.insert("mid".into(), mid.to_string());
     params.insert("ps".into(), PAGE_SIZE.to_string());
@@ -688,8 +721,10 @@ pub(crate) fn fetch_author_videos(
         cookie,
     )
     .send()
+    .await
     .map_err(|error| format!("请求作者视频失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析作者视频失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(api_error(&response, "作者视频"));
@@ -719,7 +754,7 @@ pub(crate) fn fetch_author_videos(
     })
 }
 
-pub(crate) fn fetch_recommendations(
+pub(crate) async fn fetch_recommendations(
     page: usize,
     cookie: Option<&str>,
 ) -> Result<RecommendationPage, String> {
@@ -734,8 +769,10 @@ pub(crate) fn fetch_recommendations(
         cookie,
     )
     .send()
+    .await
     .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
     let wbi_img = nav
         .get("data")
@@ -778,8 +815,10 @@ pub(crate) fn fetch_recommendations(
     )
     .query(&signed)
     .send()
+    .await
     .map_err(|error| format!("请求推荐流失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析推荐流失败：{error}"))?;
     let code = number(response.get("code"));
     if code != 0 {
@@ -838,7 +877,7 @@ fn parse_search_result_list(response: &Value) -> Vec<Video> {
     Vec::new()
 }
 
-pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> {
+pub(crate) async fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -848,8 +887,10 @@ pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> 
     let nav: Value = client
         .get("https://api.bilibili.com/x/web-interface/nav")
         .send()
+        .await
         .map_err(|error| format!("获取搜索 WBI 密钥失败：{error}"))?
         .json()
+        .await
         .map_err(|error| format!("解析搜索 WBI 密钥失败：{error}"))?;
     let wbi_img = nav
         .get("data")
@@ -892,8 +933,10 @@ pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> 
         .header("Referer", "https://search.bilibili.com/")
         .query(&signed)
         .send()
+        .await
         .map_err(|error| format!("请求 B 站搜索失败：{error}"))?
         .json()
+        .await
         .map_err(|error| format!("解析 B 站搜索结果失败：{error}"))?;
     let code = number(response.get("code"));
     let videos = if code == 0 {
@@ -917,8 +960,10 @@ pub(crate) fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> 
         .header("Referer", "https://search.bilibili.com/")
         .query(&wbi_sign(&fallback_params, &img_key, &sub_key))
         .send()
+        .await
         .map_err(|error| format!("请求 B 站综合搜索失败：{error}"))?
         .json()
+        .await
         .map_err(|error| format!("解析 B 站综合搜索结果失败：{error}"))?;
     if number(fallback_response.get("code")) != 0 {
         return Err(format!(
@@ -972,7 +1017,7 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
     })
 }
 
-pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
+pub(crate) async fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -987,8 +1032,10 @@ pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
         Some(cookie),
     )
     .send()
+    .await
     .map_err(|error| format!("请求观看历史失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析观看历史失败：{error}"))?;
     let code = number(response.get("code"));
     if code != 0 {
@@ -1009,7 +1056,7 @@ pub(crate) fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
         .collect())
 }
 
-pub(crate) fn report_video_progress(
+pub(crate) async fn report_video_progress(
     cookie: &str,
     aid: i64,
     cid: i64,
@@ -1040,8 +1087,10 @@ pub(crate) fn report_video_progress(
         ("csrf", csrf),
     ])
     .send()
+    .await
     .map_err(|error| format!("上报观看进度失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析观看进度响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
@@ -1050,7 +1099,7 @@ pub(crate) fn report_video_progress(
     }
 }
 
-pub(crate) fn report_video_heartbeat(
+pub(crate) async fn report_video_heartbeat(
     cookie: &str,
     video: &Video,
     progress: f64,
@@ -1094,8 +1143,10 @@ pub(crate) fn report_video_heartbeat(
         ("csrf", csrf),
     ])
     .send()
+    .await
     .map_err(|error| format!("上报播放心跳失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析播放心跳响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
@@ -1104,7 +1155,7 @@ pub(crate) fn report_video_heartbeat(
     }
 }
 
-pub(crate) fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> Option<i64> {
+pub(crate) async fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> Option<i64> {
     if video.aid <= 0 || video.cid <= 0 || cookie.is_none() {
         return None;
     }
@@ -1119,8 +1170,10 @@ pub(crate) fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> O
         cookie,
     )
     .send()
+    .await
     .ok()?
     .json()
+    .await
     .ok()?;
     let wbi_img = nav.get("data")?.get("wbi_img")?;
     let img_key = text(wbi_img.get("img_url"))
@@ -1158,8 +1211,10 @@ pub(crate) fn fetch_last_play_progress(video: &Video, cookie: Option<&str>) -> O
     )
     .query(&wbi_sign(&params, &img_key, &sub_key))
     .send()
+    .await
     .ok()?
     .json()
+    .await
     .ok()?;
     (number(response.get("code")) == 0)
         .then(|| {
@@ -1241,7 +1296,7 @@ fn parse_dynamic_video(item: &Value, index: usize) -> Option<Video> {
     Some(video)
 }
 
-pub(crate) fn fetch_dynamic_feed(cookie: &str) -> Result<Vec<Video>, String> {
+pub(crate) async fn fetch_dynamic_feed(cookie: &str) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -1265,8 +1320,10 @@ pub(crate) fn fetch_dynamic_feed(cookie: &str) -> Result<Vec<Video>, String> {
         Some(cookie),
     )
     .send()
+    .await
     .map_err(|error| format!("请求动态失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析动态失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(api_error(&response, "动态"));
@@ -1324,7 +1381,7 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
     })
 }
 
-pub(crate) fn fetch_watch_later(cookie: &str) -> Result<Vec<Video>, String> {
+pub(crate) async fn fetch_watch_later(cookie: &str) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -1338,8 +1395,10 @@ pub(crate) fn fetch_watch_later(cookie: &str) -> Result<Vec<Video>, String> {
         Some(cookie),
     )
     .send()
+    .await
     .map_err(|error| format!("请求稍后再看失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析稍后再看失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(api_error(&response, "稍后再看"));
@@ -1391,7 +1450,7 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
     })
 }
 
-pub(crate) fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, String> {
+pub(crate) async fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, String> {
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
         .connect_timeout(Duration::from_secs(5))
@@ -1412,8 +1471,10 @@ pub(crate) fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, Stri
         Some(cookie),
     )
     .send()
+    .await
     .map_err(|error| format!("请求收藏夹失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析收藏夹失败：{error}"))?;
     if number(folders.get("code")) != 0 {
         return Err(api_error(&folders, "收藏夹"));
@@ -1447,8 +1508,10 @@ pub(crate) fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, Stri
         Some(cookie),
     )
     .send()
+    .await
     .map_err(|error| format!("请求收藏视频失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析收藏视频失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(api_error(&response, "收藏视频"));
@@ -1465,7 +1528,7 @@ pub(crate) fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, Stri
         .collect())
 }
 
-pub(crate) fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), String> {
+pub(crate) async fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
@@ -1480,8 +1543,10 @@ pub(crate) fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), String> {
     )
     .form(&[("aid", aid.to_string()), ("csrf", csrf)])
     .send()
+    .await
     .map_err(|error| format!("添加稍后再看失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析稍后再看响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
@@ -1490,7 +1555,7 @@ pub(crate) fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), String> {
     }
 }
 
-pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), String> {
+pub(crate) async fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
     let client = Client::builder()
         .user_agent("Mozilla/5.0 biliguga/0.1")
@@ -1511,8 +1576,10 @@ pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), S
         Some(cookie),
     )
     .send()
+    .await
     .map_err(|error| format!("请求默认收藏夹失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析默认收藏夹失败：{error}"))?;
     if number(folders.get("code")) != 0 {
         return Err(api_error(&folders, "默认收藏夹"));
@@ -1542,8 +1609,10 @@ pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), S
         ("csrf", csrf),
     ])
     .send()
+    .await
     .map_err(|error| format!("收藏视频失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析收藏响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
@@ -1552,7 +1621,7 @@ pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), S
     }
 }
 
-pub(crate) fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
+pub(crate) async fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
     let client = Client::builder()
         .user_agent(
@@ -1575,8 +1644,10 @@ pub(crate) fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
         ("csrf", csrf),
     ])
     .send()
+    .await
     .map_err(|error| format!("点赞失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析点赞响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
@@ -1585,7 +1656,7 @@ pub(crate) fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
     }
 }
 
-pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
+pub(crate) async fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
     let client = Client::builder()
         .user_agent(
@@ -1609,8 +1680,10 @@ pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
         ("csrf", csrf),
     ])
     .send()
+    .await
     .map_err(|error| format!("投币失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析投币响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
@@ -1679,7 +1752,7 @@ fn parse_comment(item: &Value) -> Option<Comment> {
     })
 }
 
-pub(crate) fn fetch_comments(
+pub(crate) async fn fetch_comments(
     video: &Video,
     cookie: Option<&str>,
     page: u32,
@@ -1706,8 +1779,10 @@ pub(crate) fn fetch_comments(
             cookie,
         )
         .send()
+        .await
         .map_err(|error| format!("获取视频详情失败：{error}"))?
         .json()
+        .await
         .map_err(|error| format!("解析视频详情失败：{error}"))?;
         if number(detail.get("code")) != 0 {
             return Err(api_error(&detail, "获取视频详情"));
@@ -1735,8 +1810,10 @@ pub(crate) fn fetch_comments(
         cookie,
     )
     .send()
+    .await
     .map_err(|error| format!("获取评论失败：{error}"))?
     .json()
+    .await
     .map_err(|error| format!("解析评论失败：{error}"))?;
     if number(response.get("code")) != 0 {
         return Err(api_error(&response, "获取评论"));
@@ -1918,7 +1995,7 @@ mod tests {
     }
 }
 
-pub(crate) fn resolve_play_url(
+pub(crate) async fn resolve_play_url(
     video: &Video,
     cookie: Option<&str>,
     quality: u32,
@@ -1944,8 +2021,10 @@ pub(crate) fn resolve_play_url(
             cookie,
         )
         .send()
+        .await
         .map_err(|error| format!("获取视频详情失败：{error}"))?
         .json()
+        .await
         .map_err(|error| format!("解析视频详情失败：{error}"))?;
         if number(detail.get("code")) != 0 {
             return Err(format!(
@@ -1981,13 +2060,20 @@ pub(crate) fn resolve_play_url(
     let mut errors = Vec::new();
 
     // WBI 是当前接口，但接口策略会变化，所以失败时继续尝试旧接口。
-    match with_cookie(
+    let nav_result = match with_cookie(
         client.get("https://api.bilibili.com/x/web-interface/nav"),
         cookie,
     )
     .send()
-    .and_then(|response| response.json::<Value>())
+    .await
     {
+        Ok(response) => response
+            .json::<Value>()
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match nav_result {
         Ok(nav) => {
             if let Some(wbi_img) = nav.get("data").and_then(|data| data.get("wbi_img")) {
                 let img_key = text(wbi_img.get("img_url"))
@@ -2007,7 +2093,7 @@ pub(crate) fn resolve_play_url(
                     .unwrap_or("")
                     .to_string();
                 if !img_key.is_empty() && !sub_key.is_empty() {
-                    match with_cookie(
+                    let play_result = match with_cookie(
                         client
                             .get("https://api.bilibili.com/x/player/wbi/playurl")
                             .header("Referer", &referer)
@@ -2015,8 +2101,15 @@ pub(crate) fn resolve_play_url(
                         cookie,
                     )
                     .send()
-                    .and_then(|response| response.json::<Value>())
+                    .await
                     {
+                        Ok(response) => response
+                            .json::<Value>()
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    match play_result {
                         Ok(response) if number(response.get("code")) == 0 => {
                             if let Some(result) = parse_play_url(&response, cid, aid) {
                                 return Ok(result);
@@ -2041,7 +2134,7 @@ pub(crate) fn resolve_play_url(
     }
 
     // 部分视频或未登录请求会拒绝 WBI 播放接口，旧接口仍可返回 MP4。
-    match with_cookie(
+    let legacy_result = match with_cookie(
         client
             .get("https://api.bilibili.com/x/player/playurl")
             .header("Referer", &referer)
@@ -2049,8 +2142,15 @@ pub(crate) fn resolve_play_url(
         cookie,
     )
     .send()
-    .and_then(|response| response.json::<Value>())
+    .await
     {
+        Ok(response) => response
+            .json::<Value>()
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match legacy_result {
         Ok(response) if number(response.get("code")) == 0 => {
             if let Some(result) = parse_play_url(&response, cid, aid) {
                 return Ok(result);
