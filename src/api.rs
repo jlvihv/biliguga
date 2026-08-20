@@ -1,4 +1,4 @@
-use crate::model::{Comment, CommentPage, Video};
+use crate::model::{Comment, CommentPage, Video, VideoCollection};
 use futures::channel::oneshot;
 use gpui::RenderImage;
 use image::Frame;
@@ -278,6 +278,7 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
         cid: number(item.get("cid")),
         title: text(item.get("title")),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
+        uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
         stats: format!(
             "{}播放  ·  {}弹幕",
             compact_number(view),
@@ -332,6 +333,7 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
         cid: 0,
         title,
         uploader: clean_search_text(text(item.get("author"))),
+        uploader_mid: number(item.get("mid")),
         stats: format!(
             "{}播放  ·  {}弹幕",
             if play.is_empty() { "0" } else { &play },
@@ -390,6 +392,301 @@ fn wbi_sign(
     digest.update(format!("{query}{mixin}"));
     signed.insert("w_rid".into(), format!("{:x}", digest.finalize()));
     signed
+}
+
+fn fetch_wbi_keys(client: &Client, cookie: Option<&str>) -> Result<(String, String), String> {
+    let nav: Value = with_cookie(
+        client.get("https://api.bilibili.com/x/web-interface/nav"),
+        cookie,
+    )
+    .send()
+    .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
+    let wbi_img = nav
+        .get("data")
+        .and_then(|data| data.get("wbi_img"))
+        .ok_or_else(|| "B 站没有返回 WBI 密钥".to_string())?;
+    let img_key = text(wbi_img.get("img_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let sub_key = text(wbi_img.get("sub_url"))
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if img_key.is_empty() || sub_key.is_empty() {
+        Err("B 站 WBI 密钥为空".into())
+    } else {
+        Ok((img_key, sub_key))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VideoContext {
+    pub(crate) aid: i64,
+    pub(crate) cid: i64,
+    pub(crate) uploader: String,
+    pub(crate) uploader_mid: i64,
+    pub(crate) collection: Option<VideoCollection>,
+}
+
+fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<VideoCollection> {
+    let id = number(season.get("id"))
+        .max(number(season.get("season_id")))
+        .max(
+            season
+                .get("sections")
+                .and_then(Value::as_array)
+                .and_then(|sections| {
+                    sections
+                        .iter()
+                        .map(|section| number(section.get("season_id")))
+                        .max()
+                })
+                .unwrap_or(0),
+        );
+    let title = {
+        let title = text(season.get("title"));
+        if title.is_empty() {
+            text(season.get("name"))
+        } else {
+            title
+        }
+    };
+    let mut episodes = Vec::new();
+    if let Some(sections) = season.get("sections").and_then(Value::as_array) {
+        for section in sections {
+            let section_episodes = section
+                .get("episodes")
+                .or_else(|| section.get("archives"))
+                .and_then(Value::as_array);
+            let Some(section_episodes) = section_episodes else {
+                continue;
+            };
+            for (index, episode) in section_episodes.iter().enumerate() {
+                let arc = episode.get("arc").unwrap_or(&Value::Null);
+                let bvid = text(episode.get("bvid"));
+                let bvid = if bvid.is_empty() {
+                    text(arc.get("bvid"))
+                } else {
+                    bvid
+                };
+                if bvid.is_empty() {
+                    continue;
+                }
+                let aid = number(episode.get("aid")).max(number(arc.get("aid")));
+                let cid = number(episode.get("cid"));
+                let episode_title = {
+                    let title = clean_search_text(text(episode.get("title")));
+                    if title.is_empty() {
+                        clean_search_text(text(arc.get("title")))
+                    } else {
+                        title
+                    }
+                };
+                let stat = arc.get("stat");
+                episodes.push(Video {
+                    bvid,
+                    aid,
+                    cid,
+                    title: episode_title,
+                    uploader: owner_name.to_string(),
+                    uploader_mid: owner_mid,
+                    stats: format!(
+                        "{}播放  ·  {}弹幕",
+                        compact_number(number(stat.and_then(|stat| stat.get("view")))),
+                        compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
+                    ),
+                    duration: {
+                        let duration_text = text(arc.get("duration"));
+                        if duration_text.is_empty() {
+                            duration(arc.get("duration"))
+                        } else {
+                            duration_text
+                        }
+                    },
+                    cover: https_url(text(arc.get("pic"))),
+                    cover_image: None,
+                    accent: accent_for(index),
+                    category: "合集".into(),
+                });
+            }
+        }
+    }
+    if id <= 0 && episodes.is_empty() {
+        return None;
+    }
+    Some(VideoCollection {
+        id,
+        title,
+        episodes,
+    })
+}
+
+pub(crate) fn fetch_video_context(
+    video: &Video,
+    cookie: Option<&str>,
+) -> Result<VideoContext, String> {
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let query = if video.bvid.is_empty() {
+        vec![("aid", video.aid.to_string())]
+    } else {
+        vec![("bvid", video.bvid.clone())]
+    };
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/web-interface/view")
+            .header(
+                "Referer",
+                format!("https://www.bilibili.com/video/{}", video.bvid),
+            )
+            .query(&query),
+        cookie,
+    )
+    .send()
+    .map_err(|error| format!("获取视频详情失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析视频详情失败：{error}"))?;
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "获取视频详情"));
+    }
+    let data = response
+        .get("data")
+        .ok_or_else(|| "视频详情没有返回数据".to_string())?;
+    let owner = data.get("owner").unwrap_or(&Value::Null);
+    let owner_mid = number(owner.get("mid")).max(video.uploader_mid);
+    let owner_name = {
+        let name = text(owner.get("name"));
+        if name.is_empty() {
+            video.uploader.clone()
+        } else {
+            name
+        }
+    };
+    Ok(VideoContext {
+        aid: number(data.get("aid")).max(video.aid),
+        cid: number(data.get("cid")).max(video.cid),
+        uploader: owner_name.clone(),
+        uploader_mid: owner_mid,
+        collection: data
+            .get("ugc_season")
+            .and_then(|season| parse_collection(season, owner_mid, &owner_name)),
+    })
+}
+
+pub(crate) struct AuthorVideoPage {
+    pub(crate) videos: Vec<Video>,
+    pub(crate) page: usize,
+    pub(crate) has_more: bool,
+}
+
+fn parse_author_video(item: &Value, index: usize, mid: i64) -> Option<Video> {
+    let bvid = text(item.get("bvid"));
+    if bvid.is_empty() {
+        return None;
+    }
+    let title = clean_search_text(text(item.get("title")));
+    let duration_text = text(item.get("length"));
+    Some(Video {
+        bvid,
+        aid: number(item.get("aid")),
+        cid: 0,
+        title,
+        uploader: text(item.get("author")),
+        uploader_mid: mid,
+        stats: format!(
+            "{}播放  ·  {}评论",
+            compact_number(number(item.get("play"))),
+            compact_number(number(item.get("comment")))
+        ),
+        duration: if duration_text.is_empty() {
+            duration(item.get("duration"))
+        } else {
+            duration_text
+        },
+        cover: https_url(text(item.get("pic"))),
+        cover_image: None,
+        accent: accent_for(index),
+        category: text(item.get("typename")),
+    })
+}
+
+pub(crate) fn fetch_author_videos(
+    mid: i64,
+    page: usize,
+    cookie: Option<&str>,
+) -> Result<AuthorVideoPage, String> {
+    if mid <= 0 {
+        return Err("作者 UID 无效".into());
+    }
+    const PAGE_SIZE: usize = 30;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let (img_key, sub_key) = fetch_wbi_keys(&client, cookie)?;
+    let mut params = BTreeMap::new();
+    params.insert("mid".into(), mid.to_string());
+    params.insert("ps".into(), PAGE_SIZE.to_string());
+    params.insert("pn".into(), page.max(1).to_string());
+    params.insert("tid".into(), "0".into());
+    params.insert("keyword".into(), String::new());
+    params.insert("order".into(), "pubdate".into());
+    params.insert("platform".into(), "web".into());
+    params.insert("web_location".into(), "1550101".into());
+    let response: Value = with_cookie(
+        client
+            .get("https://api.bilibili.com/x/space/wbi/arc/search")
+            .header("Referer", format!("https://space.bilibili.com/{mid}/video"))
+            .query(&wbi_sign(&params, &img_key, &sub_key)),
+        cookie,
+    )
+    .send()
+    .map_err(|error| format!("请求作者视频失败：{error}"))?
+    .json()
+    .map_err(|error| format!("解析作者视频失败：{error}"))?;
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "作者视频"));
+    }
+    let data = response.get("data").unwrap_or(&Value::Null);
+    let list = data
+        .get("list")
+        .and_then(|list| list.get("vlist"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let videos = list
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| parse_author_video(item, index, mid))
+        .collect::<Vec<_>>();
+    let total = number(data.get("page").and_then(|page| page.get("count")));
+    let page = page.max(1);
+    Ok(AuthorVideoPage {
+        has_more: if total > 0 {
+            page as i64 * (PAGE_SIZE as i64) < total
+        } else {
+            list.len() >= PAGE_SIZE
+        },
+        videos,
+        page,
+    })
 }
 
 pub(crate) fn fetch_recommendations(
@@ -631,6 +928,7 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
         cid: number(history.get("cid")),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("author_name")),
+        uploader_mid: number(item.get("author_mid")),
         stats: format!(
             "{}播放  ·  {}弹幕",
             compact_number(number(stat.and_then(|stat| stat.get("view")))),
@@ -857,6 +1155,7 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
         cid: 0,
         title: clean_search_text(text(archive.get("title"))),
         uploader: String::new(),
+        uploader_mid: 0,
         stats: format!(
             "{}播放  ·  {}弹幕",
             text(stat.and_then(|stat| stat.get("play"))),
@@ -885,6 +1184,7 @@ fn parse_dynamic_video(item: &Value, index: usize) -> Option<Video> {
     let author_module = modules.get("module_author").unwrap_or(&Value::Null);
     let content_module = modules.get("module_dynamic").unwrap_or(&Value::Null);
     let author = text(author_module.get("name"));
+    let author_mid = number(author_module.get("mid"));
     let major = content_module.get("major").unwrap_or(&Value::Null);
     let archive = major
         .get("archive")
@@ -903,6 +1203,9 @@ fn parse_dynamic_video(item: &Value, index: usize) -> Option<Video> {
     let mut video = video?;
     if video.uploader.is_empty() {
         video.uploader = author;
+    }
+    if video.uploader_mid == 0 {
+        video.uploader_mid = author_mid;
     }
     video.accent = accent_for(index);
     Some(video)
@@ -977,6 +1280,7 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
         cid: number(item.get("cid")),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
+        uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
         stats: format!(
             "{}播放  ·  {}弹幕",
             compact_number(number(stat.and_then(|stat| stat.get("view")))),
@@ -1043,6 +1347,7 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
         cid: number(ugc.and_then(|ugc| ugc.get("first_cid"))),
         title: clean_search_text(text(item.get("title"))),
         uploader: text(upper.and_then(|upper| upper.get("name"))),
+        uploader_mid: number(upper.and_then(|upper| upper.get("mid"))),
         stats: format!(
             "{}播放  ·  {}弹幕",
             compact_number(number(stat.and_then(|stat| stat.get("play")))),
@@ -1419,7 +1724,10 @@ pub(crate) fn fetch_comments(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_history_video, parse_play_url, parse_video, thumbnail_url};
+    use super::{
+        parse_author_video, parse_collection, parse_history_video, parse_play_url, parse_video,
+        thumbnail_url,
+    };
     use serde_json::json;
 
     #[test]
@@ -1501,6 +1809,61 @@ mod tests {
         assert_eq!(result.qualities.len(), 3);
         assert_eq!(result.qualities[1].qn, 32);
         assert_eq!(result.qualities[1].label, "480P");
+    }
+
+    #[test]
+    fn collection_parses_sections_and_uses_section_season_id() {
+        let collection = parse_collection(
+            &json!({
+                "name": "测试合集",
+                "sections": [{
+                    "season_id": 9001,
+                    "episodes": [{
+                        "aid": 123,
+                        "bvid": "BV1collection",
+                        "cid": 456,
+                        "title": "第一集",
+                        "arc": {
+                            "pic": "//example.com/cover.jpg",
+                            "duration": 61,
+                            "stat": {"view": 10, "danmaku": 2}
+                        }
+                    }]
+                }]
+            }),
+            7788,
+            "作者",
+        )
+        .expect("collection should parse");
+
+        assert_eq!(collection.id, 9001);
+        assert_eq!(collection.title, "测试合集");
+        assert_eq!(collection.episodes[0].cid, 456);
+        assert_eq!(collection.episodes[0].uploader_mid, 7788);
+    }
+
+    #[test]
+    fn author_video_parser_maps_author_uid_and_stats() {
+        let video = parse_author_video(
+            &json!({
+                "aid": 123,
+                "bvid": "BV1author",
+                "title": "作者投稿",
+                "pic": "//example.com/cover.jpg",
+                "author": "作者",
+                "play": 10000,
+                "comment": 20,
+                "length": "01:02",
+                "typename": "知识"
+            }),
+            0,
+            7788,
+        )
+        .expect("author video should parse");
+
+        assert_eq!(video.uploader_mid, 7788);
+        assert_eq!(video.duration, "01:02");
+        assert!(video.stats.contains("1.0万播放"));
     }
 }
 

@@ -8,12 +8,20 @@ pub(crate) struct Video {
     pub(crate) cid: i64,
     pub(crate) title: String,
     pub(crate) uploader: String,
+    pub(crate) uploader_mid: i64,
     pub(crate) stats: String,
     pub(crate) duration: String,
     pub(crate) cover: String,
     pub(crate) cover_image: Option<Arc<RenderImage>>,
     pub(crate) accent: u32,
     pub(crate) category: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VideoCollection {
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) episodes: Vec<Video>,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +46,7 @@ pub(crate) static LOADING_VIDEO: Video = Video {
     cid: 0,
     title: String::new(),
     uploader: String::new(),
+    uploader_mid: 0,
     stats: String::new(),
     duration: String::new(),
     cover: String::new(),
