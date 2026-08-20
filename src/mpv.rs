@@ -328,11 +328,7 @@ impl MpvPlayer {
     }
 
     pub fn recycle_frame(&self, frame: Arc<RenderImage>) {
-        if let Ok(frame) = Arc::try_unwrap(frame) {
-            if let Some(pixels) = frame.into_single_frame_bytes() {
-                let _ = self.recycled_frames.send(pixels);
-            }
-        }
+        let _ = frame;
     }
 
     pub fn status(&self) -> MpvStatus {
