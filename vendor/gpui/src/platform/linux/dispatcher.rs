@@ -16,6 +16,8 @@ struct TimerAfter {
     runnable: Runnable,
 }
 
+const MAX_BACKGROUND_THREADS: usize = 8;
+
 pub(crate) struct LinuxDispatcher {
     main_sender: Sender<Runnable>,
     timer_sender: Sender<TimerAfter>,
@@ -29,7 +31,8 @@ impl LinuxDispatcher {
         let (background_sender, background_receiver) = flume::unbounded::<Runnable>();
         let thread_count = std::thread::available_parallelism()
             .map(|i| i.get())
-            .unwrap_or(1);
+            .unwrap_or(1)
+            .min(MAX_BACKGROUND_THREADS);
 
         let mut background_threads = (0..thread_count)
             .map(|i| {

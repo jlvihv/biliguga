@@ -7,7 +7,7 @@ use std::{
     os::raw::{c_char, c_double, c_int, c_void},
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -83,7 +83,9 @@ enum PlayerCommand {
         volume: f64,
         speed: f64,
     },
-    StopPlayback,
+    StopPlayback {
+        done: SyncSender<()>,
+    },
     SetPause(bool),
     SetVolume(f64),
     SetSpeed(f64),
@@ -119,13 +121,21 @@ struct FramePacket {
 
 pub struct MpvPlayer {
     commands: mpsc::Sender<PlayerCommand>,
+    worker_parts: Mutex<Option<WorkerParts>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
     frames: Receiver<FramePacket>,
     recycled_frames: mpsc::Sender<Vec<u8>>,
     statuses: Receiver<MpvStatus>,
     current_frame: Option<Arc<RenderImage>>,
     retired_frames: VecDeque<Arc<RenderImage>>,
     current_status: MpvStatus,
-    worker: Option<JoinHandle<()>>,
+}
+
+struct WorkerParts {
+    command_rx: Receiver<PlayerCommand>,
+    frame_tx: SyncSender<FramePacket>,
+    recycled_rx: Receiver<Vec<u8>>,
+    status_tx: SyncSender<MpvStatus>,
 }
 
 impl MpvPlayer {
@@ -134,55 +144,112 @@ impl MpvPlayer {
         let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
         let (recycled_tx, recycled_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::sync_channel(2);
-        let worker = thread::Builder::new()
-            .name("biliguga-libmpv".into())
-            .spawn(move || run_mpv(command_rx, frame_tx, recycled_rx, status_tx))
-            .ok();
         Self {
             commands: command_tx,
+            worker_parts: Mutex::new(Some(WorkerParts {
+                command_rx,
+                frame_tx,
+                recycled_rx,
+                status_tx,
+            })),
+            worker: Mutex::new(None),
             frames: frame_rx,
             recycled_frames: recycled_tx,
             statuses: status_rx,
             current_frame: None,
             retired_frames: VecDeque::new(),
             current_status: MpvStatus::default(),
-            worker,
         }
     }
 
+    fn start_worker(&self) {
+        let Ok(mut worker) = self.worker.lock() else {
+            return;
+        };
+        if worker.is_some() {
+            return;
+        }
+        let Some(parts) = self
+            .worker_parts
+            .lock()
+            .ok()
+            .and_then(|mut parts| parts.take())
+        else {
+            return;
+        };
+        let Ok(handle) = thread::Builder::new()
+            .name("biliguga-libmpv".into())
+            .spawn(move || {
+                run_mpv(
+                    parts.command_rx,
+                    parts.frame_tx,
+                    parts.recycled_rx,
+                    parts.status_tx,
+                )
+            })
+        else {
+            return;
+        };
+        *worker = Some(handle);
+    }
+
+    fn worker_started(&self) -> bool {
+        self.worker
+            .lock()
+            .map(|worker| worker.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn load(&self, url: String, volume: f64, speed: f64) {
+        self.start_worker();
         let _ = self
             .commands
             .send(PlayerCommand::Load { url, volume, speed });
     }
 
     pub fn stop_playback(&mut self) -> Vec<Arc<RenderImage>> {
-        let _ = self.commands.send(PlayerCommand::StopPlayback);
+        if self.worker_started() {
+            let (done_tx, done_rx) = mpsc::sync_channel(0);
+            let _ = self
+                .commands
+                .send(PlayerCommand::StopPlayback { done: done_tx });
+            let _ = done_rx.recv_timeout(Duration::from_millis(500));
+        }
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
         self.take_all_frames()
     }
 
     pub fn set_pause(&self, paused: bool) {
-        let _ = self.commands.send(PlayerCommand::SetPause(paused));
+        if self.worker_started() {
+            let _ = self.commands.send(PlayerCommand::SetPause(paused));
+        }
     }
 
     pub fn set_volume(&self, volume: f64) {
-        let _ = self.commands.send(PlayerCommand::SetVolume(volume));
+        if self.worker_started() {
+            let _ = self.commands.send(PlayerCommand::SetVolume(volume));
+        }
     }
 
     pub fn set_speed(&self, speed: f64) {
-        let _ = self.commands.send(PlayerCommand::SetSpeed(speed));
+        if self.worker_started() {
+            let _ = self.commands.send(PlayerCommand::SetSpeed(speed));
+        }
     }
 
     pub fn seek_percent(&self, percent: f64) {
-        let _ = self.commands.send(PlayerCommand::SeekPercent(percent));
+        if self.worker_started() {
+            let _ = self.commands.send(PlayerCommand::SeekPercent(percent));
+        }
     }
 
     pub fn seek_seconds(&self, seconds: f64) {
-        let _ = self
-            .commands
-            .send(PlayerCommand::SeekSeconds(seconds.max(0.)));
+        if self.worker_started() {
+            let _ = self
+                .commands
+                .send(PlayerCommand::SeekSeconds(seconds.max(0.)));
+        }
     }
 
     pub fn poll_frame(&mut self) {
@@ -268,8 +335,12 @@ impl MpvPlayer {
 
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
-        let _ = self.commands.send(PlayerCommand::Stop);
-        if let Some(worker) = self.worker.take() {
+        if self.worker_started() {
+            let _ = self.commands.send(PlayerCommand::Stop);
+        }
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.take()
+        {
             let _ = worker.join();
         }
     }
@@ -307,8 +378,10 @@ fn run_mpv(
                 }
             }
             PlayerCommand::Stop => return,
-            PlayerCommand::StopPlayback
-            | PlayerCommand::SetPause(_)
+            PlayerCommand::StopPlayback { done } => {
+                let _ = done.send(());
+            }
+            PlayerCommand::SetPause(_)
             | PlayerCommand::SetVolume(_)
             | PlayerCommand::SetSpeed(_)
             | PlayerCommand::SeekPercent(_)
@@ -400,7 +473,10 @@ fn run_mpv_session(
                     command @ PlayerCommand::Load { .. } => {
                         break 'playback SessionExit::Reload(command);
                     }
-                    PlayerCommand::StopPlayback => break 'playback SessionExit::Idle,
+                    PlayerCommand::StopPlayback { done } => {
+                        let _ = done.send(());
+                        break 'playback SessionExit::Idle;
+                    }
                     PlayerCommand::Stop => break 'playback SessionExit::Stop,
                     PlayerCommand::SetPause(paused) => {
                         render_enabled = !paused;
@@ -528,7 +604,9 @@ unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
         PlayerCommand::SeekSeconds(seconds) => {
             format!("seek {:.3} absolute", seconds.max(0.))
         }
-        PlayerCommand::Load { .. } | PlayerCommand::StopPlayback | PlayerCommand::Stop => return,
+        PlayerCommand::Load { .. } | PlayerCommand::StopPlayback { .. } | PlayerCommand::Stop => {
+            return;
+        }
     };
     if let Ok(command) = CString::new(text) {
         unsafe {

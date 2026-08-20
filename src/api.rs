@@ -239,7 +239,7 @@ struct CoverWorkers {
 }
 
 fn cover_workers() -> Option<&'static CoverWorkers> {
-    const WORKER_COUNT: usize = 4;
+    const WORKER_COUNT: usize = 2;
     static WORKERS: OnceLock<Option<CoverWorkers>> = OnceLock::new();
 
     WORKERS

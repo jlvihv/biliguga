@@ -1598,7 +1598,7 @@ impl BiliGuga {
     }
 
     fn start_collection_cover_loading(&mut self, cx: &mut Context<Self>) {
-        const MAX_IN_FLIGHT: usize = 4;
+        const MAX_IN_FLIGHT: usize = 2;
 
         if self.collection_cover_loading {
             return;
@@ -1693,7 +1693,7 @@ impl BiliGuga {
     }
 
     fn start_cover_loading(&mut self, cx: &mut Context<Self>) {
-        const MAX_IN_FLIGHT: usize = 4;
+        const MAX_IN_FLIGHT: usize = 2;
 
         if self.cover_loading {
             return;
