@@ -78,6 +78,36 @@ fn with_cookie(request: RequestBuilder, cookie: Option<&str>) -> RequestBuilder 
     }
 }
 
+fn generated_buvid3() -> &'static str {
+    static BUVID3: OnceLock<String> = OnceLock::new();
+    BUVID3.get_or_init(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut digest = Md5::new();
+        digest.update(now.to_le_bytes());
+        format!("{:x}infoc", digest.finalize())
+    })
+}
+
+fn with_action_cookie(request: RequestBuilder, cookie: &str) -> RequestBuilder {
+    if cookie.is_empty() {
+        return request;
+    }
+    let has_buvid3 = cookie.split(';').any(|part| {
+        part.trim()
+            .split_once('=')
+            .map(|(name, _)| name == "buvid3")
+            .unwrap_or(false)
+    });
+    if has_buvid3 {
+        request.header("Cookie", cookie)
+    } else {
+        request.header("Cookie", format!("{cookie}; buvid3={}", generated_buvid3()))
+    }
+}
+
 fn number(value: Option<&Value>) -> i64 {
     value
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
@@ -1525,15 +1555,19 @@ pub(crate) fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), S
 pub(crate) fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
     let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
-    let response: Value = with_cookie(
+    let response: Value = with_action_cookie(
         client
             .post("https://api.bilibili.com/x/web-interface/archive/like")
+            .header("Origin", "https://www.bilibili.com")
             .header("Referer", "https://www.bilibili.com/"),
-        Some(cookie),
+        cookie,
     )
     .form(&[
         ("aid", aid.to_string()),
@@ -1554,15 +1588,19 @@ pub(crate) fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
 pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
     let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
-    let response: Value = with_cookie(
+    let response: Value = with_action_cookie(
         client
             .post("https://api.bilibili.com/x/web-interface/coin/add")
+            .header("Origin", "https://www.bilibili.com")
             .header("Referer", "https://www.bilibili.com/"),
-        Some(cookie),
+        cookie,
     )
     .form(&[
         ("aid", aid.to_string()),
@@ -1576,6 +1614,19 @@ pub(crate) fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
     .map_err(|error| format!("解析投币响应失败：{error}"))?;
     if number(response.get("code")) == 0 {
         Ok(())
+    } else if number(response.get("code")) == -401
+        && response
+            .get("data")
+            .and_then(|data| data.get("ga_data"))
+            .and_then(|data| data.get("decisions"))
+            .and_then(Value::as_array)
+            .is_some_and(|decisions| {
+                decisions
+                    .iter()
+                    .any(|decision| text(Some(decision)) == "verify_captcha_level3")
+            })
+    {
+        Err("投币被 B 站风控拦截，请先在浏览器打开该视频并完成验证码后再重试".into())
     } else {
         Err(api_error(&response, "投币"))
     }

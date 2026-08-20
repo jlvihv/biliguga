@@ -17,10 +17,11 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use gpui::{
-    App, Application, AssetSource, Bounds, ClickEvent, Context, DispatchPhase, Entity, FontWeight,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, RenderImage,
-    ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, size, svg, uniform_list,
+    App, Application, AssetSource, Bounds, ClickEvent, Context, DispatchPhase, Entity, FocusHandle,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    RenderImage, ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, size, svg,
+    uniform_list,
 };
 use std::{
     fs,
@@ -126,6 +127,7 @@ impl AssetSource for AppAssets {
 }
 
 struct BiliGuga {
+    root_focus: FocusHandle,
     search_input: Entity<SearchInput>,
     search_query: String,
     active_tab: AppTab,
@@ -230,6 +232,7 @@ impl BiliGuga {
             .map(|session| format!("已登录：{}", session.username))
             .unwrap_or_else(|| "使用哔哩哔哩 App 扫码登录".into());
         Self {
+            root_focus: cx.focus_handle(),
             search_input: cx.new(SearchInput::new),
             search_query: String::new(),
             active_tab: AppTab::Home,
@@ -1973,7 +1976,7 @@ impl BiliGuga {
         .detach();
     }
 
-    fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_pause_state(&mut self, cx: &mut Context<Self>) {
         match self.playback {
             PlaybackState::Playing => {
                 self.queue_history_report(cx, 2);
@@ -1992,8 +1995,12 @@ impl BiliGuga {
                 self.message = SharedString::from("视频正在缓冲");
                 cx.notify();
             }
-            PlaybackState::Idle => {}
+            PlaybackState::Idle => self.begin_play_selected(cx),
         }
+    }
+
+    fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_pause_state(cx);
     }
 
     fn set_volume_from_position(
@@ -2102,15 +2109,21 @@ impl BiliGuga {
             return;
         }
         let key = event.keystroke.key.as_str();
+        let search_focused = self.search_input.read(cx).is_focused(window);
         if key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc") {
             if self.player_fullscreen || self.screen_fullscreen {
                 self.exit_fullscreen(window, cx);
             }
         } else if key.eq_ignore_ascii_case("f")
             && !event.keystroke.modifiers.modified()
-            && !self.search_input.read(cx).is_focused(window)
+            && !search_focused
         {
             self.toggle_screen_fullscreen_state(window, cx);
+        } else if (key.eq_ignore_ascii_case("space") || key == " ")
+            && !event.keystroke.modifiers.modified()
+            && !search_focused
+        {
+            self.toggle_pause_state(cx);
         }
     }
 
@@ -3446,7 +3459,8 @@ impl Render for BiliGuga {
             .size_full()
             .flex()
             .bg(rgb(0x3b414d))
-            .on_key_down(cx.listener(Self::handle_global_key));
+            .track_focus(&self.root_focus)
+            .capture_key_down(cx.listener(Self::handle_global_key));
         if self.player_fullscreen {
             root = root.child(self.render_player(cx));
         } else {
@@ -3526,6 +3540,9 @@ pub(crate) fn launch() {
                 )
                 .expect("failed to open biliguga window");
             let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+            window
+                .update(cx, |app, window, _| window.focus(&app.root_focus))
+                .unwrap();
             let window_handle = window
                 .update(cx, |_, window, _| window.window_handle())
                 .unwrap();
