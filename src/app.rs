@@ -188,6 +188,10 @@ struct BiliGuga {
     pending_seek: Option<f64>,
     collection: Option<VideoCollection>,
     collection_loading: bool,
+    collection_expanded: bool,
+    collection_cover_loading: bool,
+    collection_cover_generation: u64,
+    collection_cover_cancelled: Arc<AtomicBool>,
     history_report_at: Instant,
     history_report_in_flight: bool,
     pending_cover_drops: Vec<Arc<RenderImage>>,
@@ -293,6 +297,10 @@ impl BiliGuga {
             pending_seek: None,
             collection: None,
             collection_loading: false,
+            collection_expanded: true,
+            collection_cover_loading: false,
+            collection_cover_generation: 0,
+            collection_cover_cancelled: Arc::new(AtomicBool::new(false)),
             history_report_at: Instant::now(),
             history_report_in_flight: false,
             pending_cover_drops: Vec::new(),
@@ -550,7 +558,7 @@ impl BiliGuga {
         self.cloud_resume_applied = false;
         self.pending_seek = None;
         self.quality_options.clear();
-        self.collection = None;
+        self.clear_collection(window);
         self.collection_loading = false;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
@@ -791,6 +799,24 @@ impl BiliGuga {
         self.cover_cancelled = Arc::new(AtomicBool::new(false));
         self.cover_generation = self.cover_generation.wrapping_add(1);
         self.cover_loading = false;
+    }
+
+    fn reset_collection_cover_loading(&mut self) {
+        self.collection_cover_cancelled
+            .store(true, Ordering::Release);
+        self.collection_cover_cancelled = Arc::new(AtomicBool::new(false));
+        self.collection_cover_generation = self.collection_cover_generation.wrapping_add(1);
+        self.collection_cover_loading = false;
+    }
+
+    fn clear_collection(&mut self, window: &mut Window) {
+        self.reset_collection_cover_loading();
+        if let Some(mut collection) = self.collection.take() {
+            for episode in &mut collection.episodes {
+                Self::release_image(&mut episode.cover_image, window);
+            }
+        }
+        self.collection_expanded = true;
     }
 
     fn release_active_cover_images(&mut self, window: &mut Window) {
@@ -1571,6 +1597,101 @@ impl BiliGuga {
         self.add_video_to_favorites(index, event, window, cx);
     }
 
+    fn start_collection_cover_loading(&mut self, cx: &mut Context<Self>) {
+        const MAX_IN_FLIGHT: usize = 4;
+
+        if self.collection_cover_loading {
+            return;
+        }
+        let Some(collection) = &self.collection else {
+            return;
+        };
+        let collection_id = collection.id;
+        let covers = collection
+            .episodes
+            .iter()
+            .enumerate()
+            .filter(|(_, episode)| episode.cover_image.is_none())
+            .map(|(index, episode)| (index, episode.bvid.clone(), episode.cover.clone()))
+            .collect::<Vec<_>>();
+        if covers.is_empty() {
+            return;
+        }
+
+        self.collection_cover_loading = true;
+        let generation = self.collection_cover_generation;
+        let cancelled = self.collection_cover_cancelled.clone();
+        cx.spawn(async move |view, cx| {
+            type CoverFuture = BoxFuture<'static, (usize, String, Option<Arc<RenderImage>>)>;
+
+            let make_future = |index: usize, bvid: String, cover_url: String| -> CoverFuture {
+                let cancelled = cancelled.clone();
+                async move {
+                    let image = match queue_cover_download(cover_url, cancelled) {
+                        Some(receiver) => receiver.await.ok().flatten(),
+                        None => None,
+                    };
+                    (index, bvid, image)
+                }
+                .boxed()
+            };
+
+            let mut covers = covers.into_iter();
+            let mut pending = FuturesUnordered::<CoverFuture>::new();
+            for _ in 0..MAX_IN_FLIGHT {
+                if let Some((index, bvid, cover_url)) = covers.next() {
+                    pending.push(make_future(index, bvid, cover_url));
+                }
+            }
+
+            while let Some((index, bvid, image)) = pending.next().await {
+                let keep_loading = view
+                    .update(cx, |app, cx| {
+                        if app.collection_cover_generation != generation {
+                            return false;
+                        }
+                        let is_same_collection = app
+                            .collection
+                            .as_ref()
+                            .filter(|collection| collection.id == collection_id)
+                            .and_then(|collection| collection.episodes.get(index))
+                            .map(|episode| episode.bvid == bvid)
+                            .unwrap_or(false);
+                        if is_same_collection {
+                            if let Some(image) = image {
+                                Self::debug_image("store-collection", &image, &bvid);
+                                if let Some(episode) = app
+                                    .collection
+                                    .as_mut()
+                                    .and_then(|collection| collection.episodes.get_mut(index))
+                                {
+                                    episode.cover_image = Some(image);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_loading {
+                    cancelled.store(true, Ordering::Release);
+                    return;
+                }
+                if let Some((index, bvid, cover_url)) = covers.next() {
+                    pending.push(make_future(index, bvid, cover_url));
+                }
+            }
+
+            view.update(cx, |app, _| {
+                if app.collection_cover_generation == generation {
+                    app.collection_cover_loading = false;
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn start_cover_loading(&mut self, cx: &mut Context<Self>) {
         const MAX_IN_FLIGHT: usize = 4;
 
@@ -1795,7 +1916,7 @@ impl BiliGuga {
         self.playback = PlaybackState::Idle;
         self.pending_seek = None;
         self.quality_options.clear();
-        self.collection = None;
+        self.clear_collection(window);
         self.collection_loading = true;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
@@ -1845,7 +1966,7 @@ impl BiliGuga {
         self.playback = PlaybackState::Idle;
         self.pending_seek = None;
         self.quality_options.clear();
-        self.collection = None;
+        self.clear_collection(window);
         self.collection_loading = true;
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
@@ -1941,7 +2062,10 @@ impl BiliGuga {
                                 playing_video.uploader_mid = context.uploader_mid;
                             }
                         }
+                        app.reset_collection_cover_loading();
                         app.collection = context.and_then(|context| context.collection);
+                        app.collection_expanded = true;
+                        app.start_collection_cover_loading(cx);
                         app.collection_loading = false;
                         app.quality_options = play_url.qualities.clone();
                         if play_url.actual_quality > 0 {
@@ -2809,6 +2933,11 @@ impl BiliGuga {
         section
     }
 
+    fn toggle_collection(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.collection_expanded = !self.collection_expanded;
+        cx.notify();
+    }
+
     fn render_collection(&self, cx: &mut Context<Self>) -> gpui::Div {
         let Some(collection) = &self.collection else {
             return div();
@@ -2819,21 +2948,34 @@ impl BiliGuga {
         let entity = cx.entity();
         let mut section = div()
             .w_full()
-            .px_5()
-            .py_3()
+            .py_1()
             .bg(rgb(0x343a45))
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(
                 div()
+                    .id(SharedString::from(format!("collection-{}", collection.id)))
                     .w_full()
+                    .h(px(28.))
+                    .px_4()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x3d4350)))
+                    .child(div().flex().items_center().gap_1().child(
+                        div().text_xs().text_color(rgb(0x74ade8)).child(
+                            if self.collection_expanded {
+                                "▾"
+                            } else {
+                                "▸"
+                            },
+                        ),
+                    ))
                     .child(
                         div()
-                            .id(SharedString::from(format!("collection-{}", collection.id)))
+                            .flex_1()
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(0xdce0e5))
@@ -2845,11 +2987,16 @@ impl BiliGuga {
                             .text_xs()
                             .text_color(rgb(0x878a98))
                             .child(format!("共 {} 集", collection.episodes.len())),
-                    ),
+                    )
+                    .on_click(cx.listener(Self::toggle_collection)),
             );
+        if !self.collection_expanded {
+            return section;
+        }
         if collection.episodes.is_empty() {
             return section.child(
                 div()
+                    .px_4()
                     .text_xs()
                     .text_color(rgb(0x878a98))
                     .child("合集暂时没有可播放的视频"),
@@ -2863,24 +3010,24 @@ impl BiliGuga {
                 div()
                     .id(SharedString::from(format!("collection-episode-{index}")))
                     .w_full()
-                    .h(px(58.))
+                    .h(px(46.))
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_2()
+                    .px_4()
                     .cursor_pointer()
                     .when(is_current, |this| this.bg(rgb(0x454a56)))
                     .when(!is_current, |this| {
                         this.hover(|style| style.bg(rgb(0x3d4350)))
                     })
-                    .child(thumbnail(episode, 90., 52.))
+                    .child(thumbnail(episode, 72., 42.))
                     .child(
                         div()
                             .flex_1()
                             .flex()
                             .flex_col()
                             .justify_center()
-                            .gap_1()
+                            .gap_0()
                             .child(
                                 div()
                                     .text_xs()
