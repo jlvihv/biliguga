@@ -2305,6 +2305,20 @@ impl BiliGuga {
             && !search_focused
         {
             self.toggle_pause_state(cx);
+        } else if (key.eq_ignore_ascii_case("left") || key.eq_ignore_ascii_case("arrowleft"))
+            && !event.keystroke.modifiers.modified()
+            && !search_focused
+            && self.playback != PlaybackState::Idle
+        {
+            self.player.seek_relative(-10.);
+            cx.notify();
+        } else if (key.eq_ignore_ascii_case("right") || key.eq_ignore_ascii_case("arrowright"))
+            && !event.keystroke.modifiers.modified()
+            && !search_focused
+            && self.playback != PlaybackState::Idle
+        {
+            self.player.seek_relative(10.);
+            cx.notify();
         }
     }
 

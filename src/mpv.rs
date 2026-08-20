@@ -91,6 +91,7 @@ enum PlayerCommand {
     SetSpeed(f64),
     SeekPercent(f64),
     SeekSeconds(f64),
+    SeekRelative(f64),
     Stop,
 }
 
@@ -252,6 +253,12 @@ impl MpvPlayer {
         }
     }
 
+    pub fn seek_relative(&self, seconds: f64) {
+        if self.worker_started() && seconds.is_finite() && seconds != 0. {
+            let _ = self.commands.send(PlayerCommand::SeekRelative(seconds));
+        }
+    }
+
     pub fn poll_frame(&mut self) {
         let mut latest_packet = None;
         loop {
@@ -385,7 +392,8 @@ fn run_mpv(
             | PlayerCommand::SetVolume(_)
             | PlayerCommand::SetSpeed(_)
             | PlayerCommand::SeekPercent(_)
-            | PlayerCommand::SeekSeconds(_) => {}
+            | PlayerCommand::SeekSeconds(_)
+            | PlayerCommand::SeekRelative(_) => {}
         }
     }
 }
@@ -485,7 +493,8 @@ fn run_mpv_session(
                     command @ (PlayerCommand::SetVolume(_)
                     | PlayerCommand::SetSpeed(_)
                     | PlayerCommand::SeekPercent(_)
-                    | PlayerCommand::SeekSeconds(_)) => run_command(handle, &command),
+                    | PlayerCommand::SeekSeconds(_)
+                    | PlayerCommand::SeekRelative(_)) => run_command(handle, &command),
                 }
             }
 
@@ -604,6 +613,7 @@ unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
         PlayerCommand::SeekSeconds(seconds) => {
             format!("seek {:.3} absolute", seconds.max(0.))
         }
+        PlayerCommand::SeekRelative(seconds) => format!("seek {seconds:.3} relative"),
         PlayerCommand::Load { .. } | PlayerCommand::StopPlayback { .. } | PlayerCommand::Stop => {
             return;
         }
