@@ -49,7 +49,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 ## 登录状态
 
-程序使用二维码登录，登录状态保存在当前用户的数据目录中。Cookie 只用于访问 B 站接口，请不要把 session 文件提交到仓库。
+程序使用二维码登录，登录状态保存在 `~/.config/biliguga/session`（可通过 `XDG_CONFIG_HOME` 调整）中。Cookie 只用于访问 B 站接口，请不要把 session 文件提交到仓库。
 
 Windows Release 同时提供 `biliguga-windows-x86_64-setup.exe` 安装程序，安装后可从开始菜单启动；Windows 安装包已包含播放器运行库。
 

@@ -211,7 +211,7 @@ async fn fetch_user(cookie: &str) -> Result<UserSession, String> {
     })
 }
 
-fn session_path() -> PathBuf {
+fn config_base_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -225,11 +225,51 @@ fn session_path() -> PathBuf {
         .join("Application Support");
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let base = std::env::var_os("XDG_STATE_HOME")
+    let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
         .unwrap_or_else(|| PathBuf::from("."));
 
-    base.join("biliguga").join("session")
+    base
+}
+
+fn session_path() -> PathBuf {
+    config_base_dir().join("biliguga").join("session")
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn legacy_session_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("biliguga")
+        .join("session")
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn legacy_session_path() -> PathBuf {
+    session_path()
+}
+
+fn parse_session(content: &str) -> Option<UserSession> {
+    let mut lines = content.lines();
+    let cookie = lines.next()?.to_string();
+    if cookie.is_empty() {
+        return None;
+    }
+    Some(UserSession {
+        cookie,
+        mid: lines
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+        username: lines.next().unwrap_or("已登录用户").to_string(),
+        face: lines.next().unwrap_or_default().to_string(),
+    })
 }
 
 pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
@@ -252,23 +292,22 @@ pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
 }
 
 pub(crate) fn load_session() -> Option<UserSession> {
-    let content = fs::read_to_string(session_path()).ok()?;
-    let mut lines = content.lines();
-    let cookie = lines.next()?.to_string();
-    if cookie.is_empty() {
-        return None;
+    if let Ok(content) = fs::read_to_string(session_path()) {
+        if let Some(session) = parse_session(&content) {
+            return Some(session);
+        }
     }
-    Some(UserSession {
-        cookie,
-        mid: lines
-            .next()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default(),
-        username: lines.next().unwrap_or("已登录用户").to_string(),
-        face: lines.next().unwrap_or_default().to_string(),
-    })
+
+    let legacy_path = legacy_session_path();
+    let session = parse_session(&fs::read_to_string(&legacy_path).ok()?)?;
+    let _ = save_session(&session);
+    Some(session)
 }
 
 pub(crate) fn clear_session() {
     let _ = fs::remove_file(session_path());
+    let legacy_path = legacy_session_path();
+    if legacy_path != session_path() {
+        let _ = fs::remove_file(legacy_path);
+    }
 }
