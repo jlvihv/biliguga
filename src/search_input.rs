@@ -49,6 +49,10 @@ impl SearchInput {
         }
     }
 
+    pub(crate) fn is_focused(&self, window: &Window) -> bool {
+        self.focus_handle.is_focused(window)
+    }
+
     fn focus(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window);
         self.move_to(self.content.len(), cx);

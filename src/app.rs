@@ -25,6 +25,7 @@ use gpui::{
 use std::{
     fs,
     ops::Range,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -40,8 +41,64 @@ const WINDOW_FULLSCREEN_ICON: &str = "icons/window-fullscreen.svg";
 const WINDOW_FULLSCREEN_EXIT_ICON: &str = "icons/window-fullscreen-exit.svg";
 const SCREEN_FULLSCREEN_ICON: &str = "icons/screen-fullscreen.svg";
 const SCREEN_FULLSCREEN_EXIT_ICON: &str = "icons/screen-fullscreen-exit.svg";
+const DEFAULT_VOLUME: f64 = 100.;
+const DEFAULT_SPEED: f64 = 1.;
 
 struct AppAssets;
+
+fn player_settings_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let config_dir = std::env::var_os("APPDATA").map(PathBuf::from);
+
+    #[cfg(not(target_os = "windows"))]
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+
+    config_dir.map(|dir| dir.join("biliguga").join("settings.json"))
+}
+
+fn load_player_settings() -> (f64, f64) {
+    let defaults = (DEFAULT_VOLUME, DEFAULT_SPEED);
+    let Some(path) = player_settings_path() else {
+        return defaults;
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return defaults;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return defaults;
+    };
+    let volume = value
+        .get("volume")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|volume| volume.is_finite())
+        .map(|volume| volume.clamp(0., 100.))
+        .unwrap_or(DEFAULT_VOLUME);
+    let speed = value
+        .get("speed")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|speed| speed.is_finite() && *speed >= 0.1)
+        .unwrap_or(DEFAULT_SPEED);
+    (volume, speed)
+}
+
+fn save_player_settings(volume: f64, speed: f64) {
+    let Some(path) = player_settings_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let value = serde_json::json!({
+        "volume": volume.clamp(0., 100.),
+        "speed": speed.max(0.1),
+    });
+    let _ = fs::write(path, value.to_string());
+}
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
@@ -167,6 +224,7 @@ enum PlaybackState {
 impl BiliGuga {
     fn new(cx: &mut Context<Self>) -> Self {
         let session = login::load_session();
+        let (volume, speed) = load_player_settings();
         let login_status = session
             .as_ref()
             .map(|session| format!("已登录：{}", session.username))
@@ -215,8 +273,8 @@ impl BiliGuga {
             login_generation: 0,
             playback: PlaybackState::Idle,
             playback_request: 0,
-            volume: 100.,
-            speed: 1.,
+            volume,
+            speed,
             quality: 64,
             quality_options: Vec::new(),
             speed_menu_open: false,
@@ -1954,6 +2012,10 @@ impl BiliGuga {
         cx.notify();
     }
 
+    fn persist_player_settings(&self) {
+        save_player_settings(self.volume, self.speed);
+    }
+
     fn toggle_speed_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.speed_menu_open = !self.speed_menu_open;
         self.quality_menu_open = false;
@@ -1963,6 +2025,7 @@ impl BiliGuga {
     fn select_speed(&mut self, speed: f64, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.speed = speed;
         self.player.set_speed(self.speed);
+        self.persist_player_settings();
         self.speed_menu_open = false;
         cx.notify();
     }
@@ -2018,15 +2081,55 @@ impl BiliGuga {
         cx.notify();
     }
 
+    fn exit_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen_fullscreen {
+            self.screen_fullscreen = false;
+            window.toggle_fullscreen();
+        }
+        self.player_fullscreen = false;
+        self.controls_visible = true;
+        self.controls_generation = self.controls_generation.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn handle_global_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.is_held {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc") {
+            if self.player_fullscreen || self.screen_fullscreen {
+                self.exit_fullscreen(window, cx);
+            }
+        } else if key.eq_ignore_ascii_case("f")
+            && !event.keystroke.modifiers.modified()
+            && !self.search_input.read(cx).is_focused(window)
+        {
+            self.toggle_screen_fullscreen_state(window, cx);
+        }
+    }
+
     fn toggle_screen_fullscreen(
         &mut self,
         _: &ClickEvent,
         window: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        self.toggle_screen_fullscreen_state(window, cx);
+    }
+
+    fn toggle_screen_fullscreen_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.screen_fullscreen = !self.screen_fullscreen;
         self.player_fullscreen = self.screen_fullscreen;
         window.toggle_fullscreen();
+        self.controls_visible = true;
+        self.controls_generation = self.controls_generation.wrapping_add(1);
+        cx.notify();
     }
 
     fn seek_percent(&mut self, percent: f64, cx: &mut Context<Self>) {
@@ -2981,7 +3084,10 @@ impl BiliGuga {
                             let entity = volume_entity.clone();
                             window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
                                 if event.button == MouseButton::Left {
-                                    entity.update(cx, |app, _| app.volume_dragging = false);
+                                    entity.update(cx, |app, _| {
+                                        app.volume_dragging = false;
+                                        app.persist_player_settings();
+                                    });
                                 }
                             });
                         },
@@ -3336,7 +3442,11 @@ impl BiliGuga {
 
 impl Render for BiliGuga {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = div().size_full().flex().bg(rgb(0x3b414d));
+        let mut root = div()
+            .size_full()
+            .flex()
+            .bg(rgb(0x3b414d))
+            .on_key_down(cx.listener(Self::handle_global_key));
         if self.player_fullscreen {
             root = root.child(self.render_player(cx));
         } else {
