@@ -191,6 +191,7 @@ struct BiliGuga {
     player_fullscreen: bool,
     screen_fullscreen: bool,
     playing_video: Option<Video>,
+    player_viewport_size: Option<(usize, usize)>,
     detail_view_count: SharedString,
     detail_danmaku_count: SharedString,
     detail_like_count: SharedString,
@@ -318,6 +319,7 @@ impl BiliGuga {
             player_fullscreen: false,
             screen_fullscreen: false,
             playing_video: None,
+            player_viewport_size: None,
             detail_view_count: SharedString::from("—"),
             detail_danmaku_count: SharedString::from("—"),
             detail_like_count: SharedString::from("—"),
@@ -2093,6 +2095,9 @@ impl BiliGuga {
                         }
                         app.debug_memory("before-video-load");
                         app.player.load(play_url.url, play_url.audio_url, app.volume, app.speed);
+                        if let Some((width, height)) = app.player_viewport_size {
+                            app.player.set_render_viewport(width, height);
+                        }
                         app.cloud_resume_applied = false;
                         app.playback = PlaybackState::Buffering;
                         cx.notify();
@@ -2144,6 +2149,14 @@ impl BiliGuga {
             PlaybackState::Playing | PlaybackState::Buffering
         );
         self.power_inhibitor.set_active(should_inhibit);
+    }
+
+    fn update_player_viewport(&mut self, width: usize, height: usize) {
+        if width == 0 || height == 0 || self.player_viewport_size == Some((width, height)) {
+            return;
+        }
+        self.player_viewport_size = Some((width, height));
+        self.player.set_render_viewport(width, height);
     }
 
     fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -3214,6 +3227,7 @@ impl BiliGuga {
         let buffering = self.playback == PlaybackState::Buffering;
         let frame = self.player.frame();
         let frame_size = self.player.frame_size();
+        let source_size = self.player.source_size().or(frame_size);
         let duration = if status.duration.is_finite() && status.duration > 0. {
             status.duration
         } else {
@@ -3249,7 +3263,7 @@ impl BiliGuga {
         if self.player_fullscreen {
             stage = stage.h_full();
         } else {
-            let aspect_ratio = frame_size
+            let aspect_ratio = source_size
                 .filter(|(_, height)| *height > 0)
                 .map(|(width, height)| width as f32 / height as f32)
                 .unwrap_or(16. / 9.);
@@ -3770,6 +3784,24 @@ impl BiliGuga {
                 );
             stage = stage.child(controls);
         }
+
+        let viewport_entity = cx.entity();
+        let stage = div()
+            .on_children_prepainted(move |children, window, cx| {
+                if let Some(bounds) = children.first() {
+                    let scale_factor = window.scale_factor();
+                    let width =
+                        (f32::from(bounds.size.width) * scale_factor).round().max(1.) as usize;
+                    let height =
+                        (f32::from(bounds.size.height) * scale_factor).round().max(1.) as usize;
+                    let _ = viewport_entity
+                        .update(cx, |app, _| app.update_player_viewport(width, height));
+                }
+            })
+            .id("player-stage-viewport")
+            .w_full()
+            .when(self.player_fullscreen, |this| this.h_full())
+            .child(stage);
 
         div()
             .id("player-scroll")

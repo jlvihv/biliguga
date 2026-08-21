@@ -103,6 +103,7 @@ enum PlayerCommand {
     SetPause(bool),
     SetVolume(f64),
     SetSpeed(f64),
+    SetRenderViewport { width: usize, height: usize },
     SeekPercent(f64),
     SeekSeconds(f64),
     SeekRelative(f64),
@@ -134,6 +135,8 @@ struct FramePacket {
     pixels: Vec<u8>,
     width: usize,
     height: usize,
+    source_width: usize,
+    source_height: usize,
 }
 
 pub struct MpvPlayer {
@@ -145,6 +148,7 @@ pub struct MpvPlayer {
     statuses: Receiver<MpvStatus>,
     current_frame: Option<Arc<RenderImage>>,
     current_frame_size: Option<(usize, usize)>,
+    current_source_size: Option<(usize, usize)>,
     retired_frames: VecDeque<Arc<RenderImage>>,
     current_status: MpvStatus,
 }
@@ -176,6 +180,7 @@ impl MpvPlayer {
             statuses: status_rx,
             current_frame: None,
             current_frame_size: None,
+            current_source_size: None,
             retired_frames: VecDeque::new(),
             current_status: MpvStatus::default(),
         }
@@ -237,6 +242,7 @@ impl MpvPlayer {
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
         self.current_frame_size = None;
+        self.current_source_size = None;
         self.take_all_frames()
     }
 
@@ -255,6 +261,14 @@ impl MpvPlayer {
     pub fn set_speed(&self, speed: f64) {
         if self.worker_started() {
             let _ = self.commands.send(PlayerCommand::SetSpeed(speed));
+        }
+    }
+
+    pub fn set_render_viewport(&self, width: usize, height: usize) {
+        if width > 0 && height > 0 {
+            let _ = self
+                .commands
+                .send(PlayerCommand::SetRenderViewport { width, height });
         }
     }
 
@@ -295,10 +309,13 @@ impl MpvPlayer {
                 pixels,
                 width,
                 height,
+                source_width,
+                source_height,
             } = packet;
             let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels);
             if let Some(buffer) = buffer {
                 self.current_frame_size = Some((width, height));
+                self.current_source_size = Some((source_width, source_height));
                 if let Some(previous) =
                     self.current_frame
                         .replace(Arc::new(RenderImage::new(SmallVec::from_elem(
@@ -333,6 +350,10 @@ impl MpvPlayer {
         self.current_frame_size
     }
 
+    pub fn source_size(&self) -> Option<(usize, usize)> {
+        self.current_source_size
+    }
+
     pub fn discard_pending_frames(&mut self) {
         while let Ok(frame) = self.frames.try_recv() {
             let _ = self.recycled_frames.send(frame.pixels);
@@ -345,6 +366,7 @@ impl MpvPlayer {
             frames.push(frame);
         }
         self.current_frame_size = None;
+        self.current_source_size = None;
         frames.extend(self.retired_frames.drain(..));
         frames
     }
@@ -414,6 +436,7 @@ fn run_mpv(
             PlayerCommand::SetPause(_)
             | PlayerCommand::SetVolume(_)
             | PlayerCommand::SetSpeed(_)
+            | PlayerCommand::SetRenderViewport { .. }
             | PlayerCommand::SeekPercent(_)
             | PlayerCommand::SeekSeconds(_)
             | PlayerCommand::SeekRelative(_) => {}
@@ -495,6 +518,9 @@ fn run_mpv_session(
         run_command(handle, &PlayerCommand::SetSpeed(speed));
         let mut render_width = DEFAULT_FRAME_WIDTH;
         let mut render_height = DEFAULT_FRAME_HEIGHT;
+        let mut source_width = DEFAULT_FRAME_WIDTH;
+        let mut source_height = DEFAULT_FRAME_HEIGHT;
+        let mut viewport_size = None;
         let mut buffer_len = render_width * render_height * 4;
         let mut render_buffer = take_frame_buffer(recycled_rx, buffer_len);
         let format = CString::new("bgr0").unwrap();
@@ -518,6 +544,23 @@ fn run_mpv_session(
                         render_enabled = !paused;
                         run_command(handle, &PlayerCommand::SetPause(paused));
                     }
+                    PlayerCommand::SetRenderViewport { width, height } => {
+                        viewport_size = Some((width, height));
+                        let (width, height) = render_size_for_viewport(
+                            source_width,
+                            source_height,
+                            width,
+                            height,
+                        );
+                        if width != render_width || height != render_height {
+                            render_width = width;
+                            render_height = height;
+                            buffer_len = render_width * render_height * 4;
+                            render_buffer = take_frame_buffer(recycled_rx, buffer_len);
+                            size = [render_width as c_int, render_height as c_int];
+                            stride = render_width * 4;
+                        }
+                    }
                     command @ (PlayerCommand::SetVolume(_)
                     | PlayerCommand::SetSpeed(_)
                     | PlayerCommand::SeekPercent(_)
@@ -534,11 +577,22 @@ fn run_mpv_session(
             };
             let file_loaded = event_id == MPV_EVENT_FILE_LOADED;
             if file_loaded || event_id == MPV_EVENT_VIDEO_RECONFIG {
-                if let (Some(source_width), Some(source_height)) = (
+                if let (Some(source_width_value), Some(source_height_value)) = (
                     get_int64_property(handle, "video-out-params/w"),
                     get_int64_property(handle, "video-out-params/h"),
                 ) {
-                    let (width, height) = render_size_for_source(source_width, source_height);
+                    source_width = source_width_value.max(1) as usize;
+                    source_height = source_height_value.max(1) as usize;
+                    let (width, height) = viewport_size
+                        .map(|(viewport_width, viewport_height)| {
+                            render_size_for_viewport(
+                                source_width,
+                                source_height,
+                                viewport_width,
+                                viewport_height,
+                            )
+                        })
+                        .unwrap_or((source_width, source_height));
                     if width != render_width || height != render_height {
                         render_width = width;
                         render_height = height;
@@ -606,6 +660,8 @@ fn run_mpv_session(
                         pixels: render_buffer,
                         width: render_width,
                         height: render_height,
+                        source_width,
+                        source_height,
                     }) {
                         Ok(()) => {
                             render_buffer = take_frame_buffer(recycled_rx, buffer_len);
@@ -668,6 +724,7 @@ unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
             format!("set volume {:.1}", volume.clamp(0., 100.))
         }
         PlayerCommand::SetSpeed(speed) => format!("set speed {:.2}", speed.max(0.1)),
+        PlayerCommand::SetRenderViewport { .. } => return,
         PlayerCommand::SeekPercent(percent) => {
             format!("seek {:.3} absolute-percent", percent.clamp(0., 1.) * 100.)
         }
@@ -757,12 +814,22 @@ unsafe fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
     }
 }
 
-fn render_size_for_source(source_width: i64, source_height: i64) -> (usize, usize) {
-    if source_width <= 0 || source_height <= 0 {
-        return (DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT);
+fn render_size_for_viewport(
+    source_width: usize,
+    source_height: usize,
+    viewport_width: usize,
+    viewport_height: usize,
+) -> (usize, usize) {
+    if source_width == 0 || source_height == 0 || viewport_width == 0 || viewport_height == 0 {
+        return (source_width.max(1), source_height.max(1));
     }
 
-    (source_width as usize, source_height as usize)
+    let scale = (viewport_width as f64 / source_width as f64)
+        .min(viewport_height as f64 / source_height as f64)
+        .min(1.);
+    let width = (source_width as f64 * scale).round().max(1.) as usize;
+    let height = (source_height as f64 * scale).round().max(1.) as usize;
+    (width, height)
 }
 
 unsafe fn run_mpv_cmd(handle: *mut MpvHandle, args: &[&str]) -> bool {
@@ -820,13 +887,19 @@ mod tests {
     }
 
     #[test]
-    fn render_target_follows_source_resolution() {
-        assert_eq!(render_size_for_source(1280, 720), (1280, 720));
-        assert_eq!(render_size_for_source(1920, 1080), (1920, 1080));
-        assert_eq!(render_size_for_source(3840, 2160), (3840, 2160));
-        assert_eq!(render_size_for_source(7680, 4320), (7680, 4320));
-        assert_eq!(render_size_for_source(1080, 1920), (1080, 1920));
-        assert_eq!(render_size_for_source(0, 0), (1920, 1080));
+    fn render_target_follows_player_viewport() {
+        assert_eq!(
+            render_size_for_viewport(3840, 2160, 1280, 720),
+            (1280, 720)
+        );
+        assert_eq!(
+            render_size_for_viewport(1080, 1920, 540, 960),
+            (540, 960)
+        );
+        assert_eq!(
+            render_size_for_viewport(1920, 1080, 3840, 2160),
+            (1920, 1080)
+        );
     }
 
     #[test]
