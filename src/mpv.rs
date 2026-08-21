@@ -40,7 +40,9 @@ unsafe extern "C" {
     ) -> c_int;
     fn mpv_initialize(handle: *mut MpvHandle) -> c_int;
     fn mpv_terminate_destroy(handle: *mut MpvHandle);
+    fn mpv_command(handle: *mut MpvHandle, args: *const *const c_char) -> c_int;
     fn mpv_command_string(handle: *mut MpvHandle, command: *const c_char) -> c_int;
+    fn mpv_error_string(error: c_int) -> *const c_char;
     fn mpv_get_property(
         handle: *mut MpvHandle,
         name: *const c_char,
@@ -80,6 +82,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 enum PlayerCommand {
     Load {
         url: String,
+        audio_url: Option<String>,
         volume: f64,
         speed: f64,
     },
@@ -201,11 +204,11 @@ impl MpvPlayer {
             .unwrap_or(false)
     }
 
-    pub fn load(&self, url: String, volume: f64, speed: f64) {
+    pub fn load(&self, url: String, audio_url: Option<String>, volume: f64, speed: f64) {
         self.start_worker();
         let _ = self
             .commands
-            .send(PlayerCommand::Load { url, volume, speed });
+            .send(PlayerCommand::Load { url, audio_url, volume, speed });
     }
 
     pub fn stop_playback(&mut self) -> Vec<Arc<RenderImage>> {
@@ -365,9 +368,10 @@ fn run_mpv(
             },
         };
         match command {
-            PlayerCommand::Load { url, volume, speed } => {
+            PlayerCommand::Load { url, audio_url, volume, speed } => {
                 match run_mpv_session(
                     url,
+                    audio_url,
                     volume,
                     speed,
                     &command_rx,
@@ -402,6 +406,7 @@ enum SessionExit {
 
 fn run_mpv_session(
     url: String,
+    audio_url: Option<String>,
     volume: f64,
     speed: f64,
     command_rx: &Receiver<PlayerCommand>,
@@ -424,13 +429,22 @@ fn run_mpv_session(
         set_option(handle, "demuxer-max-bytes", "16MiB");
         set_option(handle, "demuxer-max-back-bytes", "4MiB");
         set_option(handle, "osd-level", "0");
-        set_option(handle, "user-agent", "Mozilla/5.0");
+        set_option(
+            handle,
+            "user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        );
         set_option(
             handle,
             "http-header-fields",
             "Referer: https://www.bilibili.com/",
         );
-
+        set_option(handle, "aid", "auto");
+        if let Some(audio_url) = &audio_url {
+            if !audio_url.is_empty() {
+                set_option(handle, "audio-file", audio_url);
+            }
+        }
         if mpv_initialize(handle) < 0 {
             eprintln!("libmpv: mpv_initialize failed");
             mpv_terminate_destroy(handle);
@@ -457,12 +471,18 @@ fn run_mpv_session(
             return SessionExit::Idle;
         }
 
-        let load = CString::new(format!("loadfile {} replace", quote(&url)))
-            .unwrap_or_else(|_| CString::new("stop").unwrap());
-        let _ = mpv_command_string(handle, load.as_ptr());
+        if let Some(audio_url) = &audio_url {
+            if !audio_url.is_empty() {
+                let audio_opt = format!("audio-file={audio_url}");
+                let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace", "0", &audio_opt]);
+            } else {
+                let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace"]);
+            }
+        } else {
+            let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace"]);
+        }
         run_command(handle, &PlayerCommand::SetVolume(volume));
         run_command(handle, &PlayerCommand::SetSpeed(speed));
-
         let buffer_len = FRAME_WIDTH * FRAME_HEIGHT * 4;
         let mut render_buffer = take_frame_buffer(recycled_rx, buffer_len);
         let format = CString::new("bgr0").unwrap();
@@ -677,7 +697,57 @@ unsafe fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
         let _ = mpv_set_option_string(handle, name.as_ptr(), value.as_ptr());
     }
 }
+unsafe fn run_mpv_cmd(handle: *mut MpvHandle, args: &[&str]) -> bool {
+    let Ok(cstrings) = args
+        .iter()
+        .map(|s| CString::new(*s))
+        .collect::<Result<Vec<CString>, _>>()
+    else {
+        return false;
+    };
+    let mut pointers: Vec<*const c_char> = cstrings.iter().map(|cs| cs.as_ptr()).collect();
+    pointers.push(ptr::null());
+    let ret = unsafe { mpv_command(handle, pointers.as_ptr()) };
+    if ret < 0 {
+        let err_str = unsafe {
+            let p = mpv_error_string(ret);
+            if p.is_null() {
+                "unknown"
+            } else {
+                CStr::from_ptr(p).to_str().unwrap_or("unknown")
+            }
+        };
+        eprintln!("[mpv command failed] args={args:?}, code={ret}, error={err_str}");
+        false
+    } else {
+        true
+    }
+}
 
-fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mpv_loadfile_command() {
+        unsafe {
+            let handle = mpv_create();
+            assert!(!handle.is_null());
+            set_option(handle, "vo", "libmpv");
+            set_option(handle, "hwdec", "auto-safe");
+            set_option(handle, "cache", "yes");
+            set_option(handle, "user-agent", "Mozilla/5.0");
+            set_option(handle, "http-header-fields", "Referer: https://www.bilibili.com/");
+            let ret_init = mpv_initialize(handle);
+            eprintln!("ret_init = {ret_init}");
+            assert!(ret_init >= 0);
+
+            // Test 1: loadfile with 5 args (loadfile, url, replace, 0, opt)
+            let ret_5args_0 = run_mpv_cmd(handle, &["loadfile", "https://example.com/video.mp4", "replace", "0", "audio-file=https://example.com/audio.mp4"]);
+            eprintln!("ret_5args_0 = {ret_5args_0}");
+            assert!(ret_5args_0);
+
+            mpv_terminate_destroy(handle);
+        }
+    }
 }

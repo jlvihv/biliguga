@@ -20,8 +20,8 @@ use gpui::{
     App, Application, AssetSource, Bounds, ClickEvent, Context, DispatchPhase, Entity, FocusHandle,
     FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     RenderImage, ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, size, svg,
-    uniform_list,
+    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
+    svg, uniform_list,
 };
 use std::{
     fs,
@@ -170,6 +170,7 @@ struct BiliGuga {
     login_status: SharedString,
     login_generation: u64,
     playback: PlaybackState,
+    pending_pause: Option<bool>,
     playback_request: u64,
     volume: f64,
     speed: f64,
@@ -178,6 +179,7 @@ struct BiliGuga {
     speed_menu_open: bool,
     quality_menu_open: bool,
     volume_dragging: bool,
+    seek_dragging: bool,
     controls_visible: bool,
     controls_generation: u64,
     player_fullscreen: bool,
@@ -279,6 +281,7 @@ impl BiliGuga {
             login_status: SharedString::from(login_status),
             login_generation: 0,
             playback: PlaybackState::Idle,
+            pending_pause: None,
             playback_request: 0,
             volume,
             speed,
@@ -287,6 +290,7 @@ impl BiliGuga {
             speed_menu_open: false,
             quality_menu_open: false,
             volume_dragging: false,
+            seek_dragging: false,
             controls_visible: false,
             controls_generation: 0,
             player_fullscreen: false,
@@ -1950,6 +1954,7 @@ impl BiliGuga {
         if same_video {
             if self.playback == PlaybackState::Paused {
                 self.player.set_pause(false);
+                self.pending_pause = Some(false);
                 self.playback = PlaybackState::Playing;
                 self.message = SharedString::from("继续播放");
                 cx.notify();
@@ -2003,6 +2008,7 @@ impl BiliGuga {
         if same_video {
             if self.playback == PlaybackState::Paused {
                 self.player.set_pause(false);
+                self.pending_pause = Some(false);
                 self.playback = PlaybackState::Playing;
                 self.message = SharedString::from("继续播放");
                 cx.notify();
@@ -2031,10 +2037,20 @@ impl BiliGuga {
     fn play_selected(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.playback == PlaybackState::Paused {
             self.player.set_pause(false);
+            self.pending_pause = Some(false);
             self.playback = PlaybackState::Playing;
             self.message = SharedString::from("继续播放");
             cx.notify();
             return;
+        }
+        let status = self.player.status();
+        if self.playback == PlaybackState::Idle
+            && status.time_pos.is_finite()
+            && status.duration.is_finite()
+            && status.duration > 0.
+            && status.time_pos >= status.duration - 0.25
+        {
+            self.pending_seek = Some(0.);
         }
         self.begin_play_selected(cx);
     }
@@ -2043,6 +2059,7 @@ impl BiliGuga {
         if self.playback == PlaybackState::Buffering {
             return;
         }
+        self.pending_pause = None;
         let Some(video) = self.selected_video_ref().cloned() else {
             self.message = SharedString::from("还没有可播放的视频");
             cx.notify();
@@ -2102,14 +2119,10 @@ impl BiliGuga {
                             && play_url.actual_quality > 0
                             && play_url.actual_quality != quality
                         {
-                            app.playback = PlaybackState::Idle;
                             app.message = SharedString::from(format!(
-                                "B 站没有返回 {}，实际返回 {}",
-                                quality_label(quality),
+                                "目标清晰度不可用，已自动切换为 {}",
                                 quality_label(play_url.actual_quality),
                             ));
-                            cx.notify();
-                            return;
                         }
                         if let Some(playing_video) = app.playing_video.as_mut() {
                             playing_video.cid = play_url.cid;
@@ -2132,7 +2145,7 @@ impl BiliGuga {
                             app.cloud_resume_progress = Some(progress as f64);
                         }
                         app.debug_memory("before-video-load");
-                        app.player.load(play_url.url, app.volume, app.speed);
+                        app.player.load(play_url.url, play_url.audio_url, app.volume, app.speed);
                         app.cloud_resume_applied = false;
                         app.playback = PlaybackState::Buffering;
                         app.message = SharedString::from("已获取播放地址，libmpv 正在缓冲");
@@ -2162,12 +2175,14 @@ impl BiliGuga {
             PlaybackState::Playing => {
                 self.queue_history_report(cx, 2);
                 self.player.set_pause(true);
+                self.pending_pause = Some(true);
                 self.playback = PlaybackState::Paused;
                 self.message = SharedString::from("已暂停");
                 cx.notify();
             }
             PlaybackState::Paused => {
                 self.player.set_pause(false);
+                self.pending_pause = Some(false);
                 self.playback = PlaybackState::Playing;
                 self.message = SharedString::from("继续播放");
                 cx.notify();
@@ -2182,6 +2197,20 @@ impl BiliGuga {
 
     fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_pause_state(cx);
+    }
+
+    fn set_progress_from_position(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if bounds.size.width <= px(0.) {
+            return;
+        }
+        let percent =
+            ((position.x - bounds.origin.x) / bounds.size.width).clamp(0., 1.) as f64;
+        self.seek_percent(percent, cx);
     }
 
     fn set_volume_from_position(
@@ -2239,17 +2268,17 @@ impl BiliGuga {
         self.quality = quality;
         let status = self.player.status();
         if self.playback != PlaybackState::Idle {
-            if status.time_pos.is_finite() {
-                self.pending_seek = Some(status.time_pos.max(0.));
+            if status.time_pos.is_finite() && status.time_pos >= 0. {
+                self.pending_seek = Some(status.time_pos);
             }
             self.queue_history_report(cx, 2);
             let frames = self.player.stop_playback();
             self.drop_player_frames(frames, window);
             self.playback = PlaybackState::Idle;
+            self.cloud_resume_applied = false;
             self.playback_request = self.playback_request.wrapping_add(1);
             self.begin_play_selected(cx);
         }
-        cx.notify();
     }
 
     fn toggle_player_fullscreen(
@@ -2354,6 +2383,13 @@ impl BiliGuga {
             Timer::after(Duration::from_millis(2400)).await;
             view.update(cx, |app, cx| {
                 if app.controls_generation == generation {
+                    if app.volume_dragging
+                        || app.seek_dragging
+                        || app.speed_menu_open
+                        || app.quality_menu_open
+                    {
+                        return;
+                    }
                     app.controls_visible = false;
                     cx.notify();
                 }
@@ -3194,49 +3230,91 @@ impl BiliGuga {
             );
         }
 
+        if !self.controls_visible && duration > 0. {
+            let mini_progress = div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(2.))
+                .bg(rgba(0x00000066))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(progress))
+                        .bg(rgb(0x74ade8)),
+                );
+            stage = stage.child(mini_progress);
+        }
+
         if self.controls_visible {
             let seek_entity = entity.clone();
             let progress_bar = div()
+                .id("player-progress-bar")
                 .relative()
-                .flex_1()
-                .h(px(16.))
+                .w_full()
+                .h(px(14.))
+                .cursor_pointer()
                 .child(
                     div()
                         .absolute()
                         .left_0()
                         .right_0()
-                        .top(px(6.))
+                        .top(px(5.))
                         .h(px(4.))
-                        .bg(rgb(0x464b57)),
+                        .bg(rgba(0xffffff33)),
                 )
                 .child(
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(6.))
+                        .top(px(5.))
                         .h(px(4.))
                         .w(relative(progress))
                         .bg(rgb(0x74ade8)),
                 )
                 .child(
+                    div()
+                        .absolute()
+                        .top(px(3.))
+                        .left(relative(progress))
+                        .w(px(8.))
+                        .h(px(8.))
+                        .bg(rgb(0xffffff)),
+                )
+                .child(
                     canvas(
                         |_, _, _| (),
                         move |bounds, _, window, _| {
-                            let seek_entity = seek_entity.clone();
+                            let entity = seek_entity.clone();
                             window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
-                                if phase != DispatchPhase::Bubble
-                                    || event.button != MouseButton::Left
-                                    || !bounds.contains(&event.position)
-                                    || bounds.size.width <= px(0.)
+                                if phase == DispatchPhase::Bubble
+                                    && event.button == MouseButton::Left
+                                    && bounds.contains(&event.position)
                                 {
-                                    return;
+                                    entity.update(cx, |app, cx| {
+                                        app.seek_dragging = true;
+                                        app.set_progress_from_position(event.position, bounds, cx);
+                                    });
                                 }
-                                let percent = ((event.position.x - bounds.origin.x)
-                                    / bounds.size.width)
-                                    .clamp(0., 1.);
-                                seek_entity.update(cx, |app, cx| {
-                                    app.seek_percent(percent as f64, cx);
+                            });
+                            let entity = seek_entity.clone();
+                            window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                                entity.update(cx, |app, cx| {
+                                    if app.seek_dragging
+                                        && event.pressed_button == Some(MouseButton::Left)
+                                    {
+                                        app.set_progress_from_position(event.position, bounds, cx);
+                                    }
                                 });
+                            });
+                            let entity = seek_entity.clone();
+                            window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
+                                if event.button == MouseButton::Left {
+                                    entity.update(cx, |app, _| {
+                                        app.seek_dragging = false;
+                                    });
+                                }
                             });
                         },
                     )
@@ -3245,7 +3323,7 @@ impl BiliGuga {
             let play_label = if buffering {
                 "…"
             } else if playing {
-                "Ⅱ"
+                "⏸"
             } else {
                 "▶"
             };
@@ -3257,14 +3335,14 @@ impl BiliGuga {
             let volume_entity = entity.clone();
             let volume_slider = div()
                 .relative()
-                .w(px(82.))
-                .h(px(16.))
+                .w(px(72.))
+                .h(px(14.))
                 .child(
                     div()
                         .absolute()
                         .left_0()
                         .right_0()
-                        .top(px(6.))
+                        .top(px(5.))
                         .h(px(4.))
                         .bg(rgb(0x464b57)),
                 )
@@ -3272,7 +3350,7 @@ impl BiliGuga {
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(6.))
+                        .top(px(5.))
                         .h(px(4.))
                         .w(relative((self.volume / 100.).clamp(0., 1.) as f32))
                         .bg(rgb(0x74ade8)),
@@ -3280,7 +3358,7 @@ impl BiliGuga {
                 .child(
                     div()
                         .absolute()
-                        .top(px(4.))
+                        .top(px(3.))
                         .left(relative((self.volume / 100.).clamp(0., 1.) as f32))
                         .w(px(7.))
                         .h(px(8.))
@@ -3328,27 +3406,36 @@ impl BiliGuga {
 
             let mut speed_popup = div()
                 .absolute()
-                .bottom(px(34.))
+                .bottom(px(36.))
                 .right_0()
-                .w(px(72.))
+                .w(px(76.))
                 .p_1()
                 .bg(rgb(0x252a33))
+                .rounded(px(4.))
                 .flex()
-                .flex_col();
+                .flex_col()
+                .gap(px(2.));
             for speed in SPEED_OPTIONS {
                 let selected_speed = (speed - self.speed).abs() < 0.01;
                 speed_popup = speed_popup.child(
                     div()
                         .id(SharedString::from(format!("speed-option-{speed}")))
                         .w_full()
-                        .px_2()
                         .py_1()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_center()
                         .text_xs()
+                        .whitespace_nowrap()
+                        .rounded(px(3.))
                         .text_color(if selected_speed {
                             rgb(0x74ade8)
                         } else {
                             rgb(0xdce0e5)
                         })
+                        .when(selected_speed, |this| this.bg(rgb(0x363c46)))
                         .when(!selected_speed, |this| {
                             this.hover(|style| style.bg(rgb(0x363c46)))
                         })
@@ -3368,77 +3455,93 @@ impl BiliGuga {
                 .unwrap_or_else(|| quality_label(self.quality));
             let mut quality_popup = div()
                 .absolute()
-                .bottom(px(34.))
+                .bottom(px(36.))
                 .right_0()
-                .w(px(84.))
-                .p_1()
-                .bg(rgb(0x252a33))
+                .w(px(112.))
+                .bg(rgb(0x1d2027))
                 .flex()
                 .flex_col();
             for option in self.quality_options.iter().cloned() {
                 let quality = option.qn;
                 let selected_quality = quality == self.quality;
-                quality_popup = quality_popup.child(
-                    div()
-                        .id(SharedString::from(format!("quality-option-{quality}")))
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .text_color(if selected_quality {
-                            rgb(0x74ade8)
-                        } else {
-                            rgb(0xdce0e5)
-                        })
-                        .when(!selected_quality, |this| {
-                            this.hover(|style| style.bg(rgb(0x363c46)))
-                        })
-                        .cursor_pointer()
-                        .child(option.label)
-                        .on_click(cx.listener(move |app, event, window, cx| {
-                            app.select_quality(quality, event, window, cx);
-                        })),
-                );
+                let requires_vip = quality >= 112;
+                let requires_login = (80..112).contains(&quality);
+                let has_permission = if requires_vip {
+                    self.session
+                        .as_ref()
+                        .map(|session| session.is_vip)
+                        .unwrap_or(false)
+                } else if requires_login {
+                    self.session.is_some()
+                } else {
+                    true
+                };
+                let enabled = has_permission && option.switchable;
+                let mut quality_row = div()
+                    .id(SharedString::from(format!("quality-option-{quality}")))
+                    .w_full()
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_xs()
+                    .whitespace_nowrap()
+                    .text_color(if selected_quality {
+                        rgb(0x74ade8)
+                    } else if enabled {
+                        rgb(0xdce0e5)
+                    } else {
+                        rgb(0x737985)
+                    })
+                    .when(enabled && !selected_quality, |this| {
+                        this.hover(|style| style.bg(rgb(0x2a303a)))
+                    });
+
+                quality_row = quality_row.child(option.label);
+                if requires_vip && !has_permission {
+                    quality_row = quality_row.child(div().text_color(rgb(0xf0bd58)).child("VIP"));
+                } else if requires_login && !has_permission {
+                    quality_row = quality_row.child(div().text_color(rgb(0xaeb4c0)).child("登录"));
+                }
+                if enabled && !selected_quality {
+                    quality_row = quality_row.on_click(cx.listener(move |app, event, window, cx| {
+                        app.select_quality(quality, event, window, cx);
+                    }));
+                }
+                quality_popup = quality_popup.child(quality_row);
             }
 
             let controls = div()
+                .id("player-controls-bar")
                 .absolute()
                 .left_0()
                 .right_0()
                 .bottom_0()
-                .px_4()
-                .pt_2()
-                .pb_3()
-                .bg(rgb(0x000000))
+                .bg(rgba(0x000000cc))
                 .text_color(rgb(0xdce0e5))
                 .flex()
                 .flex_col()
-                .gap_2()
+                .child(progress_bar)
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .child(format_time(position))
-                        .child(progress_bar)
-                        .child(format_time(duration)),
-                )
-                .child(
-                    div()
+                        .w_full()
+                        .px_4()
+                        .pt_1()
+                        .pb_2()
                         .flex()
                         .items_center()
                         .gap_3()
                         .child(
                             div()
                                 .id("player-play-overlay")
-                                .w(px(30.))
-                                .h(px(30.))
-                                .bg(rgb(0x74ade8))
-                                .cursor_pointer()
+                                .w(px(28.))
+                                .h(px(28.))
                                 .flex()
                                 .items_center()
                                 .justify_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x363c46)))
                                 .child(play_label)
                                 .on_click(cx.listener(play_handler)),
                         )
@@ -3446,15 +3549,11 @@ impl BiliGuga {
                             div()
                                 .text_xs()
                                 .text_color(rgb(0xa9afbc))
-                                .child(if buffering {
-                                    "缓冲中"
-                                } else if playing {
-                                    "播放中"
-                                } else if paused {
-                                    "已暂停"
-                                } else {
-                                    "待播放"
-                                }),
+                                .child(format!(
+                                    "{} / {}",
+                                    format_time(position),
+                                    format_time(duration)
+                                )),
                         )
                         .child(div().flex_1())
                         .child(
@@ -3463,6 +3562,7 @@ impl BiliGuga {
                                 .items_center()
                                 .gap_2()
                                 .text_xs()
+                                .text_color(rgb(0xa9afbc))
                                 .child("音量")
                                 .child(volume_slider),
                         )
@@ -3477,7 +3577,7 @@ impl BiliGuga {
                                         .cursor_pointer()
                                         .text_xs()
                                         .hover(|style| style.bg(rgb(0x363c46)))
-                                        .child(format!("倍速 {:.2}x", self.speed))
+                                        .child(format!("{:.2}x", self.speed))
                                         .on_click(cx.listener(Self::toggle_speed_menu)),
                                 )
                                 .when(self.speed_menu_open, |this| this.child(speed_popup)),
@@ -3492,6 +3592,7 @@ impl BiliGuga {
                                         .py_1()
                                         .cursor_pointer()
                                         .text_xs()
+                                        .whitespace_nowrap()
                                         .hover(|style| style.bg(rgb(0x363c46)))
                                         .child(quality_text.clone())
                                         .on_click(cx.listener(Self::toggle_quality_menu)),
@@ -3782,40 +3883,62 @@ pub(crate) fn launch() {
                                 if app.playback != PlaybackState::Idle
                                     && status.time_pos.is_finite()
                                 {
-                                    if !app.cloud_resume_applied {
-                                        let duration_ready = app.cloud_resume_progress.is_none()
-                                            || (status.duration.is_finite()
-                                                && status.duration > 0.);
-                                        if duration_ready {
-                                            if let Some(progress) = app
-                                                .pending_seek
-                                                .take()
-                                                .or(app.cloud_resume_progress)
-                                            {
-                                                if progress > 3. && progress < status.duration - 3.
-                                                {
-                                                    app.player.seek_seconds(progress);
-                                                }
+                                    let reached_end = app.playback != PlaybackState::Buffering
+                                        && status.duration.is_finite()
+                                        && status.duration > 0.
+                                        && status.time_pos >= status.duration - 0.25;
+                                    if reached_end {
+                                        app.playback = PlaybackState::Idle;
+                                        app.pending_pause = None;
+                                        app.pending_seek = None;
+                                        app.cloud_resume_progress = None;
+                                        app.cloud_resume_applied = true;
+                                        app.message = SharedString::from("播放结束，点击重新播放");
+                                    }
+                                    if !reached_end && !app.cloud_resume_applied {
+                                        if let Some(target) = app.pending_seek {
+                                            if target > 0. {
+                                                app.player.seek_seconds(target);
                                             }
+                                            app.pending_seek = None;
+                                            app.cloud_resume_applied = true;
+                                        } else if let Some(cloud_progress) = app.cloud_resume_progress {
+                                            if status.duration.is_finite() && status.duration > 0. {
+                                                if cloud_progress > 3. && cloud_progress < status.duration - 3. {
+                                                    app.player.seek_seconds(cloud_progress);
+                                                }
+                                                app.cloud_resume_progress = None;
+                                                app.cloud_resume_applied = true;
+                                            }
+                                        } else {
                                             app.cloud_resume_applied = true;
                                         }
                                     }
-                                    app.playback = if status.paused {
-                                        PlaybackState::Paused
-                                    } else {
-                                        PlaybackState::Playing
-                                    };
-                                    if status.volume.is_finite() {
-                                        app.volume = status.volume.clamp(0., 100.);
-                                    }
-                                    if status.speed.is_finite() {
-                                        app.speed = status.speed.max(0.1);
-                                    }
-                                    if app.playback == PlaybackState::Playing
-                                        && app.history_report_at.elapsed()
-                                            >= Duration::from_secs(15)
-                                    {
-                                        app.queue_history_report(cx, 0);
+                                    if !reached_end {
+                                        if let Some(target_paused) = app.pending_pause {
+                                            if status.paused == target_paused {
+                                                app.pending_pause = None;
+                                            }
+                                        }
+                                        if app.pending_pause.is_none() {
+                                            app.playback = if status.paused {
+                                                PlaybackState::Paused
+                                            } else {
+                                                PlaybackState::Playing
+                                            };
+                                        }
+                                        if status.volume.is_finite() {
+                                            app.volume = status.volume.clamp(0., 100.);
+                                        }
+                                        if status.speed.is_finite() {
+                                            app.speed = status.speed.max(0.1);
+                                        }
+                                        if app.playback == PlaybackState::Playing
+                                            && app.history_report_at.elapsed()
+                                                >= Duration::from_secs(15)
+                                        {
+                                            app.queue_history_report(cx, 0);
+                                        }
                                     }
                                 }
                                 let expired_frames = app.player.take_expired_frames();
@@ -3855,6 +3978,35 @@ pub(crate) fn launch() {
                 .session
                 .as_ref()
                 .map(|session| session.cookie.clone());
+            let initial_session = view.read(cx).session.clone();
+            if let Some(session) = initial_session {
+                let refresh_view = view.clone();
+                let cookie = session.cookie.clone();
+                cx.spawn(async move |cx| {
+                    let refreshed = cx
+                        .background_spawn(async move {
+                            network::run(login::fetch_user(cookie)).await
+                        })
+                        .await;
+                    if let Ok(refreshed) = refreshed {
+                        refresh_view
+                            .update(cx, |app, cx| {
+                                let is_same_session = app
+                                    .session
+                                    .as_ref()
+                                    .map(|active| active.cookie == refreshed.cookie)
+                                    .unwrap_or(false);
+                                if is_same_session {
+                                    let _ = login::save_session(&refreshed);
+                                    app.session = Some(refreshed);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    }
+                })
+                .detach();
+            }
             cx.spawn(async move |cx| {
                 let result = cx
                     .background_spawn(async move {

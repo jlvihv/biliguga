@@ -19,6 +19,7 @@ pub(crate) struct UserSession {
     pub(crate) mid: i64,
     pub(crate) username: String,
     pub(crate) face: String,
+    pub(crate) is_vip: bool,
 }
 
 pub(crate) enum PollResult {
@@ -129,7 +130,7 @@ pub(crate) async fn poll_qr_code(key: &str) -> Result<PollResult, String> {
             let cookie_mid = cookie_value(&cookie, "DedeUserID")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default();
-            let user = fetch_user(&cookie).await.ok();
+            let user = fetch_user(cookie.clone()).await.ok();
             Ok(PollResult::LoggedIn(UserSession {
                 cookie,
                 mid: user.as_ref().map(|user| user.mid).unwrap_or(cookie_mid),
@@ -137,7 +138,11 @@ pub(crate) async fn poll_qr_code(key: &str) -> Result<PollResult, String> {
                     .as_ref()
                     .map(|user| user.username.clone())
                     .unwrap_or_else(|| "已登录用户".into()),
-                face: user.map(|user| user.face).unwrap_or_default(),
+                face: user
+                    .as_ref()
+                    .map(|user| user.face.clone())
+                    .unwrap_or_default(),
+                is_vip: user.as_ref().map(|user| user.is_vip).unwrap_or(false),
             }))
         }
         86090 => Ok(PollResult::Scanned),
@@ -185,13 +190,13 @@ fn cookie_value(cookie: &str, name: &str) -> Option<String> {
     })
 }
 
-async fn fetch_user(cookie: &str) -> Result<UserSession, String> {
+pub(crate) async fn fetch_user(cookie: String) -> Result<UserSession, String> {
     let client = client()?;
     let response: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/web-interface/nav")
             .header("Referer", "https://www.bilibili.com/"),
-        cookie,
+        &cookie,
     )
     .send()
     .await
@@ -208,6 +213,11 @@ async fn fetch_user(cookie: &str) -> Result<UserSession, String> {
         mid: number(data.get("mid")),
         username: text(data.get("uname")),
         face: text(data.get("face")),
+        is_vip: data
+            .get("vip")
+            .and_then(|vip| vip.get("status"))
+            .map(|status| number(Some(status)) == 1)
+            .unwrap_or(false),
     })
 }
 
@@ -269,6 +279,10 @@ fn parse_session(content: &str) -> Option<UserSession> {
             .unwrap_or_default(),
         username: lines.next().unwrap_or("已登录用户").to_string(),
         face: lines.next().unwrap_or_default().to_string(),
+        is_vip: lines
+            .next()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
     })
 }
 
@@ -278,8 +292,8 @@ pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| format!("创建登录目录失败：{error}"))?;
     }
     let content = format!(
-        "{}\n{}\n{}\n{}\n",
-        session.cookie, session.mid, session.username, session.face
+        "{}\n{}\n{}\n{}\n{}\n",
+        session.cookie, session.mid, session.username, session.face, session.is_vip as u8
     );
     fs::write(&path, content).map_err(|error| format!("保存登录状态失败：{error}"))?;
     #[cfg(unix)]

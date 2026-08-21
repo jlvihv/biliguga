@@ -1930,6 +1930,7 @@ mod tests {
             }),
             789,
             123456,
+            64,
         )
         .expect("play url should parse");
 
@@ -1937,6 +1938,53 @@ mod tests {
         assert_eq!(result.qualities.len(), 3);
         assert_eq!(result.qualities[1].qn, 32);
         assert_eq!(result.qualities[1].label, "480P");
+    }
+
+    #[test]
+    fn play_url_parses_dash_video_and_audio() {
+        let result = parse_play_url(
+            &json!({
+                "data": {
+                    "quality": 80,
+                    "accept_quality": [80, 64, 32, 16],
+                    "accept_description": ["1080P 高清", "720P 高清", "480P 清晰", "360P 流畅"],
+                    "dash": {
+                        "video": [
+                            {
+                                "id": 80,
+                                "baseUrl": "https://cdn.example/video_1080p.m4s",
+                                "bandwidth": 1500000
+                            },
+                            {
+                                "id": 64,
+                                "baseUrl": "https://cdn.example/video_720p.m4s",
+                                "bandwidth": 800000
+                            }
+                        ],
+                        "audio": [
+                            {
+                                "id": 30280,
+                                "baseUrl": "https://cdn.example/audio.m4s",
+                                "bandwidth": 130000
+                            }
+                        ]
+                    }
+                }
+            }),
+            789,
+            123456,
+            80,
+        )
+        .expect("dash play url should parse");
+
+        assert_eq!(result.url, "https://cdn.example/video_1080p.m4s");
+        assert_eq!(result.audio_url.as_deref(), Some("https://cdn.example/audio.m4s"));
+        assert_eq!(result.actual_quality, 80);
+        assert_eq!(result.qualities.len(), 4);
+        assert_eq!(result.qualities[0].qn, 80);
+        assert_eq!(result.qualities[0].label, "1080P 高清");
+        assert!(result.qualities[0].switchable);
+        assert!(!result.qualities[2].switchable);
     }
 
     #[test]
@@ -2049,13 +2097,13 @@ pub(crate) async fn resolve_play_url(
     params.insert("bvid".into(), video.bvid.clone());
     params.insert("cid".into(), cid.to_string());
     params.insert("qn".into(), quality.to_string());
-    params.insert("fnval".into(), "1".into());
+    params.insert("fnval".into(), "4048".into());
     params.insert("fnver".into(), "0".into());
     params.insert("fourk".into(), "1".into());
-    params.insert("platform".into(), "html5".into());
-    params.insert("high_quality".into(), "1".into());
+    params.insert("voice_balance".into(), "1".into());
+    params.insert("gaia_source".into(), "pre-load".into());
+    params.insert("isGaiaAvoided".into(), "true".into());
     params.insert("web_location".into(), "1315873".into());
-
     let referer = format!("https://www.bilibili.com/video/{}", video.bvid);
     let mut errors = Vec::new();
 
@@ -2111,7 +2159,7 @@ pub(crate) async fn resolve_play_url(
                     };
                     match play_result {
                         Ok(response) if number(response.get("code")) == 0 => {
-                            if let Some(result) = parse_play_url(&response, cid, aid) {
+                            if let Some(result) = parse_play_url(&response, cid, aid, quality) {
                                 return Ok(result);
                             }
                             errors.push("WBI 接口没有返回 MP4 地址".to_string());
@@ -2152,7 +2200,7 @@ pub(crate) async fn resolve_play_url(
     };
     match legacy_result {
         Ok(response) if number(response.get("code")) == 0 => {
-            if let Some(result) = parse_play_url(&response, cid, aid) {
+            if let Some(result) = parse_play_url(&response, cid, aid, quality) {
                 return Ok(result);
             }
             errors.push("旧播放接口没有返回 MP4 地址".to_string());
@@ -2172,27 +2220,129 @@ pub(crate) async fn resolve_play_url(
 pub(crate) struct PlayQuality {
     pub(crate) qn: u32,
     pub(crate) label: String,
+    pub(crate) switchable: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlayUrlResult {
     pub(crate) url: String,
+    pub(crate) audio_url: Option<String>,
     pub(crate) cid: i64,
     pub(crate) aid: i64,
     pub(crate) actual_quality: u32,
     pub(crate) qualities: Vec<PlayQuality>,
 }
 
-fn parse_play_url(response: &Value, cid: i64, aid: i64) -> Option<PlayUrlResult> {
+fn parse_play_url(
+    response: &Value,
+    cid: i64,
+    aid: i64,
+    requested_qn: u32,
+) -> Option<PlayUrlResult> {
     let data = response.get("data")?;
-    let url = data
-        .get("durl")
-        .and_then(Value::as_array)
-        .and_then(|durl| durl.first())
-        .map(|durl| text(durl.get("url")))
-        .filter(|url| !url.is_empty())?;
-    let actual_quality = number(data.get("quality")).max(0) as u32;
+    let mut actual_quality = number(data.get("quality")).max(0) as u32;
+
+    let mut video_url = String::new();
+    let mut audio_url = None;
+
+    if let Some(dash) = data.get("dash") {
+        if let Some(videos) = dash.get("video").and_then(Value::as_array) {
+            let mut candidates: Vec<(u32, u64, String)> = Vec::new();
+            for v in videos {
+                let id = number(v.get("id")).max(0) as u32;
+                let bandwidth = number(v.get("bandwidth")).max(0) as u64;
+                let url = text(v.get("baseUrl"));
+                let url = if !url.is_empty() {
+                    url
+                } else {
+                    let url = text(v.get("base_url"));
+                    if !url.is_empty() {
+                        url
+                    } else {
+                        v.get("backupUrl")
+                            .or_else(|| v.get("backup_url"))
+                            .and_then(Value::as_array)
+                            .and_then(|arr| arr.first())
+                            .map(|s| text(Some(s)))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_default()
+                    }
+                };
+                if !url.is_empty() {
+                    candidates.push((id, bandwidth, url));
+                }
+            }
+
+            if let Some((id, _, url)) = candidates.iter().find(|(id, _, _)| *id == requested_qn) {
+                video_url = url.clone();
+                actual_quality = *id;
+            } else if let Some((id, _, url)) = candidates.iter().max_by_key(|(id, bw, _)| (*id, *bw)) {
+                video_url = url.clone();
+                actual_quality = *id;
+            }
+        }
+
+        let mut audio_candidates: Vec<(u64, String)> = Vec::new();
+        let mut collect_audios = |audios_val: Option<&Value>| {
+            if let Some(audios) = audios_val.and_then(Value::as_array) {
+                for a in audios {
+                    let bandwidth = number(a.get("bandwidth")).max(0) as u64;
+                    let url = text(a.get("baseUrl"));
+                    let url = if !url.is_empty() {
+                        url
+                    } else {
+                        let url = text(a.get("base_url"));
+                        if !url.is_empty() {
+                            url
+                        } else {
+                            a.get("backupUrl")
+                                .or_else(|| a.get("backup_url"))
+                                .and_then(Value::as_array)
+                                .and_then(|arr| arr.first())
+                                .map(|s| text(Some(s)))
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_default()
+                        }
+                    };
+                    if !url.is_empty() {
+                        audio_candidates.push((bandwidth, url));
+                    }
+                }
+            }
+        };
+
+        collect_audios(dash.get("audio"));
+        collect_audios(dash.get("dolby").and_then(|d| d.get("audio")));
+        collect_audios(dash.get("flac").and_then(|f| f.get("audio")));
+
+        if let Some((_, url)) = audio_candidates.iter().max_by_key(|(bw, _)| *bw) {
+            audio_url = Some(url.clone());
+        }
+    }
+
+    if video_url.is_empty() {
+        if let Some(durl) = data.get("durl").and_then(Value::as_array).and_then(|arr| arr.first()) {
+            video_url = text(durl.get("url"));
+        }
+    }
+
+    if video_url.is_empty() {
+        return None;
+    }
+
     let mut qualities = Vec::new();
+    let dash_video_qualities = data
+        .get("dash")
+        .and_then(|dash| dash.get("video"))
+        .and_then(Value::as_array)
+        .map(|videos| {
+            videos
+                .iter()
+                .map(|video| number(video.get("id")).max(0) as u32)
+                .filter(|qn| *qn > 0)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     if let Some(accepted) = data.get("accept_quality").and_then(Value::as_array) {
         let descriptions = data
             .get("accept_description")
@@ -2201,11 +2351,7 @@ fn parse_play_url(response: &Value, cid: i64, aid: i64) -> Option<PlayUrlResult>
             .unwrap_or_default();
         for (index, value) in accepted.iter().enumerate() {
             let qn = number(Some(value)).max(0) as u32;
-            if qn == 0
-                || qualities
-                    .iter()
-                    .any(|quality: &PlayQuality| quality.qn == qn)
-            {
+            if qn == 0 || qualities.iter().any(|q: &PlayQuality| q.qn == qn) {
                 continue;
             }
             let label = descriptions
@@ -2213,17 +2359,43 @@ fn parse_play_url(response: &Value, cid: i64, aid: i64) -> Option<PlayUrlResult>
                 .map(|description| text(Some(description)))
                 .filter(|description| !description.is_empty())
                 .unwrap_or_else(|| quality_label(qn));
-            qualities.push(PlayQuality { qn, label });
+            qualities.push(PlayQuality {
+                qn,
+                label,
+                switchable: dash_video_qualities.contains(&qn)
+                    || (dash_video_qualities.is_empty() && qn == actual_quality),
+            });
         }
     }
+
+    if let Some(dash) = data.get("dash") {
+        if let Some(videos) = dash.get("video").and_then(Value::as_array) {
+            for v in videos {
+                let qn = number(v.get("id")).max(0) as u32;
+                if qn > 0 && !qualities.iter().any(|q| q.qn == qn) {
+                    qualities.push(PlayQuality {
+                        qn,
+                        label: quality_label(qn),
+                        switchable: true,
+                    });
+                }
+            }
+        }
+    }
+
+    qualities.sort_by(|a, b| b.qn.cmp(&a.qn));
+
     if qualities.is_empty() && actual_quality > 0 {
         qualities.push(PlayQuality {
             qn: actual_quality,
             label: quality_label(actual_quality),
+            switchable: true,
         });
     }
+
     Some(PlayUrlResult {
-        url,
+        url: video_url,
+        audio_url,
         cid,
         aid,
         actual_quality,
@@ -2233,17 +2405,18 @@ fn parse_play_url(response: &Value, cid: i64, aid: i64) -> Option<PlayUrlResult>
 
 pub(crate) fn quality_label(qn: u32) -> String {
     match qn {
-        6 => "240P".into(),
-        16 => "360P".into(),
-        32 => "480P".into(),
-        64 => "720P".into(),
-        80 => "1080P".into(),
-        112 => "1080P+".into(),
-        116 => "1080P60".into(),
-        120 => "4K".into(),
-        125 => "HDR".into(),
-        126 => "杜比视界".into(),
         127 => "8K".into(),
-        _ => format!("QN {qn}"),
+        126 => "杜比视界".into(),
+        125 => "HDR 真彩".into(),
+        120 => "4K 超清".into(),
+        116 => "1080P 60帧".into(),
+        112 => "1080P 高码率".into(),
+        80 => "1080P 高清".into(),
+        74 => "720P 60帧".into(),
+        64 => "720P 高清".into(),
+        32 => "480P 清晰".into(),
+        16 => "360P 流畅".into(),
+        6 => "240P 极速".into(),
+        _ => format!("{qn}P"),
     }
 }
