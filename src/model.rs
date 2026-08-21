@@ -9,12 +9,10 @@ pub(crate) struct Video {
     pub(crate) title: String,
     pub(crate) uploader: String,
     pub(crate) uploader_mid: i64,
-    pub(crate) stats: String,
     pub(crate) duration: String,
     pub(crate) cover: String,
     pub(crate) cover_image: Option<Arc<RenderImage>>,
     pub(crate) accent: u32,
-    pub(crate) category: String,
 }
 
 #[derive(Clone, Debug)]

@@ -78,12 +78,14 @@ const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
 const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
+const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
 const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_INT64: c_int = 4;
 const MPV_FORMAT_DOUBLE: c_int = 5;
 const MPV_FORMAT_STRING: c_int = 1;
 const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
-const FRAME_WIDTH: usize = 960;
-const FRAME_HEIGHT: usize = 540;
+const DEFAULT_FRAME_WIDTH: usize = 1920;
+const DEFAULT_FRAME_HEIGHT: usize = 1080;
 const RETIRED_FRAME_LIMIT: usize = 3;
 const FRAME_CHANNEL_CAPACITY: usize = 1;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -130,6 +132,8 @@ impl Default for MpvStatus {
 
 struct FramePacket {
     pixels: Vec<u8>,
+    width: usize,
+    height: usize,
 }
 
 pub struct MpvPlayer {
@@ -140,6 +144,7 @@ pub struct MpvPlayer {
     recycled_frames: mpsc::Sender<Vec<u8>>,
     statuses: Receiver<MpvStatus>,
     current_frame: Option<Arc<RenderImage>>,
+    current_frame_size: Option<(usize, usize)>,
     retired_frames: VecDeque<Arc<RenderImage>>,
     current_status: MpvStatus,
 }
@@ -170,6 +175,7 @@ impl MpvPlayer {
             recycled_frames: recycled_tx,
             statuses: status_rx,
             current_frame: None,
+            current_frame_size: None,
             retired_frames: VecDeque::new(),
             current_status: MpvStatus::default(),
         }
@@ -230,6 +236,7 @@ impl MpvPlayer {
         }
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
+        self.current_frame_size = None;
         self.take_all_frames()
     }
 
@@ -284,12 +291,14 @@ impl MpvPlayer {
             }
         }
         if let Some(packet) = latest_packet {
-            let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(
-                FRAME_WIDTH as u32,
-                FRAME_HEIGHT as u32,
-                packet.pixels,
-            );
+            let FramePacket {
+                pixels,
+                width,
+                height,
+            } = packet;
+            let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels);
             if let Some(buffer) = buffer {
+                self.current_frame_size = Some((width, height));
                 if let Some(previous) =
                     self.current_frame
                         .replace(Arc::new(RenderImage::new(SmallVec::from_elem(
@@ -320,6 +329,10 @@ impl MpvPlayer {
         self.current_frame.clone()
     }
 
+    pub fn frame_size(&self) -> Option<(usize, usize)> {
+        self.current_frame_size
+    }
+
     pub fn discard_pending_frames(&mut self) {
         while let Ok(frame) = self.frames.try_recv() {
             let _ = self.recycled_frames.send(frame.pixels);
@@ -331,6 +344,7 @@ impl MpvPlayer {
         if let Some(frame) = self.current_frame.take() {
             frames.push(frame);
         }
+        self.current_frame_size = None;
         frames.extend(self.retired_frames.drain(..));
         frames
     }
@@ -479,11 +493,13 @@ fn run_mpv_session(
         let mut pending_audio_url = audio_url.filter(|url| !url.is_empty());
         run_command(handle, &PlayerCommand::SetVolume(volume));
         run_command(handle, &PlayerCommand::SetSpeed(speed));
-        let buffer_len = FRAME_WIDTH * FRAME_HEIGHT * 4;
+        let mut render_width = DEFAULT_FRAME_WIDTH;
+        let mut render_height = DEFAULT_FRAME_HEIGHT;
+        let mut buffer_len = render_width * render_height * 4;
         let mut render_buffer = take_frame_buffer(recycled_rx, buffer_len);
         let format = CString::new("bgr0").unwrap();
-        let size = [FRAME_WIDTH as c_int, FRAME_HEIGHT as c_int];
-        let stride = FRAME_WIDTH * 4;
+        let mut size = [render_width as c_int, render_height as c_int];
+        let mut stride = render_width * 4;
         let mut render_enabled = true;
         let mut last_status = Instant::now();
         let mut logged_hwdec = false;
@@ -511,10 +527,35 @@ fn run_mpv_session(
             }
 
             let event = mpv_wait_event(handle, 0.0);
-            if !event.is_null()
-                && (*(event as *const MpvEvent)).event_id == MPV_EVENT_FILE_LOADED
-                && let Some(audio_url) = pending_audio_url.take()
-            {
+            let event_id = if event.is_null() {
+                -1
+            } else {
+                (*(event as *const MpvEvent)).event_id
+            };
+            let file_loaded = event_id == MPV_EVENT_FILE_LOADED;
+            if file_loaded || event_id == MPV_EVENT_VIDEO_RECONFIG {
+                if let (Some(source_width), Some(source_height)) = (
+                    get_int64_property(handle, "video-out-params/w"),
+                    get_int64_property(handle, "video-out-params/h"),
+                ) {
+                    let (width, height) = render_size_for_source(source_width, source_height);
+                    if width != render_width || height != render_height {
+                        render_width = width;
+                        render_height = height;
+                        buffer_len = render_width * render_height * 4;
+                        render_buffer = take_frame_buffer(recycled_rx, buffer_len);
+                        size = [render_width as c_int, render_height as c_int];
+                        stride = render_width * 4;
+                    }
+                    if std::env::var_os("BILIGUGA_MPV_DEBUG").is_some() {
+                        eprintln!(
+                            "[biliguga-mpv] source={}x{} render-target={}x{}",
+                            source_width, source_height, render_width, render_height
+                        );
+                    }
+                }
+            }
+            if file_loaded && let Some(audio_url) = pending_audio_url.take() {
                 let _ = run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]);
             }
             let update = mpv_render_context_update(context);
@@ -563,6 +604,8 @@ fn run_mpv_session(
                     }
                     match frame_tx.try_send(FramePacket {
                         pixels: render_buffer,
+                        width: render_width,
+                        height: render_height,
                     }) {
                         Ok(()) => {
                             render_buffer = take_frame_buffer(recycled_rx, buffer_len);
@@ -657,6 +700,20 @@ unsafe fn get_double_property(handle: *mut MpvHandle, name: &str) -> Option<f64>
     (result >= 0).then_some(value)
 }
 
+unsafe fn get_int64_property(handle: *mut MpvHandle, name: &str) -> Option<i64> {
+    let name = CString::new(name).ok()?;
+    let mut value = 0_i64;
+    let result = unsafe {
+        mpv_get_property(
+            handle,
+            name.as_ptr(),
+            MPV_FORMAT_INT64,
+            &mut value as *mut i64 as *mut c_void,
+        )
+    };
+    (result >= 0).then_some(value)
+}
+
 unsafe fn get_flag_property(handle: *mut MpvHandle, name: &str) -> Option<bool> {
     let name = CString::new(name).ok()?;
     let mut value: c_int = 0;
@@ -699,6 +756,15 @@ unsafe fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
         let _ = mpv_set_option_string(handle, name.as_ptr(), value.as_ptr());
     }
 }
+
+fn render_size_for_source(source_width: i64, source_height: i64) -> (usize, usize) {
+    if source_width <= 0 || source_height <= 0 {
+        return (DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT);
+    }
+
+    (source_width as usize, source_height as usize)
+}
+
 unsafe fn run_mpv_cmd(handle: *mut MpvHandle, args: &[&str]) -> bool {
     let Ok(cstrings) = args
         .iter()
@@ -751,6 +817,16 @@ mod tests {
 
             mpv_terminate_destroy(handle);
         }
+    }
+
+    #[test]
+    fn render_target_follows_source_resolution() {
+        assert_eq!(render_size_for_source(1280, 720), (1280, 720));
+        assert_eq!(render_size_for_source(1920, 1080), (1920, 1080));
+        assert_eq!(render_size_for_source(3840, 2160), (3840, 2160));
+        assert_eq!(render_size_for_source(7680, 4320), (7680, 4320));
+        assert_eq!(render_size_for_source(1080, 1920), (1080, 1920));
+        assert_eq!(render_size_for_source(0, 0), (1920, 1080));
     }
 
     #[test]

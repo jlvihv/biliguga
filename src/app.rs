@@ -3,12 +3,14 @@ use crate::{
         PlayQuality, add_to_favorites, add_to_watch_later, coin_video, download_avatar,
         fetch_author_videos, fetch_comments, fetch_dynamic_feed, fetch_favorites, fetch_history,
         fetch_last_play_progress, fetch_recommendations, fetch_search_results, fetch_video_context,
-        fetch_watch_later, format_time, like_video, quality_label, queue_cover_download,
+        fetch_watch_later, format_publish_date, format_time, like_video, quality_label,
+        queue_cover_download,
         report_video_heartbeat, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
     model::{Comment, Video, VideoCollection},
     mpv, network,
+    power::PowerInhibitor,
     search_input::{SearchInput, bind_search_keys},
 };
 use futures::{
@@ -19,7 +21,7 @@ use futures::{
 use gpui::{
     App, Application, AssetSource, Bounds, ClickEvent, Context, DispatchPhase, Entity, FocusHandle,
     FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    RenderImage, ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window,
+    RenderImage, ScrollStrategy, ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window,
     WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
     svg, uniform_list,
 };
@@ -137,6 +139,7 @@ struct BiliGuga {
     home_has_more: bool,
     home_generation: u64,
     home_scroll_handle: UniformListScrollHandle,
+    collection_scroll_handle: UniformListScrollHandle,
     home_scroll_requested: bool,
     home_last_scroll_offset: Option<Pixels>,
     home_feed_mid: Option<i64>,
@@ -178,13 +181,21 @@ struct BiliGuga {
     quality_options: Vec<PlayQuality>,
     speed_menu_open: bool,
     quality_menu_open: bool,
+    menu_closed_by_outside: Option<PlayerMenu>,
     volume_dragging: bool,
     seek_dragging: bool,
     controls_visible: bool,
+    controls_opacity: f32,
     controls_generation: u64,
+    controls_animation_generation: u64,
     player_fullscreen: bool,
     screen_fullscreen: bool,
     playing_video: Option<Video>,
+    detail_view_count: SharedString,
+    detail_danmaku_count: SharedString,
+    detail_like_count: SharedString,
+    published_at: SharedString,
+    playback_error: Option<SharedString>,
     cloud_resume_progress: Option<f64>,
     cloud_resume_applied: bool,
     pending_seek: Option<f64>,
@@ -205,7 +216,7 @@ struct BiliGuga {
     comments_loading: bool,
     comments_generation: u64,
     comments_error: Option<SharedString>,
-    message: SharedString,
+    power_inhibitor: PowerInhibitor,
     player: mpv::MpvPlayer,
 }
 
@@ -229,6 +240,13 @@ enum PlaybackState {
     Paused,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayerMenu {
+    Speed,
+    Quality,
+    Collection,
+}
+
 impl BiliGuga {
     fn new(cx: &mut Context<Self>) -> Self {
         let session = login::load_session();
@@ -248,6 +266,7 @@ impl BiliGuga {
             home_has_more: true,
             home_generation: 0,
             home_scroll_handle: UniformListScrollHandle::new(),
+            collection_scroll_handle: UniformListScrollHandle::new(),
             home_scroll_requested: false,
             home_last_scroll_offset: None,
             home_feed_mid: None,
@@ -289,13 +308,21 @@ impl BiliGuga {
             quality_options: Vec::new(),
             speed_menu_open: false,
             quality_menu_open: false,
+            menu_closed_by_outside: None,
             volume_dragging: false,
             seek_dragging: false,
             controls_visible: false,
+            controls_opacity: 0.,
             controls_generation: 0,
+            controls_animation_generation: 0,
             player_fullscreen: false,
             screen_fullscreen: false,
             playing_video: None,
+            detail_view_count: SharedString::from("—"),
+            detail_danmaku_count: SharedString::from("—"),
+            detail_like_count: SharedString::from("—"),
+            published_at: SharedString::from("发布时间未知"),
+            playback_error: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
             pending_seek: None,
@@ -316,7 +343,7 @@ impl BiliGuga {
             comments_loading: false,
             comments_generation: 0,
             comments_error: None,
-            message: SharedString::from("正在从 B 站加载推荐视频…"),
+            power_inhibitor: PowerInhibitor::default(),
             player: mpv::MpvPlayer::new(),
         }
     }
@@ -412,9 +439,7 @@ impl BiliGuga {
         self.home_loading = true;
         self.home_scroll_requested = false;
         if reset {
-            self.message = SharedString::from("正在从 B 站加载推荐视频…");
         } else {
-            self.message = SharedString::from("正在加载更多推荐视频…");
         }
         cx.notify();
         cx.spawn(async move |view, cx| {
@@ -452,15 +477,10 @@ impl BiliGuga {
                         let added = app.videos.len().saturating_sub(old_len);
                         app.home_has_more = has_more && (reset || added > 0);
                         app.trim_home_items();
-                        app.message = SharedString::from(format!(
-                            "为你推荐 · 已加载 {} 个视频",
-                            app.videos.len()
-                        ));
                         app.start_cover_loading(cx);
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         app.home_has_more = false;
-                        app.message = SharedString::from(format!("加载推荐失败：{error}"));
                     }
                 }
                 cx.notify();
@@ -841,7 +861,6 @@ impl BiliGuga {
         if self.active_tab != AppTab::Home {
             self.leave_current_tab(window, cx);
             self.active_tab = AppTab::Home;
-            self.message = SharedString::from("首页推荐");
             let current_mid = self.session.as_ref().map(|session| session.mid);
             if (!self.home_loading && self.home_feed_mid != current_mid)
                 || (self.videos.is_empty() && !self.home_loading)
@@ -860,11 +879,6 @@ impl BiliGuga {
         if self.active_tab != AppTab::Search {
             self.leave_current_tab(window, cx);
             self.active_tab = AppTab::Search;
-            self.message = if self.search_results.is_empty() {
-                SharedString::from("输入关键词搜索视频")
-            } else {
-                SharedString::from(format!("找到 {} 个视频", self.search_results.len()))
-            };
             self.start_cover_loading(cx);
             cx.notify();
         }
@@ -874,15 +888,12 @@ impl BiliGuga {
         self.leave_current_tab(window, cx);
         self.active_tab = AppTab::Dynamic;
         if self.session.is_none() {
-            self.message = SharedString::from("请先登录后查看动态");
             cx.notify();
             return;
         }
         if self.dynamic_videos.is_empty() && !self.dynamic_loading {
             self.load_dynamic(cx, true);
         } else {
-            self.message =
-                SharedString::from(format!("动态 · {} 个视频", self.dynamic_videos.len()));
             self.start_cover_loading(cx);
             cx.notify();
         }
@@ -890,7 +901,6 @@ impl BiliGuga {
 
     fn load_dynamic(&mut self, cx: &mut Context<Self>, reset: bool) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后查看动态");
             cx.notify();
             return;
         };
@@ -904,11 +914,6 @@ impl BiliGuga {
             self.selected = 0;
         }
         self.dynamic_loading = true;
-        self.message = if reset {
-            SharedString::from("正在加载动态…")
-        } else {
-            SharedString::from("正在加载更多动态…")
-        };
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -921,16 +926,11 @@ impl BiliGuga {
                 match result {
                     Ok(videos) => {
                         app.dynamic_videos = videos;
-                        app.message = SharedString::from(format!(
-                            "动态 · {} 个视频",
-                            app.dynamic_videos.len()
-                        ));
                         if app.active_tab == AppTab::Dynamic {
                             app.start_cover_loading(cx);
                         }
                     }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载动态失败：{error}"));
+                    Err(_error) => {
                     }
                 }
                 cx.notify();
@@ -949,14 +949,12 @@ impl BiliGuga {
         self.leave_current_tab(window, cx);
         self.active_tab = AppTab::History;
         if self.session.is_none() {
-            self.message = SharedString::from("请先登录后查看观看历史");
             cx.notify();
             return;
         }
         if self.history.is_empty() && !self.history_loading {
             self.load_history(cx);
         } else {
-            self.message = SharedString::from(format!("观看历史 · {} 个视频", self.history.len()));
             self.start_cover_loading(cx);
             cx.notify();
         }
@@ -964,7 +962,6 @@ impl BiliGuga {
 
     fn load_history(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后查看观看历史");
             cx.notify();
             return;
         };
@@ -973,7 +970,6 @@ impl BiliGuga {
         self.history.clear();
         self.reset_cover_loading();
         self.selected = 0;
-        self.message = SharedString::from("正在加载观看历史…");
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -985,15 +981,12 @@ impl BiliGuga {
                 app.history_loading = false;
                 match result {
                     Ok(videos) => {
-                        let count = videos.len();
                         app.history = videos;
-                        app.message = SharedString::from(format!("观看历史 · {count} 个视频"));
                         if app.active_tab == AppTab::History {
                             app.start_cover_loading(cx);
                         }
                     }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载观看历史失败：{error}"));
+                    Err(_error) => {
                     }
                 }
                 cx.notify();
@@ -1014,15 +1007,12 @@ impl BiliGuga {
         self.leave_current_tab(window, cx);
         self.active_tab = AppTab::WatchLater;
         if self.session.is_none() {
-            self.message = SharedString::from("请先登录后查看稍后再看");
             cx.notify();
             return;
         }
         if self.watch_later.is_empty() && !self.watch_later_loading {
             self.load_watch_later(cx);
         } else {
-            self.message =
-                SharedString::from(format!("稍后再看 · {} 个视频", self.watch_later.len()));
             self.start_cover_loading(cx);
             cx.notify();
         }
@@ -1030,7 +1020,6 @@ impl BiliGuga {
 
     fn load_watch_later(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后查看稍后再看");
             cx.notify();
             return;
         };
@@ -1039,7 +1028,6 @@ impl BiliGuga {
         self.watch_later.clear();
         self.reset_cover_loading();
         self.selected = 0;
-        self.message = SharedString::from("正在加载稍后再看…");
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -1051,15 +1039,12 @@ impl BiliGuga {
                 app.watch_later_loading = false;
                 match result {
                     Ok(videos) => {
-                        let count = videos.len();
                         app.watch_later = videos;
-                        app.message = SharedString::from(format!("稍后再看 · {count} 个视频"));
                         if app.active_tab == AppTab::WatchLater {
                             app.start_cover_loading(cx);
                         }
                     }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载稍后再看失败：{error}"));
+                    Err(_error) => {
                     }
                 }
                 cx.notify();
@@ -1080,14 +1065,12 @@ impl BiliGuga {
         self.leave_current_tab(window, cx);
         self.active_tab = AppTab::Favorites;
         if self.session.is_none() {
-            self.message = SharedString::from("请先登录后查看收藏夹");
             cx.notify();
             return;
         }
         if self.favorites.is_empty() && !self.favorites_loading {
             self.load_favorites(cx);
         } else {
-            self.message = SharedString::from(format!("收藏夹 · {} 个视频", self.favorites.len()));
             self.start_cover_loading(cx);
             cx.notify();
         }
@@ -1095,7 +1078,6 @@ impl BiliGuga {
 
     fn load_favorites(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后查看收藏夹");
             cx.notify();
             return;
         };
@@ -1105,7 +1087,6 @@ impl BiliGuga {
         self.favorites.clear();
         self.reset_cover_loading();
         self.selected = 0;
-        self.message = SharedString::from("正在加载收藏夹…");
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -1117,15 +1098,12 @@ impl BiliGuga {
                 app.favorites_loading = false;
                 match result {
                     Ok(videos) => {
-                        let count = videos.len();
                         app.favorites = videos;
-                        app.message = SharedString::from(format!("收藏夹 · {count} 个视频"));
                         if app.active_tab == AppTab::Favorites {
                             app.start_cover_loading(cx);
                         }
                     }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载收藏夹失败：{error}"));
+                    Err(_error) => {
                     }
                 }
                 cx.notify();
@@ -1150,7 +1128,6 @@ impl BiliGuga {
         cx: &mut Context<Self>,
     ) {
         if mid <= 0 {
-            self.message = SharedString::from("该视频没有返回作者 UID");
             cx.notify();
             return;
         }
@@ -1181,11 +1158,6 @@ impl BiliGuga {
         let mid = self.author_mid;
         let cookie = self.session.as_ref().map(|session| session.cookie.clone());
         self.author_loading = true;
-        self.message = SharedString::from(if reset {
-            format!("正在加载 {} 的投稿…", self.author_name)
-        } else {
-            format!("正在加载 {} 的更多投稿…", self.author_name)
-        });
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -1215,20 +1187,9 @@ impl BiliGuga {
                         }
                         app.author_page = result.page;
                         app.author_has_more = result.has_more;
-                        app.message = SharedString::from(format!(
-                            "{} · 已加载 {} 个视频{}",
-                            app.author_name,
-                            app.author_videos.len(),
-                            if app.author_has_more {
-                                " · 可继续加载"
-                            } else {
-                                ""
-                            }
-                        ));
                         app.start_cover_loading(cx);
                     }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("加载作者视频失败：{error}"));
+                    Err(_error) => {
                     }
                 }
                 cx.notify();
@@ -1261,7 +1222,6 @@ impl BiliGuga {
         if self.active_tab != AppTab::Login {
             self.leave_current_tab(window, cx);
             self.active_tab = AppTab::Login;
-            self.message = SharedString::from("登录账号后可使用更多 B 站功能");
             cx.notify();
         }
         if self.session.is_none() && self.login_image.is_none() && !self.login_loading {
@@ -1462,7 +1422,6 @@ impl BiliGuga {
         cx: &mut Context<Self>,
     ) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后使用稍后再看");
             cx.notify();
             return;
         };
@@ -1470,25 +1429,18 @@ impl BiliGuga {
             return;
         };
         if video.aid <= 0 {
-            self.message = SharedString::from("这个视频没有可用的 AV 号");
             cx.notify();
             return;
         }
         let cookie = session.cookie.clone();
-        let title = video.title.clone();
-        self.message = SharedString::from(format!("正在添加：{title}"));
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let _result = cx
                 .background_spawn(async move {
                     network::run(async move { add_to_watch_later(&cookie, video.aid).await }).await
                 })
                 .await;
-            view.update(cx, |app, cx| {
-                app.message = SharedString::from(match result {
-                    Ok(()) => "已添加到稍后再看".to_string(),
-                    Err(error) => format!("添加稍后再看失败：{error}"),
-                });
+            view.update(cx, |_, cx| {
                 cx.notify();
             })
             .ok();
@@ -1504,7 +1456,6 @@ impl BiliGuga {
         cx: &mut Context<Self>,
     ) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后使用收藏功能");
             cx.notify();
             return;
         };
@@ -1512,27 +1463,20 @@ impl BiliGuga {
             return;
         };
         if video.aid <= 0 {
-            self.message = SharedString::from("这个视频没有可用的 AV 号");
             cx.notify();
             return;
         }
         let cookie = session.cookie.clone();
         let mid = session.mid;
-        let title = video.title.clone();
-        self.message = SharedString::from(format!("正在收藏：{title}"));
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let _result = cx
                 .background_spawn(async move {
                     network::run(async move { add_to_favorites(&cookie, mid, video.aid).await })
                         .await
                 })
                 .await;
-            view.update(cx, |app, cx| {
-                app.message = SharedString::from(match result {
-                    Ok(()) => "已收藏到默认收藏夹".to_string(),
-                    Err(error) => format!("收藏失败：{error}"),
-                });
+            view.update(cx, |_, cx| {
                 cx.notify();
             })
             .ok();
@@ -1542,7 +1486,6 @@ impl BiliGuga {
 
     fn like_current_video(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后点赞");
             cx.notify();
             return;
         };
@@ -1550,24 +1493,18 @@ impl BiliGuga {
             return;
         };
         if video.aid <= 0 {
-            self.message = SharedString::from("这个视频没有可用的 AV 号");
             cx.notify();
             return;
         }
         let cookie = session.cookie.clone();
-        self.message = SharedString::from("正在点赞…");
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let _result = cx
                 .background_spawn(async move {
                     network::run(async move { like_video(&cookie, video.aid).await }).await
                 })
                 .await;
-            view.update(cx, |app, cx| {
-                app.message = SharedString::from(match result {
-                    Ok(()) => "已点赞".to_string(),
-                    Err(error) => format!("点赞失败：{error}"),
-                });
+            view.update(cx, |_, cx| {
                 cx.notify();
             })
             .ok();
@@ -1577,7 +1514,6 @@ impl BiliGuga {
 
     fn coin_current_video(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
-            self.message = SharedString::from("请先登录后投币");
             cx.notify();
             return;
         };
@@ -1585,24 +1521,18 @@ impl BiliGuga {
             return;
         };
         if video.aid <= 0 {
-            self.message = SharedString::from("这个视频没有可用的 AV 号");
             cx.notify();
             return;
         }
         let cookie = session.cookie.clone();
-        self.message = SharedString::from("正在投币…");
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let _result = cx
                 .background_spawn(async move {
                     network::run(async move { coin_video(&cookie, video.aid).await }).await
                 })
                 .await;
-            view.update(cx, |app, cx| {
-                app.message = SharedString::from(match result {
-                    Ok(()) => "已投 1 枚硬币".to_string(),
-                    Err(error) => format!("投币失败：{error}"),
-                });
+            view.update(cx, |_, cx| {
                 cx.notify();
             })
             .ok();
@@ -1835,7 +1765,6 @@ impl BiliGuga {
     fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let keyword = self.search_input.read(cx).content.trim().to_string();
         if keyword.is_empty() {
-            self.message = SharedString::from("请输入搜索关键词");
             cx.notify();
             return;
         }
@@ -1848,7 +1777,6 @@ impl BiliGuga {
         self.search_results.clear();
         self.reset_cover_loading();
         self.selected = 0;
-        self.message = SharedString::from(format!("正在搜索：{keyword}"));
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -1863,14 +1791,12 @@ impl BiliGuga {
                 app.loading = false;
                 match result {
                     Ok(videos) => {
-                        app.message = SharedString::from(format!("找到 {} 个视频", videos.len()));
                         app.search_results = videos;
                         if app.active_tab == AppTab::Search {
                             app.start_cover_loading(cx);
                         }
                     }
-                    Err(error) => {
-                        app.message = SharedString::from(format!("搜索失败：{error}"));
+                    Err(_error) => {
                     }
                 }
                 cx.notify();
@@ -1911,7 +1837,6 @@ impl BiliGuga {
                 self.player.set_pause(false);
                 self.pending_pause = Some(false);
                 self.playback = PlaybackState::Playing;
-                self.message = SharedString::from("继续播放");
                 cx.notify();
             } else if self.playback == PlaybackState::Idle {
                 self.begin_play_selected(cx);
@@ -1933,6 +1858,11 @@ impl BiliGuga {
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
+        self.detail_view_count = SharedString::from("—");
+        self.detail_danmaku_count = SharedString::from("—");
+        self.detail_like_count = SharedString::from("—");
+        self.published_at = SharedString::from("发布时间未知");
+        self.playback_error = None;
         self.speed_menu_open = false;
         self.quality_menu_open = false;
         self.begin_play_selected(cx);
@@ -1973,6 +1903,11 @@ impl BiliGuga {
         self.playback_request = self.playback_request.wrapping_add(1);
         self.controls_visible = false;
         self.controls_generation = self.controls_generation.wrapping_add(1);
+        self.detail_view_count = SharedString::from("—");
+        self.detail_danmaku_count = SharedString::from("—");
+        self.detail_like_count = SharedString::from("—");
+        self.published_at = SharedString::from("发布时间未知");
+        self.playback_error = None;
         self.speed_menu_open = false;
         self.quality_menu_open = false;
         self.collection_menu_open = false;
@@ -2007,7 +1942,6 @@ impl BiliGuga {
                 self.player.set_pause(false);
                 self.pending_pause = Some(false);
                 self.playback = PlaybackState::Playing;
-                self.message = SharedString::from("继续播放");
                 cx.notify();
             } else if self.playback == PlaybackState::Idle {
                 self.begin_play_selected(cx);
@@ -2017,12 +1951,40 @@ impl BiliGuga {
         self.play_collection_episode(index, window, cx);
     }
 
+    fn play_previous_episode(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.collection_episode_index()
+            && index > 0
+        {
+            self.play_collection_episode(index - 1, window, cx);
+        }
+    }
+
+    fn play_next_episode(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.collection_episode_index()
+            && self
+                .collection
+                .as_ref()
+                .is_some_and(|collection| index + 1 < collection.episodes.len())
+        {
+            self.play_collection_episode(index + 1, window, cx);
+        }
+    }
+
     fn play_selected(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.playback == PlaybackState::Paused {
             self.player.set_pause(false);
             self.pending_pause = Some(false);
             self.playback = PlaybackState::Playing;
-            self.message = SharedString::from("继续播放");
             cx.notify();
             return;
         }
@@ -2044,10 +2006,10 @@ impl BiliGuga {
         }
         self.pending_pause = None;
         let Some(video) = self.selected_video_ref().cloned() else {
-            self.message = SharedString::from("还没有可播放的视频");
             cx.notify();
             return;
         };
+        self.playback_error = None;
         self.pin_playing_video(&video);
         self.load_comments_for_current(cx);
         self.cloud_resume_progress = None;
@@ -2055,7 +2017,6 @@ impl BiliGuga {
         self.collection_loading = true;
         self.history_report_at = Instant::now();
         self.playback = PlaybackState::Buffering;
-        self.message = SharedString::from("正在向 B 站获取播放地址…");
         cx.notify();
         let video_bvid = video.bvid.clone();
         let cookie = self.session.as_ref().map(|session| session.cookie.clone());
@@ -2097,16 +2058,6 @@ impl BiliGuga {
                         {
                             return;
                         }
-                        let explicit_quality = !app.quality_options.is_empty();
-                        if explicit_quality
-                            && play_url.actual_quality > 0
-                            && play_url.actual_quality != quality
-                        {
-                            app.message = SharedString::from(format!(
-                                "目标清晰度不可用，已自动切换为 {}",
-                                quality_label(play_url.actual_quality),
-                            ));
-                        }
                         if let Some(playing_video) = app.playing_video.as_mut() {
                             playing_video.cid = play_url.cid;
                             playing_video.aid = play_url.aid;
@@ -2115,6 +2066,19 @@ impl BiliGuga {
                                 playing_video.uploader_mid = context.uploader_mid;
                             }
                         }
+                        if let Some(context) = &context {
+                            app.detail_view_count = SharedString::from(context.view_count.clone());
+                            app.detail_danmaku_count =
+                                SharedString::from(context.danmaku_count.clone());
+                            app.detail_like_count = SharedString::from(context.like_count.clone());
+                        }
+                        app.published_at = SharedString::from(
+                            context
+                                .as_ref()
+                                .map(|context| format_publish_date(context.pubdate))
+                                .unwrap_or_else(|| "发布时间未知".into()),
+                        );
+                        app.playback_error = None;
                         app.reset_collection_cover_loading();
                         app.collection = context.and_then(|context| context.collection);
                         app.collection_menu_open = false;
@@ -2131,7 +2095,6 @@ impl BiliGuga {
                         app.player.load(play_url.url, play_url.audio_url, app.volume, app.speed);
                         app.cloud_resume_applied = false;
                         app.playback = PlaybackState::Buffering;
-                        app.message = SharedString::from("已获取播放地址，libmpv 正在缓冲");
                         cx.notify();
                     })
                     .ok();
@@ -2145,7 +2108,7 @@ impl BiliGuga {
                 }
                 app.playback = PlaybackState::Idle;
                 app.collection_loading = false;
-                app.message = SharedString::from(message);
+                app.playback_error = Some(SharedString::from(message));
                 cx.notify();
             })
             .ok();
@@ -2160,22 +2123,27 @@ impl BiliGuga {
                 self.player.set_pause(true);
                 self.pending_pause = Some(true);
                 self.playback = PlaybackState::Paused;
-                self.message = SharedString::from("已暂停");
                 cx.notify();
             }
             PlaybackState::Paused => {
                 self.player.set_pause(false);
                 self.pending_pause = Some(false);
                 self.playback = PlaybackState::Playing;
-                self.message = SharedString::from("继续播放");
                 cx.notify();
             }
             PlaybackState::Buffering => {
-                self.message = SharedString::from("视频正在缓冲");
                 cx.notify();
             }
             PlaybackState::Idle => self.begin_play_selected(cx),
         }
+    }
+
+    fn sync_power_inhibition(&mut self) {
+        let should_inhibit = matches!(
+            self.playback,
+            PlaybackState::Playing | PlaybackState::Buffering
+        );
+        self.power_inhibitor.set_active(should_inhibit);
     }
 
     fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2216,9 +2184,23 @@ impl BiliGuga {
         save_player_settings(self.volume, self.speed);
     }
 
-    fn toggle_speed_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.speed_menu_open = !self.speed_menu_open;
+    fn toggle_speed_menu(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let closed_menu = self.menu_closed_by_outside.take();
+        if closed_menu == Some(PlayerMenu::Speed) {
+            return;
+        }
+        self.speed_menu_open = if closed_menu.is_some() {
+            true
+        } else {
+            !self.speed_menu_open
+        };
         self.quality_menu_open = false;
+        self.collection_menu_open = false;
         cx.notify();
     }
 
@@ -2230,10 +2212,51 @@ impl BiliGuga {
         cx.notify();
     }
 
-    fn toggle_quality_menu(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.quality_menu_open = !self.quality_menu_open;
+    fn toggle_quality_menu(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let closed_menu = self.menu_closed_by_outside.take();
+        if closed_menu == Some(PlayerMenu::Quality) {
+            return;
+        }
+        self.quality_menu_open = if closed_menu.is_some() {
+            true
+        } else {
+            !self.quality_menu_open
+        };
         self.speed_menu_open = false;
+        self.collection_menu_open = false;
         cx.notify();
+    }
+
+    fn close_player_menus(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let closed_menu = if self.speed_menu_open {
+            Some(PlayerMenu::Speed)
+        } else if self.quality_menu_open {
+            Some(PlayerMenu::Quality)
+        } else if self.collection_menu_open {
+            Some(PlayerMenu::Collection)
+        } else {
+            None
+        };
+        if let Some(closed_menu) = closed_menu {
+            self.speed_menu_open = false;
+            self.quality_menu_open = false;
+            self.collection_menu_open = false;
+            self.menu_closed_by_outside = Some(closed_menu);
+            cx.defer_in(window, |app, _, _| {
+                app.menu_closed_by_outside = None;
+            });
+            cx.notify();
+        }
     }
 
     fn select_quality(
@@ -2278,6 +2301,8 @@ impl BiliGuga {
         }
         self.player_fullscreen = !self.player_fullscreen;
         self.controls_visible = true;
+        self.controls_opacity = 1.;
+        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
         cx.notify();
     }
 
@@ -2288,7 +2313,9 @@ impl BiliGuga {
         }
         self.player_fullscreen = false;
         self.controls_visible = true;
+        self.controls_opacity = 1.;
         self.controls_generation = self.controls_generation.wrapping_add(1);
+        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
         cx.notify();
     }
 
@@ -2348,7 +2375,9 @@ impl BiliGuga {
         self.player_fullscreen = self.screen_fullscreen;
         window.toggle_fullscreen();
         self.controls_visible = true;
+        self.controls_opacity = 1.;
         self.controls_generation = self.controls_generation.wrapping_add(1);
+        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
         cx.notify();
     }
 
@@ -2358,7 +2387,16 @@ impl BiliGuga {
     }
 
     fn show_player_controls(&mut self, _: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let was_hidden = !self.controls_visible;
         self.controls_visible = true;
+        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
+        let animation_generation = self.controls_animation_generation;
+        if was_hidden {
+            self.controls_opacity = 0.;
+            self.fade_controls_in(animation_generation, cx);
+        } else {
+            self.controls_opacity = 1.;
+        }
         self.controls_generation = self.controls_generation.wrapping_add(1);
         let generation = self.controls_generation;
         cx.notify();
@@ -2370,14 +2408,59 @@ impl BiliGuga {
                         || app.seek_dragging
                         || app.speed_menu_open
                         || app.quality_menu_open
+                        || app.collection_menu_open
                     {
                         return;
                     }
-                    app.controls_visible = false;
-                    cx.notify();
+                    app.fade_controls_out(cx);
                 }
             })
             .ok();
+        })
+        .detach();
+    }
+
+    fn fade_controls_in(&mut self, animation_generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
+            for step in 1..=6 {
+                Timer::after(Duration::from_millis(16)).await;
+                let updated = view.update(cx, |app, cx| {
+                    if app.controls_animation_generation != animation_generation {
+                        return false;
+                    }
+                    app.controls_opacity = step as f32 / 6.;
+                    cx.notify();
+                    true
+                });
+                if !updated.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn fade_controls_out(&mut self, cx: &mut Context<Self>) {
+        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
+        let animation_generation = self.controls_animation_generation;
+        cx.spawn(async move |view, cx| {
+            for step in 1..=6 {
+                Timer::after(Duration::from_millis(16)).await;
+                let updated = view.update(cx, |app, cx| {
+                    if app.controls_animation_generation != animation_generation {
+                        return false;
+                    }
+                    app.controls_opacity = 1. - step as f32 / 6.;
+                    if step == 6 {
+                        app.controls_visible = false;
+                    }
+                    cx.notify();
+                    true
+                });
+                if !updated.unwrap_or(false) {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -2446,8 +2529,6 @@ impl BiliGuga {
     ) -> impl IntoElement + use<> {
         let title = video.title.clone();
         let click_entity = entity.clone();
-        let later_entity = entity.clone();
-        let favorite_entity = entity.clone();
         div()
             .id(SharedString::from(format!("video-card-{index}")))
             .w_full()
@@ -2478,53 +2559,10 @@ impl BiliGuga {
                     )
                     .child(
                         div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xa9afbc))
-                                    .text_ellipsis()
-                                    .child(format!("{}  ·  {}", video.uploader, video.duration)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_none()
-                                    .gap_1()
-                                    .text_xs()
-                                    .text_color(rgb(0x878a98))
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("later-{index}")))
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0x74ade8)))
-                                            .child("稍后")
-                                            .on_click(move |event, window, cx| {
-                                                later_entity.update(cx, |this, cx| {
-                                                    this.add_video_to_watch_later(
-                                                        index, event, window, cx,
-                                                    );
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("favorite-{index}")))
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(0x74ade8)))
-                                            .child("收藏")
-                                            .on_click(move |event, window, cx| {
-                                                favorite_entity.update(cx, |this, cx| {
-                                                    this.add_video_to_favorites(
-                                                        index, event, window, cx,
-                                                    );
-                                                });
-                                            }),
-                                    ),
-                            ),
+                            .text_xs()
+                            .text_color(rgb(0xa9afbc))
+                            .text_ellipsis()
+                            .child(format!("{}  ·  {}", video.uploader, video.duration)),
                     ),
             )
             .on_click(move |event, window, cx| {
@@ -3020,38 +3058,126 @@ impl BiliGuga {
         section
     }
 
-    fn toggle_collection(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.collection_menu_open = !self.collection_menu_open;
+    fn toggle_collection(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let closed_menu = self.menu_closed_by_outside.take();
+        if closed_menu == Some(PlayerMenu::Collection) {
+            return;
+        }
+        self.collection_menu_open = if closed_menu.is_some() {
+            true
+        } else {
+            !self.collection_menu_open
+        };
+        self.speed_menu_open = false;
+        self.quality_menu_open = false;
+        if self.collection_menu_open
+            && let Some(index) = self.collection_episode_index()
+        {
+            self.collection_scroll_handle
+                .scroll_to_item_strict(index, ScrollStrategy::Center);
+        }
         cx.notify();
     }
 
-    fn render_collection_popup(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_collection_popup(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(collection) = &self.collection else {
             return div().into_any_element();
         };
-        let current = self.playing_video.as_ref();
-        let current_bvid = current.map(|video| video.bvid.as_str()).unwrap_or("");
-        let current_cid = current.map(|video| video.cid).unwrap_or(0);
-        let entity = cx.entity();
         if collection.episodes.is_empty() {
             return div().into_any_element();
         }
-        let popup_height = px(collection.episodes.len().min(8) as f32 * 36. + 28.);
-        let mut popup = div()
+        let episode_count = collection.episodes.len();
+        let popup_height = px(collection.episodes.len().min(8) as f32 * 34. + 26.);
+        let entity = cx.entity();
+        let collection_scroll_handle = self.collection_scroll_handle.clone();
+        let list = uniform_list(
+            "collection-popup-list",
+            episode_count,
+            cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                range
+                    .filter_map(|index| {
+                        let episode = this.collection.as_ref()?.episodes.get(index)?.clone();
+                        let current = this.playing_video.as_ref();
+                        let is_current = current
+                            .map(|current| {
+                                episode.bvid == current.bvid
+                                    && (episode.cid <= 0
+                                        || current.cid <= 0
+                                        || episode.cid == current.cid)
+                            })
+                            .unwrap_or(false);
+                        let click_entity = entity.clone();
+                        let mut row = div()
+                            .id(SharedString::from(format!("collection-episode-{index}")))
+                            .w_full()
+                            .h(px(34.))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .cursor_pointer()
+                            .when(is_current, |this| this.bg(rgb(0x454a56)))
+                            .when(!is_current, |this| {
+                                this.hover(|style| style.bg(rgb(0x3d4350)))
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(if is_current {
+                                        rgb(0x74ade8)
+                                    } else {
+                                        rgb(0xdce0e5)
+                                    })
+                                    .text_ellipsis()
+                                    .child(format!("{}. {}", index + 1, episode.title)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x878a98))
+                                    .child(episode.duration.clone()),
+                            )
+                            .on_click(move |event, window, cx| {
+                                click_entity.update(cx, |app, cx| {
+                                    app.select_collection_episode(index, event, window, cx);
+                                });
+                            });
+                        if is_current {
+                            row = row.text_color(rgb(0x74ade8));
+                        }
+                        Some(row)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(collection_scroll_handle)
+        .flex_1();
+        div()
             .id("collection-popup")
             .absolute()
             .bottom(px(36.))
             .right_0()
             .w(px(300.))
             .h(popup_height)
-            .overflow_y_scroll()
             .bg(rgb(0x1d2027))
             .flex()
             .flex_col()
+            .on_mouse_down_out(cx.listener(Self::close_player_menus))
+            .on_scroll_wheel(|_, _, cx| {
+                // The collection popup owns the wheel while it is open. Otherwise a
+                // wheel event that reaches the popup can continue to the player page.
+                cx.stop_propagation();
+            })
             .child(
                 div()
                     .w_full()
-                    .h(px(28.))
+                    .h(px(26.))
                     .px_3()
                     .flex()
                     .items_center()
@@ -3059,58 +3185,13 @@ impl BiliGuga {
                     .text_color(rgb(0x878a98))
                     .text_ellipsis()
                     .child(collection.title.clone()),
-            );
-        for (index, episode) in collection.episodes.iter().enumerate() {
-            let is_current = episode.bvid == current_bvid
-                && (episode.cid <= 0 || current_cid <= 0 || episode.cid == current_cid);
-            let click_entity = entity.clone();
-            let mut row =
-                div()
-                    .id(SharedString::from(format!("collection-episode-{index}")))
-                    .w_full()
-                    .h(px(36.))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .cursor_pointer()
-                    .when(is_current, |this| this.bg(rgb(0x454a56)))
-                    .when(!is_current, |this| {
-                        this.hover(|style| style.bg(rgb(0x3d4350)))
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(if is_current {
-                                rgb(0x74ade8)
-                            } else {
-                                rgb(0xdce0e5)
-                            })
-                            .text_ellipsis()
-                            .child(format!("{}. {}", index + 1, episode.title)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x878a98))
-                            .child(episode.duration.clone()),
-                    )
-                    .on_click(move |event, window, cx| {
-                        click_entity.update(cx, |app, cx| {
-                            app.select_collection_episode(index, event, window, cx);
-                        });
-                    });
-            if is_current {
-                row = row.text_color(rgb(0x74ade8));
-            }
-            popup = popup.child(row);
-        }
-        popup.into_any_element()
+            )
+            .child(list)
+            .into_any_element()
     }
 
-    fn render_player(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(video) = self.playing_video.as_ref() else {
+    fn render_player(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(video) = self.playing_video.clone() else {
             return div()
                 .id("player-scroll")
                 .flex_1()
@@ -3132,6 +3213,7 @@ impl BiliGuga {
         let paused = self.playback == PlaybackState::Paused;
         let buffering = self.playback == PlaybackState::Buffering;
         let frame = self.player.frame();
+        let frame_size = self.player.frame_size();
         let duration = if status.duration.is_finite() && status.duration > 0. {
             status.duration
         } else {
@@ -3151,6 +3233,10 @@ impl BiliGuga {
         let author_mid = video.uploader_mid;
         let author_name = video.uploader.clone();
         let author_entity = entity.clone();
+        let detail_view_count = self.detail_view_count.clone();
+        let detail_danmaku_count = self.detail_danmaku_count.clone();
+        let detail_like_count = self.detail_like_count.clone();
+        let published_at = self.published_at.clone();
         let mut stage = div()
             .w_full()
             .overflow_hidden()
@@ -3163,9 +3249,11 @@ impl BiliGuga {
         if self.player_fullscreen {
             stage = stage.h_full();
         } else {
-            // Keep the normal player at the video's native 16:9 ratio instead of
-            // imposing a height that only happens to fit one window size.
-            stage.style().aspect_ratio = Some(16. / 9.);
+            let aspect_ratio = frame_size
+                .filter(|(_, height)| *height > 0)
+                .map(|(width, height)| width as f32 / height as f32)
+                .unwrap_or(16. / 9.);
+            stage.style().aspect_ratio = Some(aspect_ratio);
         }
 
         if let Some(frame) = frame {
@@ -3176,15 +3264,22 @@ impl BiliGuga {
                     .object_fit(gpui::ObjectFit::Contain),
             );
         } else {
+            let player_message = self.playback_error.clone().unwrap_or_else(|| {
+                SharedString::from(if buffering {
+                    "正在缓冲…"
+                } else {
+                    "点击播放开始观看"
+                })
+            });
             stage = stage.child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x878a98))
-                    .child(if buffering {
-                        "正在缓冲视频…"
+                    .text_color(if self.playback_error.is_some() {
+                        rgb(0xd07277)
                     } else {
-                        "点击播放开始观看"
-                    }),
+                        rgb(0x878a98)
+                    })
+                    .child(player_message),
             );
         }
 
@@ -3363,16 +3458,15 @@ impl BiliGuga {
                 );
 
             let mut speed_popup = div()
+                .id("speed-popup")
                 .absolute()
                 .bottom(px(36.))
                 .right_0()
                 .w(px(76.))
-                .p_1()
                 .bg(rgb(0x252a33))
-                .rounded(px(4.))
                 .flex()
-                .flex_col()
-                .gap(px(2.));
+                .flex_col();
+            speed_popup = speed_popup.on_mouse_down_out(cx.listener(Self::close_player_menus));
             for speed in SPEED_OPTIONS {
                 let selected_speed = (speed - self.speed).abs() < 0.01;
                 speed_popup = speed_popup.child(
@@ -3387,7 +3481,6 @@ impl BiliGuga {
                         .text_center()
                         .text_xs()
                         .whitespace_nowrap()
-                        .rounded(px(3.))
                         .text_color(if selected_speed {
                             rgb(0x74ade8)
                         } else {
@@ -3412,6 +3505,7 @@ impl BiliGuga {
                 .map(|option| option.label.clone())
                 .unwrap_or_else(|| quality_label(self.quality));
             let mut quality_popup = div()
+                .id("quality-popup")
                 .absolute()
                 .bottom(px(36.))
                 .right_0()
@@ -3419,6 +3513,7 @@ impl BiliGuga {
                 .bg(rgb(0x1d2027))
                 .flex()
                 .flex_col();
+            quality_popup = quality_popup.on_mouse_down_out(cx.listener(Self::close_player_menus));
             for option in self.quality_options.iter().cloned() {
                 let quality = option.qn;
                 let selected_quality = quality == self.quality;
@@ -3470,27 +3565,69 @@ impl BiliGuga {
                 quality_popup = quality_popup.child(quality_row);
             }
             let collection_popup = self.render_collection_popup(cx);
+            let collection_index = self.collection_episode_index();
+            let has_previous_episode = collection_index.is_some_and(|index| index > 0);
+            let has_next_episode = collection_index.is_some_and(|index| {
+                self.collection
+                    .as_ref()
+                    .is_some_and(|collection| index + 1 < collection.episodes.len())
+            });
+            let mut previous_episode = div()
+                .id("player-previous-episode")
+                .px_1()
+                .py_1()
+                .text_xs()
+                .text_color(if has_previous_episode {
+                    rgb(0xdce0e5)
+                } else {
+                    rgb(0x737985)
+                })
+                .child("上一集");
+            if has_previous_episode {
+                previous_episode = previous_episode
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x363c46)))
+                    .on_click(cx.listener(Self::play_previous_episode));
+            }
+            let mut next_episode = div()
+                .id("player-next-episode")
+                .px_1()
+                .py_1()
+                .text_xs()
+                .text_color(if has_next_episode {
+                    rgb(0xdce0e5)
+                } else {
+                    rgb(0x737985)
+                })
+                .child("下一集");
+            if has_next_episode {
+                next_episode = next_episode
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x363c46)))
+                    .on_click(cx.listener(Self::play_next_episode));
+            }
 
             let controls = div()
                 .id("player-controls-bar")
                 .absolute()
                 .left_0()
                 .right_0()
-                .bottom_0()
-                .bg(rgba(0x000000cc))
-                .text_color(rgb(0xdce0e5))
+            .bottom_0()
+            .bg(rgba(0x000000cc))
+            .opacity(self.controls_opacity)
+            .text_color(rgb(0xdce0e5))
                 .flex()
                 .flex_col()
                 .child(progress_bar)
                 .child(
                     div()
                         .w_full()
-                        .px_4()
+                        .px_3()
                         .pt_1()
                         .pb_2()
                         .flex()
                         .items_center()
-                        .gap_3()
+                        .gap_2()
                         .child(
                             div()
                                 .id("player-play-overlay")
@@ -3527,6 +3664,7 @@ impl BiliGuga {
                         )
                         .child(
                             div()
+                                .id("player-speed-menu")
                                 .relative()
                                 .child(
                                     div()
@@ -3543,6 +3681,7 @@ impl BiliGuga {
                         )
                         .child(
                             div()
+                                .id("player-quality-menu")
                                 .relative()
                                 .child(
                                     div()
@@ -3560,7 +3699,12 @@ impl BiliGuga {
                         )
                         .when(self.collection.is_some(), |this| {
                             this.child(
+                                previous_episode,
+                            )
+                            .child(next_episode)
+                            .child(
                                 div()
+                                    .id("player-collection-menu")
                                     .relative()
                                     .child(
                                         div()
@@ -3666,13 +3810,15 @@ impl BiliGuga {
                                         .w_full()
                                         .flex()
                                         .items_center()
-                                        .gap_3()
-                                        .text_sm()
-                                        .text_color(rgb(0xa9afbc))
-                                        .text_ellipsis()
+                                        .gap_4()
+                                        .text_xs()
+                                        .text_color(rgb(0x8f97a6))
+                                        .overflow_hidden()
                                         .child(
                                             div()
                                                 .id("player-author")
+                                                .flex_shrink_0()
+                                                .text_color(rgb(0xdce0e5))
                                                 .cursor_pointer()
                                                 .hover(|style| style.text_color(rgb(0x74ade8)))
                                                 .child(author_name.clone())
@@ -3687,10 +3833,39 @@ impl BiliGuga {
                                                     });
                                                 }),
                                         )
-                                        .child("  ·  ")
-                                        .child(video.stats.clone())
-                                        .child("  ·  ")
-                                        .child(video.category.clone()),
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .flex_shrink_0()
+                                                .child(detail_view_count)
+                                                .child("播放"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .flex_shrink_0()
+                                                .child(detail_danmaku_count)
+                                                .child("弹幕"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .flex_shrink_0()
+                                                .child(detail_like_count)
+                                                .child("点赞"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_color(rgb(0x737b8b))
+                                                .child(published_at),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -3736,14 +3911,6 @@ impl BiliGuga {
                                                 ),
                                         ),
                                 )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .text_xs()
-                                        .text_color(rgb(0x878a98))
-                                        .text_ellipsis()
-                                        .child(self.message.clone()),
-                                ),
                         )
                         .child(self.render_comments(cx))
                     }),
@@ -3798,10 +3965,14 @@ fn sidebar_item(icon: &'static str, label: &'static str, active: bool) -> gpui::
         .flex_col()
         .items_center()
         .justify_center()
+        .cursor_pointer()
         .when(active, |this| {
             this.bg(rgb(0x454a56)).text_color(rgb(0xdce0e5))
         })
-        .when(!active, |this| this.text_color(rgb(0xa9afbc)))
+        .when(!active, |this| {
+            this.text_color(rgb(0xa9afbc))
+                .hover(|style| style.bg(rgb(0x383e48)))
+        })
         .child(div().text_lg().child(icon))
         .child(div().text_xs().child(label))
 }
@@ -3891,9 +4062,6 @@ pub(crate) fn launch() {
                                             app.pending_seek = None;
                                             app.cloud_resume_progress = None;
                                             app.cloud_resume_applied = true;
-                                            app.message = SharedString::from(
-                                                "播放结束，点击重新播放",
-                                            );
                                         }
                                     }
                                     if !reached_end && !app.cloud_resume_applied {
@@ -3942,6 +4110,7 @@ pub(crate) fn launch() {
                                         }
                                     }
                                 }
+                                app.sync_power_inhibition();
                                 let expired_frames = app.player.take_expired_frames();
                                 if was_active || !expired_frames.is_empty() {
                                     cx.notify();
@@ -4025,19 +4194,14 @@ pub(crate) fn launch() {
                     app.loading = false;
                     match result {
                         Ok(videos) => {
-                            app.message = SharedString::from(format!(
-                                "已加载 {} 个真实视频",
-                                videos.videos.len()
-                            ));
                             app.home_page = 1;
                             app.home_has_more = videos.has_more;
                             app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
                             app.videos = videos.videos;
                             app.start_cover_loading(cx);
                         }
-                        Err(error) => {
-                            app.message = SharedString::from(format!("加载失败：{error}"));
-                        }
+                    Err(_error) => {
+                    }
                     }
                     cx.notify();
                 })

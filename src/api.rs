@@ -144,6 +144,34 @@ pub(crate) fn format_time(seconds: f64) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
+pub(crate) fn format_publish_date(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "发布时间未知".into();
+    }
+
+    // Bilibili timestamps are Unix seconds; display them in China Standard Time.
+    let days = (timestamp + 8 * 60 * 60).div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era
+        - day_of_era.div_euclid(1_460)
+        + day_of_era.div_euclid(36_524)
+        - day_of_era.div_euclid(146_096))
+    .div_euclid(365);
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era
+        - (365 * year_of_era + year_of_era.div_euclid(4) - year_of_era.div_euclid(100));
+    let month_part = (5 * day_of_year + 2).div_euclid(153);
+    let day = day_of_year - (153 * month_part + 2).div_euclid(5) + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    let seconds_of_day = (timestamp + 8 * 60 * 60).rem_euclid(86_400);
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
 fn accent_for(index: usize) -> u32 {
     [0x3e4654, 0x39455a, 0x4b4240, 0x4c4255, 0x354c4a, 0x46503d][index % 6]
 }
@@ -329,8 +357,6 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
     // 两者都兼容，否则推荐流中的视频无法上报观看记录和续播进度。
     let aid = number(item.get("aid"));
     let aid = if aid > 0 { aid } else { number(item.get("id")) };
-    let view = number(item.get("stat").and_then(|stat| stat.get("view")));
-    let danmaku = number(item.get("stat").and_then(|stat| stat.get("danmaku")));
     Some(Video {
         bvid,
         aid,
@@ -338,16 +364,10 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
         title: text(item.get("title")),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
-        stats: format!(
-            "{}播放  ·  {}弹幕",
-            compact_number(view),
-            compact_number(danmaku)
-        ),
         duration: duration(item.get("duration")),
         cover: https_url(text(item.get("pic"))),
         cover_image: None,
         accent: accent_for(index),
-        category: text(item.get("tname")),
     })
 }
 
@@ -383,8 +403,6 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
         return None;
     }
     let title = clean_search_text(text(item.get("title")));
-    let play = clean_search_text(text(item.get("play")));
-    let danmaku = clean_search_text(text(item.get("video_review")));
     let duration = clean_search_text(text(item.get("duration")));
     Some(Video {
         bvid,
@@ -393,11 +411,6 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
         title,
         uploader: clean_search_text(text(item.get("author"))),
         uploader_mid: number(item.get("mid")),
-        stats: format!(
-            "{}播放  ·  {}弹幕",
-            if play.is_empty() { "0" } else { &play },
-            if danmaku.is_empty() { "0" } else { &danmaku }
-        ),
         duration: if duration.is_empty() {
             "--:--".into()
         } else {
@@ -406,7 +419,6 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
         cover: https_url(text(item.get("pic"))),
         cover_image: None,
         accent: accent_for(index),
-        category: clean_search_text(text(item.get("typename"))),
     })
 }
 
@@ -495,6 +507,10 @@ async fn fetch_wbi_keys(client: &Client, cookie: Option<&str>) -> Result<(String
 pub(crate) struct VideoContext {
     pub(crate) aid: i64,
     pub(crate) cid: i64,
+    pub(crate) view_count: String,
+    pub(crate) danmaku_count: String,
+    pub(crate) like_count: String,
+    pub(crate) pubdate: i64,
     pub(crate) uploader: String,
     pub(crate) uploader_mid: i64,
     pub(crate) collection: Option<VideoCollection>,
@@ -554,7 +570,6 @@ fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<
                         title
                     }
                 };
-                let stat = arc.get("stat");
                 episodes.push(Video {
                     bvid,
                     aid,
@@ -562,11 +577,6 @@ fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<
                     title: episode_title,
                     uploader: owner_name.to_string(),
                     uploader_mid: owner_mid,
-                    stats: format!(
-                        "{}播放  ·  {}弹幕",
-                        compact_number(number(stat.and_then(|stat| stat.get("view")))),
-                        compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
-                    ),
                     duration: {
                         let duration_text = text(arc.get("duration"));
                         if duration_text.is_empty() {
@@ -578,7 +588,6 @@ fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<
                     cover: https_url(text(arc.get("pic"))),
                     cover_image: None,
                     accent: accent_for(index),
-                    category: "合集".into(),
                 });
             }
         }
@@ -640,9 +649,14 @@ pub(crate) async fn fetch_video_context(
             name
         }
     };
+    let stat = data.get("stat").unwrap_or(&Value::Null);
     Ok(VideoContext {
         aid: number(data.get("aid")).max(video.aid),
         cid: number(data.get("cid")).max(video.cid),
+        view_count: compact_number(number(stat.get("view"))),
+        danmaku_count: compact_number(number(stat.get("danmaku"))),
+        like_count: compact_number(number(stat.get("like"))),
+        pubdate: number(data.get("pubdate")),
         uploader: owner_name.clone(),
         uploader_mid: owner_mid,
         collection: data
@@ -671,11 +685,6 @@ fn parse_author_video(item: &Value, index: usize, mid: i64) -> Option<Video> {
         title,
         uploader: text(item.get("author")),
         uploader_mid: mid,
-        stats: format!(
-            "{}播放  ·  {}评论",
-            compact_number(number(item.get("play"))),
-            compact_number(number(item.get("comment")))
-        ),
         duration: if duration_text.is_empty() {
             duration(item.get("duration"))
         } else {
@@ -684,7 +693,6 @@ fn parse_author_video(item: &Value, index: usize, mid: i64) -> Option<Video> {
         cover: https_url(text(item.get("pic"))),
         cover_image: None,
         accent: accent_for(index),
-        category: text(item.get("typename")),
     })
 }
 
@@ -985,7 +993,6 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
     if bvid.is_empty() {
         return None;
     }
-    let stat = item.get("stat");
     let cover = {
         let cover = text(item.get("cover"));
         if cover.is_empty() {
@@ -1004,16 +1011,10 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("author_name")),
         uploader_mid: number(item.get("author_mid")),
-        stats: format!(
-            "{}播放  ·  {}弹幕",
-            compact_number(number(stat.and_then(|stat| stat.get("view")))),
-            compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
-        ),
         duration: duration(item.get("duration")),
         cover: https_url(cover),
         cover_image: None,
         accent: accent_for(index),
-        category: "观看历史".into(),
     })
 }
 
@@ -1233,7 +1234,6 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
     if bvid.is_empty() {
         return None;
     }
-    let stat = archive.get("stat");
     Some(Video {
         bvid,
         aid: text(archive.get("aid")).parse().unwrap_or_default(),
@@ -1241,11 +1241,6 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
         title: clean_search_text(text(archive.get("title"))),
         uploader: String::new(),
         uploader_mid: 0,
-        stats: format!(
-            "{}播放  ·  {}弹幕",
-            text(stat.and_then(|stat| stat.get("play"))),
-            text(stat.and_then(|stat| stat.get("danmaku")))
-        ),
         duration: {
             let value = text(archive.get("duration_text"));
             if value.is_empty() {
@@ -1257,7 +1252,6 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
         cover: https_url(text(archive.get("cover"))),
         cover_image: None,
         accent: 0x3e4654,
-        category: "动态".into(),
     })
 }
 
@@ -1360,7 +1354,6 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
     if bvid.is_empty() {
         return None;
     }
-    let stat = item.get("stat");
     Some(Video {
         bvid,
         aid: number(item.get("aid")),
@@ -1368,16 +1361,10 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
         title: clean_search_text(text(item.get("title"))),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
-        stats: format!(
-            "{}播放  ·  {}弹幕",
-            compact_number(number(stat.and_then(|stat| stat.get("view")))),
-            compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
-        ),
         duration: duration(item.get("duration")),
         cover: https_url(text(item.get("pic"))),
         cover_image: None,
         accent: accent_for(index),
-        category: "稍后再看".into(),
     })
 }
 
@@ -1429,7 +1416,6 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
     }
     let ugc = item.get("ugc");
     let upper = item.get("upper");
-    let stat = item.get("cnt_info");
     Some(Video {
         bvid,
         aid: number(item.get("id")),
@@ -1437,16 +1423,10 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
         title: clean_search_text(text(item.get("title"))),
         uploader: text(upper.and_then(|upper| upper.get("name"))),
         uploader_mid: number(upper.and_then(|upper| upper.get("mid"))),
-        stats: format!(
-            "{}播放  ·  {}弹幕",
-            compact_number(number(stat.and_then(|stat| stat.get("play")))),
-            compact_number(number(stat.and_then(|stat| stat.get("danmaku"))))
-        ),
         duration: duration(item.get("duration")),
         cover: https_url(text(item.get("cover"))),
         cover_image: None,
         accent: accent_for(index),
-        category: "收藏夹".into(),
     })
 }
 
@@ -1853,8 +1833,8 @@ pub(crate) async fn fetch_comments(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_author_video, parse_collection, parse_history_video, parse_play_url, parse_video,
-        thumbnail_url,
+        format_publish_date, parse_author_video, parse_collection, parse_history_video,
+        parse_play_url, parse_video, thumbnail_url,
     };
     use serde_json::json;
 
@@ -1915,6 +1895,11 @@ mod tests {
             thumbnail_url("https://example.com/cover.jpg", 160, 90),
             "https://example.com/cover.jpg",
         );
+    }
+
+    #[test]
+    fn publish_date_uses_china_standard_time() {
+        assert_eq!(format_publish_date(1_704_067_200), "2024-01-01 08:00");
     }
 
     #[test]
@@ -2039,7 +2024,6 @@ mod tests {
 
         assert_eq!(video.uploader_mid, 7788);
         assert_eq!(video.duration, "01:02");
-        assert!(video.stats.contains("1.0万播放"));
     }
 }
 
