@@ -30,6 +30,14 @@ struct MpvRenderParam {
     data: *mut c_void,
 }
 
+#[repr(C)]
+struct MpvEvent {
+    event_id: c_int,
+    error: c_int,
+    reply_userdata: u64,
+    data: *mut c_void,
+}
+
 #[link(name = "mpv")]
 unsafe extern "C" {
     fn mpv_create() -> *mut MpvHandle;
@@ -69,6 +77,7 @@ const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
 const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
 const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
+const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_DOUBLE: c_int = 5;
 const MPV_FORMAT_STRING: c_int = 1;
@@ -440,11 +449,6 @@ fn run_mpv_session(
             "Referer: https://www.bilibili.com/",
         );
         set_option(handle, "aid", "auto");
-        if let Some(audio_url) = &audio_url {
-            if !audio_url.is_empty() {
-                set_option(handle, "audio-file", audio_url);
-            }
-        }
         if mpv_initialize(handle) < 0 {
             eprintln!("libmpv: mpv_initialize failed");
             mpv_terminate_destroy(handle);
@@ -471,16 +475,8 @@ fn run_mpv_session(
             return SessionExit::Idle;
         }
 
-        if let Some(audio_url) = &audio_url {
-            if !audio_url.is_empty() {
-                let audio_opt = format!("audio-file={audio_url}");
-                let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace", "0", &audio_opt]);
-            } else {
-                let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace"]);
-            }
-        } else {
-            let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace"]);
-        }
+        let _ = run_mpv_cmd(handle, &["loadfile", &url, "replace"]);
+        let mut pending_audio_url = audio_url.filter(|url| !url.is_empty());
         run_command(handle, &PlayerCommand::SetVolume(volume));
         run_command(handle, &PlayerCommand::SetSpeed(speed));
         let buffer_len = FRAME_WIDTH * FRAME_HEIGHT * 4;
@@ -514,7 +510,13 @@ fn run_mpv_session(
                 }
             }
 
-            let _ = mpv_wait_event(handle, 0.0);
+            let event = mpv_wait_event(handle, 0.0);
+            if !event.is_null()
+                && (*(event as *const MpvEvent)).event_id == MPV_EVENT_FILE_LOADED
+                && let Some(audio_url) = pending_audio_url.take()
+            {
+                let _ = run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]);
+            }
             let update = mpv_render_context_update(context);
             if render_enabled && update & MPV_RENDER_UPDATE_FRAME != 0 {
                 let mut params = [
@@ -742,11 +744,50 @@ mod tests {
             eprintln!("ret_init = {ret_init}");
             assert!(ret_init >= 0);
 
-            // Test 1: loadfile with 5 args (loadfile, url, replace, 0, opt)
-            let ret_5args_0 = run_mpv_cmd(handle, &["loadfile", "https://example.com/video.mp4", "replace", "0", "audio-file=https://example.com/audio.mp4"]);
-            eprintln!("ret_5args_0 = {ret_5args_0}");
-            assert!(ret_5args_0);
+            // Audio is configured separately; loadfile only receives the video URL.
+            let ret_load = run_mpv_cmd(handle, &["loadfile", "https://example.com/video.mp4", "replace"]);
+            eprintln!("ret_load = {ret_load}");
+            assert!(ret_load);
 
+            mpv_terminate_destroy(handle);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires live Bilibili DASH URLs in environment"]
+    fn test_mpv_external_audio_live() {
+        let video_url = std::env::var("BILIGUGA_LIVE_VIDEO_URL")
+            .expect("BILIGUGA_LIVE_VIDEO_URL is required");
+        let audio_url = std::env::var("BILIGUGA_LIVE_AUDIO_URL")
+            .expect("BILIGUGA_LIVE_AUDIO_URL is required");
+
+        unsafe {
+            let handle = mpv_create();
+            assert!(!handle.is_null());
+            set_option(handle, "vo", "null");
+            set_option(handle, "user-agent", "Mozilla/5.0");
+            set_option(handle, "http-header-fields", "Referer: https://www.bilibili.com/");
+            assert_eq!(mpv_initialize(handle), 0);
+            assert!(run_mpv_cmd(handle, &["loadfile", &video_url, "replace"]));
+
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut codec = None;
+            while Instant::now() < deadline {
+                let event = mpv_wait_event(handle, 0.1);
+                if !event.is_null()
+                    && (*(event as *const MpvEvent)).event_id == MPV_EVENT_FILE_LOADED
+                {
+                    assert!(run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]));
+                }
+                if let Some(value) = get_string_property(handle, "audio-codec") {
+                    if !value.is_empty() {
+                        codec = Some(value);
+                        break;
+                    }
+                }
+            }
+            eprintln!("live audio codec = {codec:?}");
+            assert!(codec.is_some(), "libmpv did not create an audio track");
             mpv_terminate_destroy(handle);
         }
     }

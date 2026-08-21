@@ -39,18 +39,3 @@ pub(crate) struct CommentPage {
     pub(crate) total: i64,
     pub(crate) has_more: bool,
 }
-
-pub(crate) static LOADING_VIDEO: Video = Video {
-    bvid: String::new(),
-    aid: 0,
-    cid: 0,
-    title: String::new(),
-    uploader: String::new(),
-    uploader_mid: 0,
-    stats: String::new(),
-    duration: String::new(),
-    cover: String::new(),
-    cover_image: None,
-    accent: 0x74ade8,
-    category: String::new(),
-};

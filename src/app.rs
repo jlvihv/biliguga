@@ -7,7 +7,7 @@ use crate::{
         report_video_heartbeat, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
-    model::{Comment, LOADING_VIDEO, Video, VideoCollection},
+    model::{Comment, Video, VideoCollection},
     mpv, network,
     search_input::{SearchInput, bind_search_keys},
 };
@@ -190,7 +190,7 @@ struct BiliGuga {
     pending_seek: Option<f64>,
     collection: Option<VideoCollection>,
     collection_loading: bool,
-    collection_expanded: bool,
+    collection_menu_open: bool,
     collection_cover_loading: bool,
     collection_cover_generation: u64,
     collection_cover_cancelled: Arc<AtomicBool>,
@@ -301,7 +301,7 @@ impl BiliGuga {
             pending_seek: None,
             collection: None,
             collection_loading: false,
-            collection_expanded: true,
+            collection_menu_open: false,
             collection_cover_loading: false,
             collection_cover_generation: 0,
             collection_cover_cancelled: Arc::new(AtomicBool::new(false)),
@@ -403,7 +403,6 @@ impl BiliGuga {
             self.loading = true;
             self.videos.clear();
             self.selected = 0;
-            self.playing_video = None;
             self.home_scroll_requested = false;
             self.reset_home_scroll();
         }
@@ -568,24 +567,6 @@ impl BiliGuga {
         .detach();
     }
 
-    fn stop_current_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.queue_history_report(cx, 2);
-        let frames = self.player.stop_playback();
-        self.drop_player_frames(frames, window);
-        self.selected = 0;
-        self.playback = PlaybackState::Idle;
-        self.playing_video = None;
-        self.cloud_resume_progress = None;
-        self.cloud_resume_applied = false;
-        self.pending_seek = None;
-        self.quality_options.clear();
-        self.clear_collection(window);
-        self.collection_loading = false;
-        self.playback_request = self.playback_request.wrapping_add(1);
-        self.controls_visible = false;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-    }
-
     fn note_home_scroll(
         &mut self,
         event: &ScrollWheelEvent,
@@ -704,7 +685,7 @@ impl BiliGuga {
         self.load_comments_page(cx, false);
     }
 
-    fn leave_current_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn leave_current_tab(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.debug_memory("before-tab-leave");
         if self.active_tab == AppTab::Home {
             self.home_generation = self.home_generation.wrapping_add(1);
@@ -714,9 +695,7 @@ impl BiliGuga {
             self.author_generation = self.author_generation.wrapping_add(1);
             self.author_loading = false;
         }
-        self.stop_current_playback(window, cx);
         self.reset_cover_loading();
-        self.reset_comments();
         self.debug_memory("after-tab-leave");
     }
 
@@ -842,7 +821,7 @@ impl BiliGuga {
                 Self::release_image(&mut episode.cover_image, window);
             }
         }
-        self.collection_expanded = true;
+        self.collection_menu_open = false;
     }
 
     fn release_active_cover_images(&mut self, window: &mut Window) {
@@ -1869,18 +1848,6 @@ impl BiliGuga {
         self.search_results.clear();
         self.reset_cover_loading();
         self.selected = 0;
-        self.queue_history_report(cx, 2);
-        let frames = self.player.stop_playback();
-        self.drop_player_frames(frames, window);
-        self.playback = PlaybackState::Idle;
-        self.playing_video = None;
-        self.cloud_resume_progress = None;
-        self.cloud_resume_applied = false;
-        self.pending_seek = None;
-        self.quality_options.clear();
-        self.playback_request = self.playback_request.wrapping_add(1);
-        self.controls_visible = false;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
         self.message = SharedString::from(format!("正在搜索：{keyword}"));
         cx.notify();
         cx.spawn(async move |view, cx| {
@@ -1919,18 +1886,6 @@ impl BiliGuga {
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.reset(cx));
         self.reset_cover_loading();
-        self.queue_history_report(cx, 2);
-        let frames = self.player.stop_playback();
-        self.drop_player_frames(frames, window);
-        self.playback = PlaybackState::Idle;
-        self.playing_video = None;
-        self.cloud_resume_progress = None;
-        self.cloud_resume_applied = false;
-        self.pending_seek = None;
-        self.quality_options.clear();
-        self.playback_request = self.playback_request.wrapping_add(1);
-        self.controls_visible = false;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
         self.load_home_page(cx, true);
     }
 
@@ -1983,6 +1938,47 @@ impl BiliGuga {
         self.begin_play_selected(cx);
     }
 
+    fn collection_episode_index(&self) -> Option<usize> {
+        let current = self.playing_video.as_ref()?;
+        self.collection.as_ref()?.episodes.iter().position(|episode| {
+            episode.bvid == current.bvid
+                && (episode.cid <= 0 || current.cid <= 0 || episode.cid == current.cid)
+        })
+    }
+
+    fn play_collection_episode(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(video) = self
+            .collection
+            .as_ref()
+            .and_then(|collection| collection.episodes.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        self.queue_history_report(cx, 2);
+        self.pin_playing_video(&video);
+        let frames = self.player.stop_playback();
+        self.drop_player_frames(frames, window);
+        self.playback = PlaybackState::Idle;
+        self.pending_pause = None;
+        self.pending_seek = None;
+        self.quality_options.clear();
+        self.clear_collection(window);
+        self.collection_loading = true;
+        self.playback_request = self.playback_request.wrapping_add(1);
+        self.controls_visible = false;
+        self.controls_generation = self.controls_generation.wrapping_add(1);
+        self.speed_menu_open = false;
+        self.quality_menu_open = false;
+        self.collection_menu_open = false;
+        self.begin_play_selected(cx);
+    }
+
     fn select_collection_episode(
         &mut self,
         index: usize,
@@ -1998,6 +1994,7 @@ impl BiliGuga {
         else {
             return;
         };
+        self.collection_menu_open = false;
         let same_video = self
             .selected_video_ref()
             .map(|current| {
@@ -2017,21 +2014,7 @@ impl BiliGuga {
             }
             return;
         }
-        self.queue_history_report(cx, 2);
-        self.pin_playing_video(&video);
-        let frames = self.player.stop_playback();
-        self.drop_player_frames(frames, window);
-        self.playback = PlaybackState::Idle;
-        self.pending_seek = None;
-        self.quality_options.clear();
-        self.clear_collection(window);
-        self.collection_loading = true;
-        self.playback_request = self.playback_request.wrapping_add(1);
-        self.controls_visible = false;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-        self.speed_menu_open = false;
-        self.quality_menu_open = false;
-        self.begin_play_selected(cx);
+        self.play_collection_episode(index, window, cx);
     }
 
     fn play_selected(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2134,7 +2117,7 @@ impl BiliGuga {
                         }
                         app.reset_collection_cover_loading();
                         app.collection = context.and_then(|context| context.collection);
-                        app.collection_expanded = true;
+                        app.collection_menu_open = false;
                         app.start_collection_cover_loading(cx);
                         app.collection_loading = false;
                         app.quality_options = play_url.qualities.clone();
@@ -2771,10 +2754,7 @@ impl BiliGuga {
                     range
                         .filter_map(|index| {
                             let video = this.current_videos().get(index)?.clone();
-                            let selected = this
-                                .selected_video_ref()
-                                .map(|current| current.bvid == video.bvid)
-                                .unwrap_or(index == this.selected);
+                            let selected = index == this.selected;
                             Some(BiliGuga::render_video_card(
                                 index,
                                 video,
@@ -3041,74 +3021,45 @@ impl BiliGuga {
     }
 
     fn toggle_collection(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.collection_expanded = !self.collection_expanded;
+        self.collection_menu_open = !self.collection_menu_open;
         cx.notify();
     }
 
-    fn render_collection(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_collection_popup(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(collection) = &self.collection else {
-            return div();
+            return div().into_any_element();
         };
-        let current = self.selected_video_ref();
+        let current = self.playing_video.as_ref();
         let current_bvid = current.map(|video| video.bvid.as_str()).unwrap_or("");
         let current_cid = current.map(|video| video.cid).unwrap_or(0);
         let entity = cx.entity();
-        let mut section = div()
-            .w_full()
-            .py_1()
-            .bg(rgb(0x343a45))
+        if collection.episodes.is_empty() {
+            return div().into_any_element();
+        }
+        let popup_height = px(collection.episodes.len().min(8) as f32 * 36. + 28.);
+        let mut popup = div()
+            .id("collection-popup")
+            .absolute()
+            .bottom(px(36.))
+            .right_0()
+            .w(px(300.))
+            .h(popup_height)
+            .overflow_y_scroll()
+            .bg(rgb(0x1d2027))
             .flex()
             .flex_col()
-            .gap_1()
             .child(
                 div()
-                    .id(SharedString::from(format!("collection-{}", collection.id)))
                     .w_full()
                     .h(px(28.))
-                    .px_4()
+                    .px_3()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x3d4350)))
-                    .child(div().flex().items_center().gap_1().child(
-                        div().text_xs().text_color(rgb(0x74ade8)).child(
-                            if self.collection_expanded {
-                                "▾"
-                            } else {
-                                "▸"
-                            },
-                        ),
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0xdce0e5))
-                            .text_ellipsis()
-                            .child(format!("合集 · {}", collection.title)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x878a98))
-                            .child(format!("共 {} 集", collection.episodes.len())),
-                    )
-                    .on_click(cx.listener(Self::toggle_collection)),
-            );
-        if !self.collection_expanded {
-            return section;
-        }
-        if collection.episodes.is_empty() {
-            return section.child(
-                div()
-                    .px_4()
                     .text_xs()
                     .text_color(rgb(0x878a98))
-                    .child("合集暂时没有可播放的视频"),
+                    .text_ellipsis()
+                    .child(collection.title.clone()),
             );
-        }
         for (index, episode) in collection.episodes.iter().enumerate() {
             let is_current = episode.bvid == current_bvid
                 && (episode.cid <= 0 || current_cid <= 0 || episode.cid == current_cid);
@@ -3117,42 +3068,33 @@ impl BiliGuga {
                 div()
                     .id(SharedString::from(format!("collection-episode-{index}")))
                     .w_full()
-                    .h(px(46.))
+                    .h(px(36.))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px_4()
+                    .gap_3()
+                    .px_3()
                     .cursor_pointer()
                     .when(is_current, |this| this.bg(rgb(0x454a56)))
                     .when(!is_current, |this| {
                         this.hover(|style| style.bg(rgb(0x3d4350)))
                     })
-                    .child(thumbnail(episode, 72., 42.))
                     .child(
                         div()
                             .flex_1()
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap_0()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if is_current {
-                                        rgb(0x74ade8)
-                                    } else {
-                                        rgb(0xdce0e5)
-                                    })
-                                    .text_ellipsis()
-                                    .child(format!("{}. {}", index + 1, episode.title)),
-                            )
-                            .child(div().text_xs().text_color(rgb(0x878a98)).child(
-                                if is_current {
-                                    format!("{} · 正在播放", episode.duration)
-                                } else {
-                                    episode.duration.clone()
-                                },
-                            )),
+                            .text_xs()
+                            .text_color(if is_current {
+                                rgb(0x74ade8)
+                            } else {
+                                rgb(0xdce0e5)
+                            })
+                            .text_ellipsis()
+                            .child(format!("{}. {}", index + 1, episode.title)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x878a98))
+                            .child(episode.duration.clone()),
                     )
                     .on_click(move |event, window, cx| {
                         click_entity.update(cx, |app, cx| {
@@ -3162,13 +3104,29 @@ impl BiliGuga {
             if is_current {
                 row = row.text_color(rgb(0x74ade8));
             }
-            section = section.child(row);
+            popup = popup.child(row);
         }
-        section
+        popup.into_any_element()
     }
 
-    fn render_player(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let video = self.selected_video_ref().unwrap_or(&LOADING_VIDEO);
+    fn render_player(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(video) = self.playing_video.as_ref() else {
+            return div()
+                .id("player-scroll")
+                .flex_1()
+                .h_full()
+                .bg(rgb(0x3b414d))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x878a98))
+                        .child("暂无正在播放的视频"),
+                )
+                .into_any_element();
+        };
         let status = self.player.status();
         let playing = self.playback == PlaybackState::Playing;
         let paused = self.playback == PlaybackState::Paused;
@@ -3511,6 +3469,7 @@ impl BiliGuga {
                 }
                 quality_popup = quality_popup.child(quality_row);
             }
+            let collection_popup = self.render_collection_popup(cx);
 
             let controls = div()
                 .id("player-controls-bar")
@@ -3599,6 +3558,27 @@ impl BiliGuga {
                                 )
                                 .when(self.quality_menu_open, |this| this.child(quality_popup)),
                         )
+                        .when(self.collection.is_some(), |this| {
+                            this.child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        div()
+                                            .id("player-collection")
+                                            .px_2()
+                                            .py_1()
+                                            .cursor_pointer()
+                                            .text_xs()
+                                            .whitespace_nowrap()
+                                            .hover(|style| style.bg(rgb(0x363c46)))
+                                            .child("选集")
+                                            .on_click(cx.listener(Self::toggle_collection)),
+                                    )
+                                    .when(self.collection_menu_open, |this| {
+                                        this.child(collection_popup)
+                                    }),
+                            )
+                        })
                         .child(
                             div()
                                 .id("player-window-fullscreen")
@@ -3765,10 +3745,10 @@ impl BiliGuga {
                                         .child(self.message.clone()),
                                 ),
                         )
-                        .child(self.render_collection(cx))
                         .child(self.render_comments(cx))
                     }),
             )
+            .into_any_element()
     }
 }
 
@@ -3853,6 +3833,11 @@ pub(crate) fn launch() {
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(gpui::TitlebarOptions {
+                            title: Some("哔哩咕嘎".into()),
+                            ..Default::default()
+                        }),
+                        app_id: Some("biliguga".into()),
                         ..Default::default()
                     },
                     |_, cx| cx.new(BiliGuga::new),
@@ -3888,12 +3873,28 @@ pub(crate) fn launch() {
                                         && status.duration > 0.
                                         && status.time_pos >= status.duration - 0.25;
                                     if reached_end {
-                                        app.playback = PlaybackState::Idle;
-                                        app.pending_pause = None;
-                                        app.pending_seek = None;
-                                        app.cloud_resume_progress = None;
-                                        app.cloud_resume_applied = true;
-                                        app.message = SharedString::from("播放结束，点击重新播放");
+                                        let next_episode = app.collection_episode_index().and_then(
+                                            |index| {
+                                                app.collection
+                                                    .as_ref()
+                                                    .and_then(|collection| {
+                                                        (index + 1 < collection.episodes.len())
+                                                            .then_some(index + 1)
+                                                    })
+                                            },
+                                        );
+                                        if let Some(next_episode) = next_episode {
+                                            app.play_collection_episode(next_episode, window, cx);
+                                        } else {
+                                            app.playback = PlaybackState::Idle;
+                                            app.pending_pause = None;
+                                            app.pending_seek = None;
+                                            app.cloud_resume_progress = None;
+                                            app.cloud_resume_applied = true;
+                                            app.message = SharedString::from(
+                                                "播放结束，点击重新播放",
+                                            );
+                                        }
                                     }
                                     if !reached_end && !app.cloud_resume_applied {
                                         if let Some(target) = app.pending_seek {
