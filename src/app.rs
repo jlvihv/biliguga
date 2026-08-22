@@ -38,7 +38,8 @@ use std::{
 
 const HOME_MAX_ITEMS: usize = 120;
 const HOME_PREFETCH_ITEMS: usize = 4;
-const VIDEO_ROW_HEIGHT: f32 = 76.;
+const HOME_GRID_ROW_HEIGHT: f32 = 170.;
+const HOME_GRID_CARD_WIDTH: f32 = 190.;
 const SPEED_OPTIONS: [f64; 5] = [0.5, 1., 1.25, 1.5, 2.];
 const WINDOW_FULLSCREEN_ICON: &str = "icons/window-fullscreen.svg";
 const WINDOW_FULLSCREEN_EXIT_ICON: &str = "icons/window-fullscreen-exit.svg";
@@ -408,11 +409,14 @@ impl BiliGuga {
 
         let handle = self.home_scroll_handle.0.borrow().base_handle.clone();
         let offset = handle.offset();
+        let removed_rows = (remove_count + 1) / 2;
         handle.set_offset(point(
             offset.x,
-            offset.y + px(remove_count as f32 * VIDEO_ROW_HEIGHT),
+            offset.y + px(removed_rows as f32 * HOME_GRID_ROW_HEIGHT),
         ));
-        self.home_last_scroll_offset = Some(offset.y + px(remove_count as f32 * VIDEO_ROW_HEIGHT));
+        self.home_last_scroll_offset = Some(
+            offset.y + px(removed_rows as f32 * HOME_GRID_ROW_HEIGHT),
+        );
     }
 
     fn reset_home_scroll(&mut self) {
@@ -523,7 +527,7 @@ impl BiliGuga {
             let max_offset = state.base_handle.max_offset();
             let remaining = max_offset.height + offset.y;
             max_offset.height > px(0.)
-                && remaining <= px(VIDEO_ROW_HEIGHT * HOME_PREFETCH_ITEMS as f32)
+                && remaining <= px(HOME_GRID_ROW_HEIGHT * HOME_PREFETCH_ITEMS as f32)
         };
         if near_bottom {
             self.load_home_page(cx, false);
@@ -2485,7 +2489,32 @@ impl BiliGuga {
             .flex()
             .flex_col()
             .items_center()
-            .bg(rgb(0x2f343e))
+            .gap_1()
+            .pt_3()
+            .bg(rgb(0x10141c))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(48.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0x8e8aff))
+                            .child("◈"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x6e7890))
+                            .child("GUGA"),
+                    ),
+            )
             .child(clickable_sidebar_item(
                 "⌂",
                 "首页",
@@ -2550,9 +2579,15 @@ impl BiliGuga {
             .flex_none()
             .gap_2()
             .cursor_pointer()
-            .when(selected, |this| this.bg(rgb(0x454a56)))
+            .border_b_1()
+            .border_color(rgb(0x1d2533))
+            .when(selected, |this| {
+                this.bg(rgb(0x202a42))
+                    .border_l_2()
+                    .border_color(rgb(0x8580ff))
+            })
             .when(!selected, |this| {
-                this.hover(|style| style.bg(rgb(0x363c46)))
+                this.hover(|style| style.bg(rgb(0x182131)))
             })
             .child(thumbnail(&video, 126., 76.))
             .child(
@@ -2577,6 +2612,63 @@ impl BiliGuga {
                             .text_ellipsis()
                             .child(format!("{}  ·  {}", video.uploader, video.duration)),
                     ),
+            )
+            .on_click(move |event, window, cx| {
+                click_entity.update(cx, |this, cx| {
+                    this.select_video(index, event, window, cx);
+                });
+            })
+    }
+
+    fn render_video_grid_card(
+        index: usize,
+        video: Video,
+        selected: bool,
+        entity: Entity<BiliGuga>,
+    ) -> impl IntoElement + use<> {
+        let title = video.title.clone();
+        let click_entity = entity.clone();
+        div()
+            .id(SharedString::from(format!("video-grid-card-{index}")))
+            .w(px(HOME_GRID_CARD_WIDTH))
+            .flex_none()
+            .h(px(160.))
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .when(selected, |this| {
+                this.bg(rgb(0x182039))
+                    .border_b_2()
+                    .border_color(rgb(0x8580ff))
+            })
+            .when(!selected, |this| {
+                this.hover(|style| style.bg(rgb(0x151d2c)))
+            })
+            .child(thumbnail_fill(&video, 106.))
+            .child(
+                div()
+                    .w_full()
+                    .px_1()
+                    .pt_2()
+                    .text_sm()
+                    .line_height(px(19.))
+                    .text_color(if selected {
+                        rgb(0xe9eaff)
+                    } else {
+                        rgb(0xdce0e5)
+                    })
+                    .text_ellipsis()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_1()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(rgb(0x7f8ca8))
+                    .text_ellipsis()
+                    .child(format!("{}  ·  {}", video.uploader, video.duration)),
             )
             .on_click(move |event, window, cx| {
                 click_entity.update(cx, |this, cx| {
@@ -2732,6 +2824,7 @@ impl BiliGuga {
             .id("feed-scroll")
             .w_full()
             .flex_1()
+            .bg(rgb(0x0f141d))
             .overflow_x_hidden();
         if is_loading {
             feed = feed.child(
@@ -2740,7 +2833,8 @@ impl BiliGuga {
                     .py_8()
                     .text_center()
                     .text_sm()
-                    .text_color(rgb(0xa9afbc))
+                    .text_color(rgb(0x7f8ca8))
+                    .child(div().text_color(rgb(0x8e8aff)).child("·  ·  ·"))
                     .child(if is_search {
                         "正在搜索 B 站视频…"
                     } else if is_dynamic {
@@ -2764,7 +2858,8 @@ impl BiliGuga {
                     .py_8()
                     .text_center()
                     .text_sm()
-                    .text_color(rgb(0xd07277))
+                    .text_color(rgb(0x8d99b2))
+                    .child(div().text_color(rgb(0x505d78)).child("──"))
                     .child(if is_search {
                         "没有找到视频，请换个关键词试试"
                     } else if is_dynamic {
@@ -2798,26 +2893,73 @@ impl BiliGuga {
                     }),
             );
         } else {
-            let list = uniform_list(
-                "video-list",
-                self.current_videos().len(),
-                cx.processor(move |this, range: Range<usize>, _window, _cx| {
-                    range
-                        .filter_map(|index| {
-                            let video = this.current_videos().get(index)?.clone();
-                            let selected = index == this.selected;
-                            Some(BiliGuga::render_video_card(
-                                index,
-                                video,
-                                selected,
-                                entity.clone(),
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
-            .size_full();
+            let list = if is_home {
+                let row_count = self.videos.len().div_ceil(2);
+                uniform_list(
+                    "video-grid",
+                    row_count,
+                    cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                        range
+                            .filter_map(|row_index| {
+                                let first_index = row_index * 2;
+                                let first_video = this.videos.get(first_index)?.clone();
+                                let mut row = div()
+                                    .w_full()
+                                    .h(px(HOME_GRID_ROW_HEIGHT))
+                                    .flex()
+                                    .gap_2()
+                                    .px_3()
+                                    .pt_2();
+                                row = row.child(BiliGuga::render_video_grid_card(
+                                    first_index,
+                                    first_video,
+                                    first_index == this.selected,
+                                    entity.clone(),
+                                ));
+                                if let Some(second_video) = this.videos.get(first_index + 1).cloned()
+                                {
+                                    row = row.child(BiliGuga::render_video_grid_card(
+                                        first_index + 1,
+                                        second_video,
+                                        first_index + 1 == this.selected,
+                                        entity.clone(),
+                                    ));
+                                } else {
+                                    row = row.child(
+                                        div()
+                                            .w(px(HOME_GRID_CARD_WIDTH))
+                                            .flex_none(),
+                                    );
+                                }
+                                Some(row)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
+                .size_full()
+            } else {
+                uniform_list(
+                    "video-list",
+                    self.current_videos().len(),
+                    cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                        range
+                            .filter_map(|index| {
+                                let video = this.current_videos().get(index)?.clone();
+                                let selected = index == this.selected;
+                                Some(BiliGuga::render_video_card(
+                                    index,
+                                    video,
+                                    selected,
+                                    entity.clone(),
+                                ))
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
+                .size_full()
+            };
             let list = if is_home {
                 list.track_scroll(self.home_scroll_handle.clone())
                     .on_scroll_wheel(cx.listener(Self::note_home_scroll))
@@ -2846,12 +2988,15 @@ impl BiliGuga {
             .items_center()
             .justify_between()
             .px_3()
-            .py_2()
+            .py_3()
+            .bg(rgb(0x111722))
+            .border_b_1()
+            .border_color(rgb(0x20293a))
             .child(
                 div()
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xdce0e5))
+                    .text_color(rgb(0xe1e5f2))
                     .child(feed_title),
             );
         if !is_search {
@@ -2899,27 +3044,33 @@ impl BiliGuga {
         let search_bar = div()
             .flex()
             .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(rgb(0x111722))
             .child(
                 div()
                     .id("search-box")
                     .flex_1()
-                    .h(px(30.))
+                    .h(px(32.))
                     .on_key_down(cx.listener(Self::search_key_down))
                     .child(search_input),
             )
             .child(
                 div()
                     .id("search-button")
-                    .h(px(30.))
+                    .h(px(32.))
                     .px_2()
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_sm()
-                    .text_color(rgb(0x74ade8))
-                    .bg(rgb(0x363c46))
+                    .text_color(rgb(0xe9eaff))
+                    .bg(rgb(0x5d59c8))
+                    .border_1()
+                    .border_color(rgb(0x8e8aff))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x454a56)))
+                    .hover(|style| style.bg(rgb(0x716cf0)))
                     .child("搜索")
                     .on_click(cx.listener(Self::submit_search)),
             );
@@ -2929,7 +3080,7 @@ impl BiliGuga {
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(0x2f343e))
+            .bg(rgb(0x0f141d))
             .child(header);
         if is_search {
             root = root.child(search_bar);
@@ -2938,7 +3089,13 @@ impl BiliGuga {
     }
 
     fn render_comments(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut section = div().w_full().px_5().pb_6().flex().flex_col().gap_2();
+        let mut section = div()
+            .w_full()
+            .px(px(10.))
+            .pb(px(12.))
+            .flex()
+            .flex_col()
+            .gap_2();
         let count = if self.comments_total > 0 {
             self.comments_total
         } else {
@@ -3209,7 +3366,7 @@ impl BiliGuga {
                 .id("player-scroll")
                 .flex_1()
                 .h_full()
-                .bg(rgb(0x3b414d))
+                .bg(rgb(0x0f141d))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3800,31 +3957,32 @@ impl BiliGuga {
             })
             .id("player-stage-viewport")
             .w_full()
+            .flex_none()
             .when(self.player_fullscreen, |this| this.h_full())
             .child(stage);
 
-        div()
+        let mut player = div()
             .id("player-scroll")
             .flex_1()
             .when(self.player_fullscreen, |this| this.w_full())
             .h_full()
+            .flex()
+            .flex_col()
             .when(self.player_fullscreen, |this| this.overflow_hidden())
-            .when(!self.player_fullscreen, |this| this.overflow_y_scroll())
             .overflow_x_hidden()
-            .bg(rgb(0x3b414d))
-            .child(
+            .bg(rgb(0x0f141d))
+            .child(stage);
+        if !self.player_fullscreen {
+            player = player.child(
                 div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .when(self.player_fullscreen, |this| this.h_full())
-                    .child(stage)
-                    .when(!self.player_fullscreen, |this| {
-                        this.child(
+                        .id("player-details-scroll")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .child(
                             div()
                                 .w_full()
-                                .px_5()
-                                .py_4()
+                                .px(px(10.))
+                                .py(px(8.))
                                 .flex()
                                 .flex_col()
                                 .gap_2()
@@ -3942,12 +4100,12 @@ impl BiliGuga {
                                                     cx.listener(Self::save_current_to_watch_later),
                                                 ),
                                         ),
-                                )
+                                ),
                         )
-                        .child(self.render_comments(cx))
-                    }),
-            )
-            .into_any_element()
+                        .child(self.render_comments(cx)),
+            );
+        }
+        player.into_any_element()
     }
 }
 
@@ -3956,7 +4114,7 @@ impl Render for BiliGuga {
         let mut root = div()
             .size_full()
             .flex()
-            .bg(rgb(0x3b414d))
+            .bg(rgb(0x0b0f16))
             .track_focus(&self.root_focus)
             .capture_key_down(cx.listener(Self::handle_global_key));
         if self.player_fullscreen {
@@ -3991,6 +4149,7 @@ where
 
 fn sidebar_item(icon: &'static str, label: &'static str, active: bool) -> gpui::Div {
     div()
+        .relative()
         .w(px(64.))
         .h(px(52.))
         .flex()
@@ -3999,11 +4158,21 @@ fn sidebar_item(icon: &'static str, label: &'static str, active: bool) -> gpui::
         .justify_center()
         .cursor_pointer()
         .when(active, |this| {
-            this.bg(rgb(0x454a56)).text_color(rgb(0xdce0e5))
+            this.bg(rgb(0x202a42))
+                .text_color(rgb(0xe4e6ff))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(rgb(0x8580ff)),
+                )
         })
         .when(!active, |this| {
             this.text_color(rgb(0xa9afbc))
-                .hover(|style| style.bg(rgb(0x383e48)))
+                .hover(|style| style.bg(rgb(0x192131)))
         })
         .child(div().text_lg().child(icon))
         .child(div().text_xs().child(label))
@@ -4014,6 +4183,24 @@ fn thumbnail(video: &Video, width: f32, height: f32) -> impl IntoElement {
         .w(px(width))
         .h(px(height))
         .flex_none()
+        .bg(rgb(video.accent));
+    if let Some(image) = &video.cover_image {
+        thumbnail = thumbnail.child(
+            img(image.clone())
+                .w_full()
+                .h_full()
+                .object_fit(gpui::ObjectFit::Cover),
+        );
+    }
+    thumbnail
+}
+
+fn thumbnail_fill(video: &Video, height: f32) -> impl IntoElement {
+    let mut thumbnail = div()
+        .w_full()
+        .h(px(height))
+        .flex_none()
+        .overflow_hidden()
         .bg(rgb(video.accent));
     if let Some(image) = &video.cover_image {
         thumbnail = thumbnail.child(

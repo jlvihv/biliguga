@@ -520,7 +520,14 @@ impl Render for SearchInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::focus))
-            .bg(rgb(0x282c33))
+            .bg(rgb(0x151b27))
+            .border_1()
+            .border_color(rgb(0x273149))
+            .focus(|style| {
+                style
+                    .bg(rgb(0x192238))
+                    .border_color(rgb(0x7c78ff))
+            })
             .px_2()
             .child(SearchTextElement { input: cx.entity() })
     }
