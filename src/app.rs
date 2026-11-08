@@ -1195,19 +1195,19 @@ fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
                 .min_h(0.0)
                 .gap(4.0)
                 .child(
-                    text(video.title.clone())
+                    text(&video.title)
                         .font(type_::BODY)
                         .color(theme::TEXT)
                         .max_lines(2),
                 )
                 .child(
-                    text(video.uploader.clone())
+                    text(&video.uploader)
                         .font(type_::LABEL)
                         .color(theme::TEXT_FAINT)
                         .truncate(),
                 )
                 .child(
-                    text(video.duration.clone())
+                    text(&video.duration)
                         .font(type_::LABEL)
                         .color(theme::TEXT_FAINT),
                 ),
@@ -1234,13 +1234,13 @@ fn video_card(app: &BiliGuga, index: usize, video: &Video) -> El {
         .on_press(move |app: &mut BiliGuga| app.select(index))
         .child(card_cover(video, image, GRID_CARD_WIDTH - 8.0, 106.0))
         .child(
-            text(video.title.clone())
+            text(&video.title)
                 .font(type_::LABEL)
                 .color(theme::TEXT)
                 .max_lines(2),
         )
         .child(
-            text(video.uploader.clone())
+            text(&video.uploader)
                 .font(type_::SECTION)
                 .color(theme::TEXT_FAINT)
                 .truncate(),
@@ -1851,7 +1851,7 @@ fn render_player(app: &BiliGuga) -> El {
                 .children(app.quality_options.iter().map(|option| {
                     let selected = option.qn == app.quality;
                     let quality = option.qn;
-                    let label = option.label.clone();
+                    let label = option.label.as_str();
                     // `switchable` says whether the account may play this quality at all (4K
                     // without a membership is listed but refused), so the menu says so rather
                     // than letting the click fail with a server error.
@@ -1899,7 +1899,7 @@ fn render_player(app: &BiliGuga) -> El {
                 .px(12.0)
                 .py(4.0)
                 .fill(theme::PANEL)
-                .child(text(note.clone()).font(type_::LABEL).color(theme::ACCENT_SOFT)),
+                .child(text(note).font(type_::LABEL).color(theme::ACCENT_SOFT)),
         );
     }
     root.child(render_detail(app, video))
@@ -1970,7 +1970,7 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                         .color(theme::TEXT_DIM),
                 )
                 .child(
-                    text(video.uploader.clone())
+                    text(&video.uploader)
                         .font(type_::LABEL)
                         .color(theme::ACCENT_SOFT)
                         .cursor(rune::Cursor::Pointer)
@@ -1991,7 +1991,7 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                 .color(theme::TEXT_FAINT),
         );
     } else if let Some(error) = &app.comments_error {
-        section = section.child(text(error.clone()).font(type_::LABEL).color(theme::DANGER));
+        section = section.child(text(error).font(type_::LABEL).color(theme::DANGER));
     } else if app.comments.is_empty() {
         section = section.child(
             text("还没有评论")
