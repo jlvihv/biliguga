@@ -1,18 +1,15 @@
 use crate::{
-    model::{Comment, CommentPage, Video, VideoCollection},
+    model::{Comment, CommentPage, Rgba8, Video, VideoCollection},
     network,
 };
 use futures::{
     StreamExt,
     channel::{mpsc as async_mpsc, oneshot},
 };
-use gpui::RenderImage;
-use image::Frame;
 use md5::{Digest, Md5};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
-use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
@@ -202,7 +199,7 @@ fn thumbnail_url(url: &str, width: u32, height: u32) -> String {
     format!("{base}@{width}w_{height}h_1c.webp")
 }
 
-fn decode_image(bytes: &[u8], width: u32, height: u32) -> Option<Arc<RenderImage>> {
+fn decode_image(bytes: &[u8], width: u32, height: u32) -> Option<Arc<Rgba8>> {
     let compressed_len = bytes.len();
     let source = image::load_from_memory(bytes).ok()?.into_rgba8();
     if std::env::var_os("BILIGUGA_IMAGE_DEBUG").is_some() {
@@ -215,16 +212,15 @@ fn decode_image(bytes: &[u8], width: u32, height: u32) -> Option<Arc<RenderImage
             height,
         );
     }
-    let mut rgba = image::imageops::thumbnail(&source, width, height);
+    // `image` already hands back RGBA in the order `rune::Pixels` and `ImageCache` want, so no
+    // channel swap is needed here (GPUI's BGRA order used to need one).
+    let rgba = image::imageops::thumbnail(&source, width, height);
     drop(source);
-    for pixel in rgba.pixels_mut() {
-        let [red, green, blue, alpha] = pixel.0;
-        pixel.0 = [blue, green, red, alpha];
-    }
-    Some(Arc::new(RenderImage::new(SmallVec::from_elem(
-        Frame::new(rgba),
-        1,
-    ))))
+    Some(Arc::new(Rgba8::new(
+        rgba.width(),
+        rgba.height(),
+        rgba.into_raw(),
+    )))
 }
 
 fn cover_image_client() -> Option<Client> {
@@ -240,7 +236,7 @@ async fn download_cover_async(
     client: &Client,
     url: &str,
     cancelled: &AtomicBool,
-) -> Option<Arc<RenderImage>> {
+) -> Option<Arc<Rgba8>> {
     if cancelled.load(Ordering::Acquire) || url.is_empty() {
         return None;
     }
@@ -264,7 +260,7 @@ async fn download_cover_async(
 struct CoverRequest {
     url: String,
     cancelled: Arc<AtomicBool>,
-    reply: oneshot::Sender<Option<Arc<RenderImage>>>,
+    reply: oneshot::Sender<Option<Arc<Rgba8>>>,
 }
 
 struct CoverWorkers {
@@ -315,7 +311,7 @@ fn cover_workers() -> Option<&'static CoverWorkers> {
 pub(crate) fn queue_cover_download(
     url: String,
     cancelled: Arc<AtomicBool>,
-) -> Option<oneshot::Receiver<Option<Arc<RenderImage>>>> {
+) -> Option<oneshot::Receiver<Option<Arc<Rgba8>>>> {
     let workers = cover_workers()?;
     let (reply, receiver) = oneshot::channel();
     let index = workers.next.fetch_add(1, Ordering::Relaxed) % workers.senders.len();
@@ -329,7 +325,7 @@ pub(crate) fn queue_cover_download(
     Some(receiver)
 }
 
-pub(crate) async fn download_avatar(url: &str) -> Option<Arc<RenderImage>> {
+pub(crate) async fn download_avatar(url: &str) -> Option<Arc<Rgba8>> {
     if url.is_empty() {
         return None;
     }
@@ -366,7 +362,6 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
         uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
         duration: duration(item.get("duration")),
         cover: https_url(text(item.get("pic"))),
-        cover_image: None,
         accent: accent_for(index),
     })
 }
@@ -417,7 +412,6 @@ fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
             duration
         },
         cover: https_url(text(item.get("pic"))),
-        cover_image: None,
         accent: accent_for(index),
     })
 }
@@ -586,7 +580,6 @@ fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<
                         }
                     },
                     cover: https_url(text(arc.get("pic"))),
-                    cover_image: None,
                     accent: accent_for(index),
                 });
             }
@@ -691,7 +684,6 @@ fn parse_author_video(item: &Value, index: usize, mid: i64) -> Option<Video> {
             duration_text
         },
         cover: https_url(text(item.get("pic"))),
-        cover_image: None,
         accent: accent_for(index),
     })
 }
@@ -1013,7 +1005,6 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
         uploader_mid: number(item.get("author_mid")),
         duration: duration(item.get("duration")),
         cover: https_url(cover),
-        cover_image: None,
         accent: accent_for(index),
     })
 }
@@ -1250,7 +1241,6 @@ fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
             }
         },
         cover: https_url(text(archive.get("cover"))),
-        cover_image: None,
         accent: 0x3e4654,
     })
 }
@@ -1363,7 +1353,6 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
         uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
         duration: duration(item.get("duration")),
         cover: https_url(text(item.get("pic"))),
-        cover_image: None,
         accent: accent_for(index),
     })
 }
@@ -1425,7 +1414,6 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
         uploader_mid: number(upper.and_then(|upper| upper.get("mid"))),
         duration: duration(item.get("duration")),
         cover: https_url(text(item.get("cover"))),
-        cover_image: None,
         accent: accent_for(index),
     })
 }

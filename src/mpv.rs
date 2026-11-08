@@ -1,14 +1,11 @@
-use gpui::RenderImage;
-use image::{Frame, ImageBuffer, Rgba};
-use smallvec::SmallVec;
+use rune::Pixels as FramePixels;
 use std::{
-    collections::VecDeque,
     ffi::{CStr, CString},
     os::raw::{c_char, c_double, c_int, c_void},
     ptr,
     sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+        Mutex,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -86,8 +83,6 @@ const MPV_FORMAT_STRING: c_int = 1;
 const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 const DEFAULT_FRAME_WIDTH: usize = 1920;
 const DEFAULT_FRAME_HEIGHT: usize = 1080;
-const RETIRED_FRAME_LIMIT: usize = 3;
-const FRAME_CHANNEL_CAPACITY: usize = 1;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 enum PlayerCommand {
@@ -131,57 +126,50 @@ impl Default for MpvStatus {
     }
 }
 
-struct FramePacket {
-    pixels: Vec<u8>,
-    width: usize,
-    height: usize,
-    source_width: usize,
-    source_height: usize,
-}
-
 pub struct MpvPlayer {
     commands: mpsc::Sender<PlayerCommand>,
     worker_parts: Mutex<Option<WorkerParts>>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    frames: Receiver<FramePacket>,
-    recycled_frames: mpsc::Sender<Vec<u8>>,
     statuses: Receiver<MpvStatus>,
-    current_frame: Option<Arc<RenderImage>>,
+    /// Text for the UI's status line ("正在缓冲", a decode error), cleared once read.
+    messages: Receiver<Option<String>>,
+    /// Each fresh render size's buffer, sent once so the view can draw it. The worker keeps
+    /// writing into the one it last sent.
+    frame_targets: Receiver<FramePixels>,
+    presented: Option<FramePixels>,
     current_frame_size: Option<(usize, usize)>,
     current_source_size: Option<(usize, usize)>,
-    retired_frames: VecDeque<Arc<RenderImage>>,
     current_status: MpvStatus,
 }
 
 struct WorkerParts {
     command_rx: Receiver<PlayerCommand>,
-    frame_tx: SyncSender<FramePacket>,
-    recycled_rx: Receiver<Vec<u8>>,
     status_tx: SyncSender<MpvStatus>,
+    message_tx: SyncSender<Option<String>>,
+    target_tx: SyncSender<FramePixels>,
 }
 
 impl MpvPlayer {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel();
-        let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
-        let (recycled_tx, recycled_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::sync_channel(2);
+        let (message_tx, message_rx) = mpsc::sync_channel(4);
+        let (target_tx, target_rx) = mpsc::sync_channel(2);
         Self {
             commands: command_tx,
             worker_parts: Mutex::new(Some(WorkerParts {
                 command_rx,
-                frame_tx,
-                recycled_rx,
                 status_tx,
+                message_tx,
+                target_tx,
             })),
             worker: Mutex::new(None),
-            frames: frame_rx,
-            recycled_frames: recycled_tx,
             statuses: status_rx,
-            current_frame: None,
+            messages: message_rx,
+            frame_targets: target_rx,
+            presented: None,
             current_frame_size: None,
             current_source_size: None,
-            retired_frames: VecDeque::new(),
             current_status: MpvStatus::default(),
         }
     }
@@ -206,9 +194,9 @@ impl MpvPlayer {
             .spawn(move || {
                 run_mpv(
                     parts.command_rx,
-                    parts.frame_tx,
-                    parts.recycled_rx,
                     parts.status_tx,
+                    parts.message_tx,
+                    parts.target_tx,
                 )
             })
         else {
@@ -231,7 +219,7 @@ impl MpvPlayer {
             .send(PlayerCommand::Load { url, audio_url, volume, speed });
     }
 
-    pub fn stop_playback(&mut self) -> Vec<Arc<RenderImage>> {
+    pub fn stop_playback(&mut self) {
         if self.worker_started() {
             let (done_tx, done_rx) = mpsc::sync_channel(0);
             let _ = self
@@ -243,7 +231,7 @@ impl MpvPlayer {
         self.current_status = MpvStatus::default();
         self.current_frame_size = None;
         self.current_source_size = None;
-        self.take_all_frames()
+        self.presented = None;
     }
 
     pub fn set_pause(&self, paused: bool) {
@@ -292,58 +280,34 @@ impl MpvPlayer {
         }
     }
 
-    pub fn poll_frame(&mut self) {
-        let mut latest_packet = None;
-        loop {
-            match self.frames.try_recv() {
-                Ok(packet) => {
-                    if let Some(previous) = latest_packet.replace(packet) {
-                        let _ = self.recycled_frames.send(previous.pixels);
-                    }
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
-        }
-        if let Some(packet) = latest_packet {
-            let FramePacket {
-                pixels,
-                width,
-                height,
-                source_width,
-                source_height,
-            } = packet;
-            let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels);
-            if let Some(buffer) = buffer {
-                self.current_frame_size = Some((width, height));
-                self.current_source_size = Some((source_width, source_height));
-                if let Some(previous) =
-                    self.current_frame
-                        .replace(Arc::new(RenderImage::new(SmallVec::from_elem(
-                            Frame::new(buffer),
-                            1,
-                        ))))
-                {
-                    self.retired_frames.push_back(previous);
-                }
-            }
+    /// Collects what the worker produced since the last frame. Pixels do not come through
+    /// here: the worker writes them into a `rune::Pixels`, whose `set` wakes the windows that
+    /// draw it, so playback never needs the view to run.
+    pub fn poll_frame(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(target) = self.frame_targets.try_recv() {
+            self.presented = Some(target);
+            changed = true;
         }
         while let Ok(status) = self.statuses.try_recv() {
             self.current_status = status;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The player's own message for the UI, if one arrived (a decode error, a stalled stream).
+    pub fn take_message(&self) -> Option<String> {
+        match self.messages.try_recv() {
+            Ok(message) => message,
+            Err(_) => None,
         }
     }
 
-    pub fn take_expired_frames(&mut self) -> Vec<std::sync::Arc<RenderImage>> {
-        let expired = self
-            .retired_frames
-            .len()
-            .saturating_sub(RETIRED_FRAME_LIMIT);
-        (0..expired)
-            .filter_map(|_| self.retired_frames.pop_front())
-            .collect()
-    }
-
-    pub fn frame(&self) -> Option<std::sync::Arc<RenderImage>> {
-        self.current_frame.clone()
+    /// The buffer the latest frame landed in, for the view to draw. `None` until the worker
+    /// has made one, which happens on the first frame of a new size.
+    pub fn presented(&self) -> Option<FramePixels> {
+        self.presented.clone()
     }
 
     pub fn frame_size(&self) -> Option<(usize, usize)> {
@@ -355,28 +319,8 @@ impl MpvPlayer {
     }
 
     pub fn discard_pending_frames(&mut self) {
-        while let Ok(frame) = self.frames.try_recv() {
-            let _ = self.recycled_frames.send(frame.pixels);
-        }
-    }
-
-    pub fn take_all_frames(&mut self) -> Vec<Arc<RenderImage>> {
-        let mut frames = Vec::with_capacity(self.retired_frames.len() + 1);
-        if let Some(frame) = self.current_frame.take() {
-            frames.push(frame);
-        }
-        self.current_frame_size = None;
-        self.current_source_size = None;
-        frames.extend(self.retired_frames.drain(..));
-        frames
-    }
-
-    pub fn debug_frame_counts(&self) -> (bool, usize) {
-        (self.current_frame.is_some(), self.retired_frames.len())
-    }
-
-    pub fn recycle_frame(&self, frame: Arc<RenderImage>) {
-        let _ = frame;
+        while self.frame_targets.try_recv().is_ok() {}
+        self.presented = None;
     }
 
     pub fn status(&self) -> MpvStatus {
@@ -399,9 +343,9 @@ impl Drop for MpvPlayer {
 
 fn run_mpv(
     command_rx: Receiver<PlayerCommand>,
-    frame_tx: SyncSender<FramePacket>,
-    recycled_rx: Receiver<Vec<u8>>,
     status_tx: SyncSender<MpvStatus>,
+    message_tx: SyncSender<Option<String>>,
+    target_tx: SyncSender<FramePixels>,
 ) {
     let mut next_load = None;
     loop {
@@ -420,9 +364,9 @@ fn run_mpv(
                     volume,
                     speed,
                     &command_rx,
-                    &frame_tx,
-                    &recycled_rx,
                     &status_tx,
+                    &message_tx,
+                    &target_tx,
                 ) {
                     SessionExit::Idle => {}
                     SessionExit::Reload(command) => next_load = Some(command),
@@ -456,9 +400,9 @@ fn run_mpv_session(
     volume: f64,
     speed: f64,
     command_rx: &Receiver<PlayerCommand>,
-    frame_tx: &SyncSender<FramePacket>,
-    recycled_rx: &Receiver<Vec<u8>>,
     status_tx: &SyncSender<MpvStatus>,
+    _message_tx: &SyncSender<Option<String>>,
+    target_tx: &SyncSender<FramePixels>,
 ) -> SessionExit {
     unsafe {
         let handle = mpv_create();
@@ -522,8 +466,15 @@ fn run_mpv_session(
         let mut source_height = DEFAULT_FRAME_HEIGHT;
         let mut viewport_size = None;
         let mut buffer_len = render_width * render_height * 4;
-        let mut render_buffer = take_frame_buffer(recycled_rx, buffer_len);
-        let format = CString::new("bgr0").unwrap();
+        let mut render_buffer = vec![0_u8; buffer_len];
+        // The view draws this, and `set` wakes it. One buffer per session: a new one is only
+        // made when the target size changes, which the UI publishes to the window.
+        let mut target = FramePixels::new();
+        let mut published = false;
+        // `rgb0` is the format mpv's own render example uses, and its bytes are already in the
+        // R,G,B,X order `rune::Pixels` wants: only the unused fourth byte has to become opaque,
+        // where GPUI's BGRA target used to need a per-pixel red/blue swap as well.
+        let format = CString::new("rgb0").unwrap();
         let mut size = [render_width as c_int, render_height as c_int];
         let mut stride = render_width * 4;
         let mut render_enabled = true;
@@ -556,9 +507,13 @@ fn run_mpv_session(
                             render_width = width;
                             render_height = height;
                             buffer_len = render_width * render_height * 4;
-                            render_buffer = take_frame_buffer(recycled_rx, buffer_len);
+                            render_buffer = vec![0_u8; buffer_len];
                             size = [render_width as c_int, render_height as c_int];
                             stride = render_width * 4;
+                            // A new size needs a new handle: the view swaps to it and the old
+                            // one, with its GPU slot, goes when the view stops drawing it.
+                            target = FramePixels::new();
+                            published = false;
                         }
                     }
                     command @ (PlayerCommand::SetVolume(_)
@@ -597,9 +552,11 @@ fn run_mpv_session(
                         render_width = width;
                         render_height = height;
                         buffer_len = render_width * render_height * 4;
-                        render_buffer = take_frame_buffer(recycled_rx, buffer_len);
+                        render_buffer = vec![0_u8; buffer_len];
                         size = [render_width as c_int, render_height as c_int];
                         stride = render_width * 4;
+                        target = FramePixels::new();
+                        published = false;
                     }
                     if std::env::var_os("BILIGUGA_MPV_DEBUG").is_some() {
                         eprintln!(
@@ -650,32 +607,24 @@ fn run_mpv_session(
                         }
                         logged_hwdec = true;
                     }
-                    // `bgr0` already matches GPUI's BGRA byte order. Only fill
-                    // the alpha byte; avoid a second full-frame copy and the
-                    // per-pixel red/blue channel swap used by `rgb0`.
+                    // `rgb0` leaves its fourth byte unused: fill it so the frame is opaque
+                    // straight-alpha RGBA, which is what `rune::Pixels::set` takes.
                     for alpha in render_buffer.iter_mut().skip(3).step_by(4) {
                         *alpha = 255;
                     }
-                    match frame_tx.try_send(FramePacket {
-                        pixels: render_buffer,
-                        width: render_width,
-                        height: render_height,
-                        source_width,
-                        source_height,
-                    }) {
-                        Ok(()) => {
-                            render_buffer = take_frame_buffer(recycled_rx, buffer_len);
-                        }
-                        Err(TrySendError::Full(packet)) => {
-                            // The UI is behind. Keep the just-rendered buffer
-                            // and let the next render overwrite it instead of
-                            // growing a queue or waiting for the consumer.
-                            render_buffer = packet.pixels;
-                        }
-                        Err(TrySendError::Disconnected(_)) => {
+                    if !published {
+                        // Hand the view the handle once per size: it draws from here on
+                        // without the view ever running again for a frame.
+                        if target_tx.try_send(target.clone()).is_err() {
                             break 'playback SessionExit::Stop;
                         }
+                        published = true;
                     }
+                    // `set` copies into the buffer the renderer reads and wakes only the
+                    // windows drawing it: no queue, nothing for the view to re-run. Sets
+                    // between two frames coalesce, so a fast decode never backs up.
+                    target.set(render_width as u32, render_height as u32, render_buffer);
+                    render_buffer = vec![0_u8; buffer_len];
                 }
             }
             if last_status.elapsed() >= Duration::from_millis(100) {
@@ -705,14 +654,6 @@ fn run_mpv_session(
         crate::allocator::trim();
         exit
     }
-}
-
-fn take_frame_buffer(recycled_rx: &Receiver<Vec<u8>>, len: usize) -> Vec<u8> {
-    recycled_rx
-        .try_recv()
-        .ok()
-        .filter(|pixels| pixels.len() == len)
-        .unwrap_or_else(|| vec![0_u8; len])
 }
 
 unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {

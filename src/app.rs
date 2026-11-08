@@ -1,54 +1,54 @@
+//! The window: state, the async work behind it, and the Rune view that draws it.
+//!
+//! The shape of this file follows Rune's model rather than GPUI's. There are three pieces:
+//!
+//! * [`BiliGuga`] is plain state. Handlers get `&mut BiliGuga` and change it directly; nothing
+//!   is leased out of a store, so a handler can never panic on re-entering the view.
+//! * [`Worker`] owns every async request. Each call spawns onto the shared tokio runtime,
+//!   funnels its answer into one `mpsc` channel as an [`Event`], and wakes the window through
+//!   the `Waker` Rune hands us in `setup`. `poll` drains that channel once per frame.
+//! * [`view`] is a pure function of `&BiliGuga`: it builds the whole `El` tree on the frames
+//!   that need one, and the runtime diffs it against the last commit by key.
+//!
+//! Player frames are the one thing that never goes through `poll`: mpv's worker thread writes
+//! straight into a `rune::Pixels`, which the renderer uploads without re-running the view.
+//! That is why a 1080p video does not rebuild the feed 30 times a second.
+
 use crate::{
     api::{
-        PlayQuality, add_to_favorites, add_to_watch_later, coin_video, download_avatar,
-        fetch_author_videos, fetch_comments, fetch_dynamic_feed, fetch_favorites, fetch_history,
-        fetch_last_play_progress, fetch_recommendations, fetch_search_results, fetch_video_context,
-        fetch_watch_later, format_publish_date, format_time, like_video, quality_label,
-        queue_cover_download,
-        report_video_heartbeat, report_video_progress, resolve_play_url,
+        self, PlayQuality, fetch_author_videos, fetch_comments, fetch_dynamic_feed,
+        fetch_favorites, fetch_history, fetch_last_play_progress, fetch_recommendations,
+        fetch_search_results, fetch_video_context, fetch_watch_later, format_publish_date,
+        format_time, queue_cover_download, report_video_heartbeat, report_video_progress,
+        resolve_play_url,
     },
     login::{self, PollResult, UserSession},
-    model::{Comment, Video, VideoCollection},
+    model::{Comment, Rgba8, Video, VideoCollection},
     mpv, network,
     power::PowerInhibitor,
-    search_input::{SearchInput, bind_search_keys},
 };
-use futures::{
-    FutureExt,
-    future::BoxFuture,
-    stream::{FuturesUnordered, StreamExt},
-};
-use gpui::{
-    App, Application, AssetSource, Bounds, ClickEvent, Context, DispatchPhase, Entity, FocusHandle,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    RenderImage, ScrollStrategy, ScrollWheelEvent, SharedString, Timer, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
-    svg, uniform_list,
+use rune::tok::type_;
+use rune::{
+    AppSpec, Color, Cx, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, Pixels, ScrollSpec,
+    SurfaceFit, TextEdit, Tx, Waker, col, el, row, text, text_input,
 };
 use std::{
     fs,
-    ops::Range,
     path::PathBuf,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
 const HOME_MAX_ITEMS: usize = 120;
-const HOME_PREFETCH_ITEMS: usize = 4;
-const HOME_GRID_ROW_HEIGHT: f32 = 170.;
-const HOME_GRID_CARD_WIDTH: f32 = 190.;
 const SPEED_OPTIONS: [f64; 5] = [0.5, 1., 1.25, 1.5, 2.];
-const WINDOW_FULLSCREEN_ICON: &str = "icons/window-fullscreen.svg";
-const WINDOW_FULLSCREEN_EXIT_ICON: &str = "icons/window-fullscreen-exit.svg";
-const SCREEN_FULLSCREEN_ICON: &str = "icons/screen-fullscreen.svg";
-const SCREEN_FULLSCREEN_EXIT_ICON: &str = "icons/screen-fullscreen-exit.svg";
 const DEFAULT_VOLUME: f64 = 100.;
 const DEFAULT_SPEED: f64 = 1.;
-
-struct AppAssets;
+const SIDEBAR_WIDTH: f32 = 64.;
+const FEED_WIDTH: f32 = 414.;
+const GRID_CARD_HEIGHT: f32 = 170.;
+const GRID_CARD_WIDTH: f32 = 190.;
+/// How long the player's controls stay up after the pointer moves.
+const CONTROLS_LINGER: Duration = Duration::from_millis(2400);
 
 fn player_settings_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
@@ -104,122 +104,55 @@ fn save_player_settings(volume: f64, speed: f64) {
     let _ = fs::write(path, value.to_string());
 }
 
-impl AssetSource for AppAssets {
-    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        let asset = match path {
-            WINDOW_FULLSCREEN_ICON => {
-                include_bytes!("../assets/icons/window-fullscreen.svg").as_slice()
-            }
-            WINDOW_FULLSCREEN_EXIT_ICON => {
-                include_bytes!("../assets/icons/window-fullscreen-exit.svg").as_slice()
-            }
-            SCREEN_FULLSCREEN_ICON => {
-                include_bytes!("../assets/icons/screen-fullscreen.svg").as_slice()
-            }
-            SCREEN_FULLSCREEN_EXIT_ICON => {
-                include_bytes!("../assets/icons/screen-fullscreen-exit.svg").as_slice()
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(std::borrow::Cow::Borrowed(asset)))
+/// The app's colours, in Rune's linear-sRGB `Color`. They mirror the old GPUI theme so the
+/// look carries over: near-black slate with an indigo accent.
+mod theme {
+    use rune::{Color, oklch};
+
+    pub(super) fn bg() -> Color {
+        oklch(0.185, 0.02, 265.0)
+    }
+    pub(super) fn panel() -> Color {
+        oklch(0.215, 0.022, 265.0)
+    }
+    pub(super) fn feed() -> Color {
+        oklch(0.205, 0.021, 265.0)
+    }
+    pub(super) fn border() -> Color {
+        oklch(0.30, 0.022, 265.0)
+    }
+    pub(super) fn text() -> Color {
+        oklch(0.94, 0.004, 265.0)
+    }
+    pub(super) fn text_dim() -> Color {
+        oklch(0.72, 0.012, 265.0)
+    }
+    pub(super) fn text_faint() -> Color {
+        oklch(0.58, 0.014, 265.0)
+    }
+    pub(super) fn accent() -> Color {
+        oklch(0.62, 0.19, 285.0)
+    }
+    pub(super) fn accent_soft() -> Color {
+        oklch(0.72, 0.15, 285.0)
+    }
+    pub(super) fn hover() -> Color {
+        oklch(0.245, 0.024, 265.0)
+    }
+    pub(super) fn active_row() -> Color {
+        oklch(0.28, 0.05, 280.0)
+    }
+    pub(super) fn danger() -> Color {
+        oklch(0.66, 0.16, 25.0)
+    }
+    pub(super) fn track() -> Color {
+        oklch(0.42, 0.02, 265.0)
     }
 
-    fn list(&self, _: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(Vec::new())
+    /// The placeholder colour a cover shows before its pixels arrive.
+    pub(super) fn cover_placeholder(accent: u32) -> Color {
+        rune::color::hex(&format!("#{accent:06x}")).unwrap_or(Color::BLACK)
     }
-}
-
-struct BiliGuga {
-    root_focus: FocusHandle,
-    search_input: Entity<SearchInput>,
-    search_query: String,
-    active_tab: AppTab,
-    videos: Vec<Video>,
-    home_page: usize,
-    home_loading: bool,
-    home_has_more: bool,
-    home_generation: u64,
-    home_scroll_handle: UniformListScrollHandle,
-    collection_scroll_handle: UniformListScrollHandle,
-    home_scroll_requested: bool,
-    home_last_scroll_offset: Option<Pixels>,
-    home_feed_mid: Option<i64>,
-    search_results: Vec<Video>,
-    history: Vec<Video>,
-    watch_later: Vec<Video>,
-    favorites: Vec<Video>,
-    dynamic_videos: Vec<Video>,
-    author_videos: Vec<Video>,
-    author_mid: i64,
-    author_name: String,
-    author_page: usize,
-    author_has_more: bool,
-    author_loading: bool,
-    author_generation: u64,
-    selected: usize,
-    loading: bool,
-    history_loading: bool,
-    watch_later_loading: bool,
-    favorites_loading: bool,
-    dynamic_loading: bool,
-    cover_loading: bool,
-    cover_generation: u64,
-    cover_cancelled: Arc<AtomicBool>,
-    feed_generation: u64,
-    session: Option<UserSession>,
-    account_avatar: Option<Arc<RenderImage>>,
-    login_image: Option<Arc<RenderImage>>,
-    login_key: Option<String>,
-    login_loading: bool,
-    login_status: SharedString,
-    login_generation: u64,
-    playback: PlaybackState,
-    pending_pause: Option<bool>,
-    playback_request: u64,
-    volume: f64,
-    speed: f64,
-    quality: u32,
-    quality_options: Vec<PlayQuality>,
-    speed_menu_open: bool,
-    quality_menu_open: bool,
-    menu_closed_by_outside: Option<PlayerMenu>,
-    volume_dragging: bool,
-    seek_dragging: bool,
-    controls_visible: bool,
-    controls_opacity: f32,
-    controls_generation: u64,
-    controls_animation_generation: u64,
-    player_fullscreen: bool,
-    screen_fullscreen: bool,
-    playing_video: Option<Video>,
-    player_viewport_size: Option<(usize, usize)>,
-    detail_view_count: SharedString,
-    detail_danmaku_count: SharedString,
-    detail_like_count: SharedString,
-    published_at: SharedString,
-    playback_error: Option<SharedString>,
-    cloud_resume_progress: Option<f64>,
-    cloud_resume_applied: bool,
-    pending_seek: Option<f64>,
-    collection: Option<VideoCollection>,
-    collection_loading: bool,
-    collection_menu_open: bool,
-    collection_cover_loading: bool,
-    collection_cover_generation: u64,
-    collection_cover_cancelled: Arc<AtomicBool>,
-    history_report_at: Instant,
-    history_report_in_flight: bool,
-    pending_cover_drops: Vec<Arc<RenderImage>>,
-    comments: Vec<Comment>,
-    comments_for: String,
-    comments_page: u32,
-    comments_total: i64,
-    comments_has_more: bool,
-    comments_loading: bool,
-    comments_generation: u64,
-    comments_error: Option<SharedString>,
-    power_inhibitor: PowerInhibitor,
-    player: mpv::MpvPlayer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,29 +182,186 @@ enum PlayerMenu {
     Collection,
 }
 
+/// One answer from background work, drained by `poll` at the top of a frame.
+enum Event {
+    Home(Result<api::RecommendationPage, String>, u64),
+    Search(Result<Vec<Video>, String>),
+    Dynamic(Result<Vec<Video>, String>),
+    History(Result<Vec<Video>, String>),
+    WatchLater(Result<Vec<Video>, String>),
+    Favorites(Result<Vec<Video>, String>),
+    Author(Result<api::AuthorVideoPage, String>, u64),
+    VideoContext(Box<api::VideoContext>),
+    PlayUrl(Result<api::PlayUrlResult, String>),
+    Resume(Option<f64>),
+    Comments(Result<(usize, Vec<Comment>, i64, bool), String>, u64),
+    Avatar(Option<Arc<Rgba8>>),
+    QrCode(Result<login::QrCodeData, String>, u64),
+    QrPoll(Result<PollResult, String>, u64),
+    Session(Result<UserSession, String>),
+    Action(&'static str),
+    /// Text for the player's status line, or its error.
+    PlaybackMessage(Option<String>),
+    /// A cover arrived: which feed generation, which index by bvid, and its pixels.
+    Cover(String, Arc<Rgba8>),
+}
+
+/// Everything that talks to the network or the player. All of it is one-way: an [`Event`]
+/// comes back through `events`, and the `Waker` brings the window round to collect it.
+struct Worker {
+    events: std::sync::mpsc::Sender<Event>,
+    waker: Waker,
+}
+
+impl Worker {
+    fn wake(&self) {
+        (self.waker)();
+    }
+
+    fn send(&self, event: Event) {
+        // A closed channel means the window is gone; the work is simply dropped.
+        if self.events.send(event).is_ok() {
+            self.wake();
+        }
+    }
+
+    /// Runs `future` on the shared tokio runtime and turns its output into an `Event`.
+    fn spawn<F>(&self, future: F, wrap: impl FnOnce(F::Output) -> Event + Send + 'static)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        network::detach(async move {
+            let output = future.await;
+            if events.send(wrap(output)).is_ok() {
+                waker();
+            }
+        });
+    }
+
+    fn spawn_quiet<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        network::detach(future);
+    }
+}
+
+/// Cover downloads in flight, keyed by bvid, so scrolling past a card twice does not fetch it
+/// twice. Covers land as `Event::Cover` and are attached to whichever feed row matches.
+struct Covers {
+    requested: Arc<AtomicBool>,
+}
+
+pub(crate) struct BiliGuga {
+    // Identity and navigation.
+    search_edit: TextEdit,
+    search_query: String,
+    active_tab: AppTab,
+    // Feeds. Only one is shown at a time; `selected` indexes into whichever that is.
+    videos: Vec<Video>,
+    search_results: Vec<Video>,
+    history: Vec<Video>,
+    watch_later: Vec<Video>,
+    favorites: Vec<Video>,
+    dynamic_videos: Vec<Video>,
+    author_videos: Vec<Video>,
+    author_mid: i64,
+    author_name: String,
+    author_page: usize,
+    author_has_more: bool,
+    author_loading: bool,
+    author_generation: u64,
+    /// The row the keyboard and the highlight are on, `None` until the user picks one: an
+    /// unplayed feed should not claim its first row is chosen.
+    selected: Option<usize>,
+    loading: bool,
+    history_loading: bool,
+    watch_later_loading: bool,
+    favorites_loading: bool,
+    dynamic_loading: bool,
+    // Paging.
+    home_page: usize,
+    home_loading: bool,
+    home_has_more: bool,
+    home_generation: u64,
+    // Account and login.
+    session: Option<UserSession>,
+    account_avatar: Option<Image>,
+    login_qr: Option<Image>,
+    login_key: Option<String>,
+    login_loading: bool,
+    login_status: String,
+    login_generation: u64,
+    // Player.
+    playback: PlaybackState,
+    pending_pause: Option<bool>,
+    volume: f64,
+    speed: f64,
+    quality: u32,
+    quality_options: Vec<PlayQuality>,
+    open_menu: Option<PlayerMenu>,
+    seek_dragging: bool,
+    volume_dragging: bool,
+    controls_until: Option<Instant>,
+    player_fullscreen: bool,
+    screen_fullscreen: bool,
+    playing_video: Option<Video>,
+    player_viewport_size: Option<(usize, usize)>,
+    detail_view_count: String,
+    detail_danmaku_count: String,
+    detail_like_count: String,
+    published_at: String,
+    playback_error: Option<String>,
+    cloud_resume_progress: Option<f64>,
+    cloud_resume_applied: bool,
+    pending_seek: Option<f64>,
+    collection: Option<VideoCollection>,
+    collection_loading: bool,
+    history_report_at: Instant,
+    history_report_in_flight: bool,
+    // Comments.
+    comments: Vec<Comment>,
+    comments_for: String,
+    comments_page: u32,
+    comments_total: i64,
+    comments_has_more: bool,
+    comments_loading: bool,
+    comments_generation: u64,
+    comments_error: Option<String>,
+    // Runtime plumbing.
+    power_inhibitor: PowerInhibitor,
+    player: mpv::MpvPlayer,
+    /// The frame the player's worker writes into. The renderer uploads it without the view
+    /// running again, which is what keeps playback off the layout path.
+    frame_pixels: Pixels,
+    covers: Covers,
+    images: Option<ImageCache>,
+    worker: Option<Worker>,
+    events: std::sync::mpsc::Receiver<Event>,
+    /// Covers already decoded, by bvid. Rune's `Image` is a cheap shared handle, so one lookup
+    /// per card per frame costs nothing and no bytes are hashed again.
+    cover_images: std::collections::HashMap<String, Image>,
+    /// The playhead the clock last showed, so `poll` reports a change only when the bar moves.
+    last_position: f64,
+}
+
 impl BiliGuga {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new() -> Self {
         let session = login::load_session();
         let (volume, speed) = load_player_settings();
         let login_status = session
             .as_ref()
             .map(|session| format!("已登录：{}", session.username))
             .unwrap_or_else(|| "使用哔哩哔哩 App 扫码登录".into());
+        let (events_tx, events) = std::sync::mpsc::channel();
         Self {
-            root_focus: cx.focus_handle(),
-            search_input: cx.new(SearchInput::new),
+            search_edit: TextEdit::new(""),
             search_query: String::new(),
             active_tab: AppTab::Home,
             videos: Vec::new(),
-            home_page: 0,
-            home_loading: true,
-            home_has_more: true,
-            home_generation: 0,
-            home_scroll_handle: UniformListScrollHandle::new(),
-            collection_scroll_handle: UniformListScrollHandle::new(),
-            home_scroll_requested: false,
-            home_last_scroll_offset: None,
-            home_feed_mid: None,
             search_results: Vec::new(),
             history: Vec::new(),
             watch_later: Vec::new(),
@@ -284,60 +374,49 @@ impl BiliGuga {
             author_has_more: false,
             author_loading: false,
             author_generation: 0,
-            selected: 0,
+            selected: None,
             loading: true,
             history_loading: false,
             watch_later_loading: false,
             favorites_loading: false,
             dynamic_loading: false,
-            cover_loading: false,
-            cover_generation: 0,
-            cover_cancelled: Arc::new(AtomicBool::new(false)),
-            feed_generation: 0,
+            home_page: 0,
+            home_loading: true,
+            home_has_more: true,
+            home_generation: 0,
             session,
             account_avatar: None,
-            login_image: None,
+            login_qr: None,
             login_key: None,
             login_loading: false,
-            login_status: SharedString::from(login_status),
+            login_status,
             login_generation: 0,
             playback: PlaybackState::Idle,
             pending_pause: None,
-            playback_request: 0,
             volume,
             speed,
             quality: 64,
             quality_options: Vec::new(),
-            speed_menu_open: false,
-            quality_menu_open: false,
-            menu_closed_by_outside: None,
-            volume_dragging: false,
+            open_menu: None,
             seek_dragging: false,
-            controls_visible: false,
-            controls_opacity: 0.,
-            controls_generation: 0,
-            controls_animation_generation: 0,
+            volume_dragging: false,
+            controls_until: None,
             player_fullscreen: false,
             screen_fullscreen: false,
             playing_video: None,
             player_viewport_size: None,
-            detail_view_count: SharedString::from("—"),
-            detail_danmaku_count: SharedString::from("—"),
-            detail_like_count: SharedString::from("—"),
-            published_at: SharedString::from("发布时间未知"),
+            detail_view_count: "—".into(),
+            detail_danmaku_count: "—".into(),
+            detail_like_count: "—".into(),
+            published_at: "发布时间未知".into(),
             playback_error: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
             pending_seek: None,
             collection: None,
             collection_loading: false,
-            collection_menu_open: false,
-            collection_cover_loading: false,
-            collection_cover_generation: 0,
-            collection_cover_cancelled: Arc::new(AtomicBool::new(false)),
             history_report_at: Instant::now(),
             history_report_in_flight: false,
-            pending_cover_drops: Vec::new(),
             comments: Vec::new(),
             comments_for: String::new(),
             comments_page: 0,
@@ -348,7 +427,25 @@ impl BiliGuga {
             comments_error: None,
             power_inhibitor: PowerInhibitor::default(),
             player: mpv::MpvPlayer::new(),
+            frame_pixels: Pixels::new(),
+            covers: Covers {
+                requested: Arc::new(AtomicBool::new(false)),
+            },
+            images: None,
+            worker: Some(Worker {
+                events: events_tx,
+                waker: Arc::new(|| {}),
+            }),
+            events,
+            cover_images: std::collections::HashMap::new(),
+            last_position: 0.,
         }
+    }
+}
+
+impl BiliGuga {
+    fn worker(&self) -> &Worker {
+        self.worker.as_ref().expect("worker is installed in setup")
     }
 
     fn current_videos(&self) -> &Vec<Video> {
@@ -377,56 +474,30 @@ impl BiliGuga {
         }
     }
 
-    fn selected_video_ref(&self) -> Option<&Video> {
+    fn selected_video(&self) -> Option<&Video> {
         self.playing_video
             .as_ref()
-            .or_else(|| self.current_videos().get(self.selected))
-    }
-
-    fn pin_playing_video(&mut self, video: &Video) {
-        let mut video = video.clone();
-        video.cover_image = None;
-        self.playing_video = Some(video);
+            .or_else(|| {
+                self.selected
+                    .and_then(|selected| self.current_videos().get(selected))
+            })
     }
 
     fn trim_home_items(&mut self) {
         if self.videos.len() <= HOME_MAX_ITEMS {
             return;
         }
-        let excess = self.videos.len() - HOME_MAX_ITEMS;
-        let remove_count = excess.min(self.videos.len());
-        let removed: Vec<_> = self.videos.drain(..remove_count).collect();
-        for mut video in removed {
-            if let Some(image) = video.cover_image.take() {
-                self.pending_cover_drops.push(image);
-            }
-        }
-        if self.selected >= remove_count {
-            self.selected -= remove_count;
-        } else {
-            self.selected = 0;
-        }
-
-        let handle = self.home_scroll_handle.0.borrow().base_handle.clone();
-        let offset = handle.offset();
-        let removed_rows = (remove_count + 1) / 2;
-        handle.set_offset(point(
-            offset.x,
-            offset.y + px(removed_rows as f32 * HOME_GRID_ROW_HEIGHT),
-        ));
-        self.home_last_scroll_offset = Some(
-            offset.y + px(removed_rows as f32 * HOME_GRID_ROW_HEIGHT),
-        );
+        let remove_count = self.videos.len() - HOME_MAX_ITEMS;
+        self.videos.drain(..remove_count);
+        self.selected = self
+            .selected
+            .map(|selected| selected.saturating_sub(remove_count));
     }
 
-    fn reset_home_scroll(&mut self) {
-        let handle = self.home_scroll_handle.0.borrow().base_handle.clone();
-        handle.set_offset(point(px(0.), px(0.)));
-        self.home_last_scroll_offset = Some(px(0.));
-    }
+    // ---- Feeds ---------------------------------------------------------------------------
 
-    fn load_home_page(&mut self, cx: &mut Context<Self>, reset: bool) {
-        if (!reset && self.home_loading) || (!reset && !self.home_has_more) {
+    fn load_home_page(&mut self, reset: bool) {
+        if !reset && (self.home_loading || !self.home_has_more) {
             return;
         }
         if reset {
@@ -435,726 +506,82 @@ impl BiliGuga {
             self.home_has_more = true;
             self.loading = true;
             self.videos.clear();
-            self.selected = 0;
-            self.home_scroll_requested = false;
-            self.reset_home_scroll();
+            self.selected = None;
         }
         let page = self.home_page + 1;
         let generation = self.home_generation;
         let cookie = self.session.as_ref().map(|session| session.cookie.clone());
         self.home_loading = true;
-        self.home_scroll_requested = false;
-        if reset {
-        } else {
-        }
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(
-                        async move { fetch_recommendations(page, cookie.as_deref()).await },
-                    )
-                    .await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                if app.home_generation != generation || app.active_tab != AppTab::Home {
-                    return;
-                }
-                app.home_loading = false;
-                app.loading = false;
-                app.home_scroll_requested = false;
-                match result {
-                    Ok(videos) => {
-                        let has_more = videos.has_more;
-                        let videos = videos.videos;
-                        let old_len = app.videos.len();
-                        if reset {
-                            app.videos = videos;
-                        } else {
-                            for video in videos {
-                                if !app.videos.iter().any(|current| current.bvid == video.bvid) {
-                                    app.videos.push(video);
-                                }
-                            }
-                        }
-                        app.home_page = page;
-                        app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
-                        let added = app.videos.len().saturating_sub(old_len);
-                        app.home_has_more = has_more && (reset || added > 0);
-                        app.trim_home_items();
-                        app.start_cover_loading(cx);
-                    }
-                    Err(_error) => {
-                        app.home_has_more = false;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn maybe_load_home_page(&mut self, cx: &mut Context<Self>) {
-        if self.active_tab != AppTab::Home
-            || self.loading
-            || self.home_loading
-            || !self.home_has_more
-            || self.videos.is_empty()
-        {
-            return;
-        }
-
-        let current_scroll_offset = {
-            let state = self.home_scroll_handle.0.borrow();
-            state.base_handle.offset().y
-        };
-        if self
-            .home_last_scroll_offset
-            .is_some_and(|last| last != current_scroll_offset)
-        {
-            self.home_scroll_requested = true;
-        }
-        self.home_last_scroll_offset = Some(current_scroll_offset);
-
-        if !self.home_scroll_requested {
-            return;
-        }
-        let near_bottom = {
-            let state = self.home_scroll_handle.0.borrow();
-            let offset = state.base_handle.offset();
-            let max_offset = state.base_handle.max_offset();
-            let remaining = max_offset.height + offset.y;
-            max_offset.height > px(0.)
-                && remaining <= px(HOME_GRID_ROW_HEIGHT * HOME_PREFETCH_ITEMS as f32)
-        };
-        if near_bottom {
-            self.load_home_page(cx, false);
-        }
-    }
-
-    fn queue_history_report(&mut self, cx: &mut Context<Self>, play_type: i64) {
-        if self.history_report_in_flight || self.session.is_none() {
-            return;
-        }
-        let Some(video) = self.selected_video_ref().cloned() else {
-            return;
-        };
-        let status = self.player.status();
-        if !status.time_pos.is_finite() || video.aid <= 0 || video.cid <= 0 {
-            return;
-        }
-        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
-            return;
-        };
-        self.history_report_in_flight = true;
-        self.history_report_at = Instant::now();
-        let progress = status.time_pos.max(0.);
-        let aid = video.aid;
-        let cid = video.cid;
-        let heartbeat_video = video.clone();
-        cx.spawn(async move |view, cx| {
-            let (heartbeat_result, progress_result) = cx
-                .background_spawn(async move {
-                    let heartbeat_cookie = cookie.clone();
-                    let progress_cookie = cookie;
-                    futures::join!(
-                        network::run(async move {
-                            report_video_heartbeat(
-                                &heartbeat_cookie,
-                                &heartbeat_video,
-                                progress,
-                                play_type,
-                            )
-                            .await
-                        }),
-                        network::run(async move {
-                            report_video_progress(&progress_cookie, aid, cid, progress).await
-                        })
-                    )
-                })
-                .await;
-            view.update(cx, |app, _| {
-                app.history_report_in_flight = false;
-                if let Err(error) = heartbeat_result {
-                    if std::env::var_os("BILIGUGA_API_DEBUG").is_some() {
-                        eprintln!("[biliguga-history] {error}");
-                    }
-                }
-                if let Err(error) = progress_result {
-                    if std::env::var_os("BILIGUGA_API_DEBUG").is_some() {
-                        eprintln!("[biliguga-history] {error}");
-                    }
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn note_home_scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.active_tab == AppTab::Home && event.delta.pixel_delta(px(20.)).y < px(0.) {
-            self.home_scroll_requested = true;
-            cx.notify();
-        }
-    }
-
-    fn drop_player_frames(&mut self, frames: Vec<Arc<RenderImage>>, window: &mut Window) {
-        for frame in frames {
-            let _ = window.drop_image(frame.clone());
-            self.player.recycle_frame(frame);
-        }
-    }
-
-    fn reset_comments(&mut self) {
-        self.comments_generation = self.comments_generation.wrapping_add(1);
-        self.comments.clear();
-        self.comments_for.clear();
-        self.comments_page = 0;
-        self.comments_total = 0;
-        self.comments_has_more = false;
-        self.comments_loading = false;
-        self.comments_error = None;
-    }
-
-    fn load_comments_for_current(&mut self, cx: &mut Context<Self>) {
-        let Some(video) = self.selected_video_ref().cloned() else {
-            self.reset_comments();
-            return;
-        };
-        if self.comments_for != video.bvid {
-            self.comments_generation = self.comments_generation.wrapping_add(1);
-            self.comments.clear();
-            self.comments_for = video.bvid.clone();
-            self.comments_page = 0;
-            self.comments_total = 0;
-            self.comments_has_more = true;
-            self.comments_loading = false;
-            self.comments_error = None;
-        }
-        if self.comments_page == 0 && !self.comments_loading {
-            self.load_comments_page(cx, true);
-        }
-    }
-
-    fn load_comments_page(&mut self, cx: &mut Context<Self>, reset: bool) {
-        let Some(video) = self.selected_video_ref().cloned() else {
-            return;
-        };
-        if self.comments_loading || (!reset && !self.comments_has_more) {
-            return;
-        }
-        if reset {
-            self.comments_generation = self.comments_generation.wrapping_add(1);
-            self.comments.clear();
-            self.comments_page = 0;
-            self.comments_total = 0;
-            self.comments_has_more = true;
-            self.comments_error = None;
-        }
-        let page = self.comments_page + 1;
-        self.comments_loading = true;
-        let generation = self.comments_generation;
-        let bvid = video.bvid.clone();
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(
-                        async move { fetch_comments(&video, cookie.as_deref(), page).await },
-                    )
-                    .await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                if app.comments_generation != generation
-                    || app
-                        .selected_video_ref()
-                        .map(|current| current.bvid != bvid)
-                        .unwrap_or(true)
-                {
-                    return;
-                }
-                app.comments_loading = false;
-                match result {
-                    Ok(comment_page) => {
-                        app.comments.extend(comment_page.comments);
-                        app.comments_page = page;
-                        app.comments_total = comment_page.total;
-                        app.comments_has_more = comment_page.has_more;
-                        app.comments_error = None;
-                    }
-                    Err(error) => {
-                        app.comments_has_more = false;
-                        app.comments_error = Some(SharedString::from(error));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn retry_comments(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.load_comments_page(cx, true);
-    }
-
-    fn load_more_comments(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.load_comments_page(cx, false);
-    }
-
-    fn leave_current_tab(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.debug_memory("before-tab-leave");
-        if self.active_tab == AppTab::Home {
-            self.home_generation = self.home_generation.wrapping_add(1);
-            self.home_loading = false;
-        }
-        if self.active_tab == AppTab::Author {
-            self.author_generation = self.author_generation.wrapping_add(1);
-            self.author_loading = false;
-        }
-        self.reset_cover_loading();
-        self.debug_memory("after-tab-leave");
-    }
-
-    fn debug_memory_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("BILIGUGA_MEM_DEBUG").is_some())
-    }
-
-    fn debug_memory(&self, label: &str) {
-        if !Self::debug_memory_enabled() {
-            return;
-        }
-
-        let memory = fs::read_to_string("/proc/self/status")
-            .ok()
-            .map(|status| {
-                let value = |name: &str| {
-                    status
-                        .lines()
-                        .find_map(|line| line.strip_prefix(name))
-                        .and_then(|value| value.split_whitespace().next())
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0)
-                };
-                (
-                    value("VmRSS:"),
-                    value("RssAnon:"),
-                    value("RssFile:"),
-                    value("Threads:"),
-                )
-            })
-            .unwrap_or_default();
-        let covers = |videos: &[Video]| {
-            videos
-                .iter()
-                .filter(|video| video.cover_image.is_some())
-                .count()
-        };
-        let (current_frame, retired_frames) = self.player.debug_frame_counts();
-        eprintln!(
-            concat!(
-                "[biliguga-mem] {} rss={}KB anon={}KB file={}KB threads={} tab={:?} ",
-                "videos={{home:{}/{},search:{}/{},dynamic:{}/{},watch:{}/{},",
-                "favorites:{}/{},history:{}/{}}} ",
-                "player={{current:{},retired:{}}} covers={{home:{},search:{},dynamic:{},watch:{},favorites:{},history:{}}}"
-            ),
-            label,
-            memory.0,
-            memory.1,
-            memory.2,
-            memory.3,
-            self.active_tab,
-            self.videos.len(),
-            covers(&self.videos),
-            self.search_results.len(),
-            covers(&self.search_results),
-            self.dynamic_videos.len(),
-            covers(&self.dynamic_videos),
-            self.watch_later.len(),
-            covers(&self.watch_later),
-            self.favorites.len(),
-            covers(&self.favorites),
-            self.history.len(),
-            covers(&self.history),
-            current_frame,
-            retired_frames,
-            covers(&self.videos),
-            covers(&self.search_results),
-            covers(&self.dynamic_videos),
-            covers(&self.watch_later),
-            covers(&self.favorites),
-            covers(&self.history),
+        self.worker().spawn(
+            async move { fetch_recommendations(page, cookie.as_deref()).await },
+            move |result| Event::Home(result, generation),
         );
     }
 
-    fn debug_image(label: &str, image: &Arc<RenderImage>, key: &str) {
-        if std::env::var_os("BILIGUGA_IMAGE_DEBUG").is_some() {
-            eprintln!(
-                "[biliguga-image] {} key={} id={} strong_count={}",
-                label,
-                key,
-                image.id.0,
-                Arc::strong_count(image),
-            );
-        }
-    }
-
-    fn release_cover_images(videos: &mut Vec<Video>, window: &mut Window) {
-        for video in videos {
-            if let Some(image) = video.cover_image.take() {
-                Self::debug_image("release", &image, &video.bvid);
-                let _ = window.drop_image(image);
-            }
-        }
-    }
-
-    fn release_image(image: &mut Option<Arc<RenderImage>>, window: &mut Window) {
-        if let Some(image) = image.take() {
-            Self::debug_image("release-special", &image, "special");
-            let _ = window.drop_image(image);
-        }
-    }
-
-    fn reset_cover_loading(&mut self) {
-        self.cover_cancelled.store(true, Ordering::Release);
-        self.cover_cancelled = Arc::new(AtomicBool::new(false));
-        self.cover_generation = self.cover_generation.wrapping_add(1);
-        self.cover_loading = false;
-    }
-
-    fn reset_collection_cover_loading(&mut self) {
-        self.collection_cover_cancelled
-            .store(true, Ordering::Release);
-        self.collection_cover_cancelled = Arc::new(AtomicBool::new(false));
-        self.collection_cover_generation = self.collection_cover_generation.wrapping_add(1);
-        self.collection_cover_loading = false;
-    }
-
-    fn clear_collection(&mut self, window: &mut Window) {
-        self.reset_collection_cover_loading();
-        if let Some(mut collection) = self.collection.take() {
-            for episode in &mut collection.episodes {
-                Self::release_image(&mut episode.cover_image, window);
-            }
-        }
-        self.collection_menu_open = false;
-    }
-
-    fn release_active_cover_images(&mut self, window: &mut Window) {
-        match self.active_tab {
-            AppTab::Home => Self::release_cover_images(&mut self.videos, window),
-            AppTab::Search => Self::release_cover_images(&mut self.search_results, window),
-            AppTab::Dynamic => Self::release_cover_images(&mut self.dynamic_videos, window),
-            AppTab::WatchLater => Self::release_cover_images(&mut self.watch_later, window),
-            AppTab::Favorites => Self::release_cover_images(&mut self.favorites, window),
-            AppTab::History => Self::release_cover_images(&mut self.history, window),
-            AppTab::Author => Self::release_cover_images(&mut self.author_videos, window),
-            AppTab::Login => {}
-        }
-    }
-
-    fn show_home(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tab != AppTab::Home {
-            self.leave_current_tab(window, cx);
-            self.active_tab = AppTab::Home;
-            let current_mid = self.session.as_ref().map(|session| session.mid);
-            if (!self.home_loading && self.home_feed_mid != current_mid)
-                || (self.videos.is_empty() && !self.home_loading)
-            {
-                Self::release_cover_images(&mut self.videos, window);
-                self.reset_cover_loading();
-                self.load_home_page(cx, true);
-            } else {
-                self.start_cover_loading(cx);
-            }
-            cx.notify();
-        }
-    }
-
-    fn show_search(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tab != AppTab::Search {
-            self.leave_current_tab(window, cx);
-            self.active_tab = AppTab::Search;
-            self.start_cover_loading(cx);
-            cx.notify();
-        }
-    }
-
-    fn show_dynamic(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window, cx);
-        self.active_tab = AppTab::Dynamic;
-        if self.session.is_none() {
-            cx.notify();
+    fn load_search(&mut self) {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
             return;
         }
-        if self.dynamic_videos.is_empty() && !self.dynamic_loading {
-            self.load_dynamic(cx, true);
-        } else {
-            self.start_cover_loading(cx);
-            cx.notify();
-        }
+        self.active_tab = AppTab::Search;
+        self.loading = true;
+        self.search_results.clear();
+        self.selected = None;
+        self.worker().spawn(
+            async move { fetch_search_results(&query).await },
+            Event::Search,
+        );
     }
 
-    fn load_dynamic(&mut self, cx: &mut Context<Self>, reset: bool) {
-        let Some(session) = &self.session else {
-            cx.notify();
-            return;
-        };
-        let cookie = session.cookie.clone();
-        if self.dynamic_loading {
-            return;
-        }
-        if reset {
+    fn load_dynamic(&mut self) {
+        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
             self.dynamic_videos.clear();
-            self.reset_cover_loading();
-            self.selected = 0;
-        }
+            return;
+        };
         self.dynamic_loading = true;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(async move { fetch_dynamic_feed(&cookie).await }).await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                app.dynamic_loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.dynamic_videos = videos;
-                        if app.active_tab == AppTab::Dynamic {
-                            app.start_cover_loading(cx);
-                        }
-                    }
-                    Err(_error) => {
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.worker()
+            .spawn(async move { fetch_dynamic_feed(&cookie).await }, Event::Dynamic);
     }
 
-    fn refresh_dynamic(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.release_active_cover_images(window);
-        self.load_dynamic(cx, true);
-    }
-
-    fn show_history(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window, cx);
-        self.active_tab = AppTab::History;
-        if self.session.is_none() {
-            cx.notify();
-            return;
-        }
-        if self.history.is_empty() && !self.history_loading {
-            self.load_history(cx);
-        } else {
-            self.start_cover_loading(cx);
-            cx.notify();
-        }
-    }
-
-    fn load_history(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            cx.notify();
+    fn load_history(&mut self) {
+        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
+            self.history.clear();
             return;
         };
-        let cookie = session.cookie.clone();
         self.history_loading = true;
-        self.history.clear();
-        self.reset_cover_loading();
-        self.selected = 0;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(async move { fetch_history(&cookie).await }).await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                app.history_loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.history = videos;
-                        if app.active_tab == AppTab::History {
-                            app.start_cover_loading(cx);
-                        }
-                    }
-                    Err(_error) => {
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.worker()
+            .spawn(async move { fetch_history(&cookie).await }, Event::History);
     }
 
-    fn refresh_history(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.history_loading {
-            self.release_active_cover_images(window);
-            self.load_history(cx);
-        }
-    }
-
-    fn show_watch_later(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window, cx);
-        self.active_tab = AppTab::WatchLater;
-        if self.session.is_none() {
-            cx.notify();
-            return;
-        }
-        if self.watch_later.is_empty() && !self.watch_later_loading {
-            self.load_watch_later(cx);
-        } else {
-            self.start_cover_loading(cx);
-            cx.notify();
-        }
-    }
-
-    fn load_watch_later(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            cx.notify();
+    fn load_watch_later(&mut self) {
+        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
+            self.watch_later.clear();
             return;
         };
-        let cookie = session.cookie.clone();
         self.watch_later_loading = true;
-        self.watch_later.clear();
-        self.reset_cover_loading();
-        self.selected = 0;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(async move { fetch_watch_later(&cookie).await }).await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                app.watch_later_loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.watch_later = videos;
-                        if app.active_tab == AppTab::WatchLater {
-                            app.start_cover_loading(cx);
-                        }
-                    }
-                    Err(_error) => {
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.worker()
+            .spawn(async move { fetch_watch_later(&cookie).await }, Event::WatchLater);
     }
 
-    fn refresh_watch_later(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.watch_later_loading {
-            self.release_active_cover_images(window);
-            self.load_watch_later(cx);
-        }
-    }
-
-    fn show_favorites(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_current_tab(window, cx);
-        self.active_tab = AppTab::Favorites;
-        if self.session.is_none() {
-            cx.notify();
-            return;
-        }
-        if self.favorites.is_empty() && !self.favorites_loading {
-            self.load_favorites(cx);
-        } else {
-            self.start_cover_loading(cx);
-            cx.notify();
-        }
-    }
-
-    fn load_favorites(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            cx.notify();
+    fn load_favorites(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            self.favorites.clear();
             return;
         };
-        let cookie = session.cookie.clone();
-        let mid = session.mid;
+        let (cookie, mid) = (session.cookie.clone(), session.mid);
         self.favorites_loading = true;
-        self.favorites.clear();
-        self.reset_cover_loading();
-        self.selected = 0;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(async move { fetch_favorites(&cookie, mid).await }).await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                app.favorites_loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.favorites = videos;
-                        if app.active_tab == AppTab::Favorites {
-                            app.start_cover_loading(cx);
-                        }
-                    }
-                    Err(_error) => {
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.worker().spawn(
+            async move { fetch_favorites(&cookie, mid).await },
+            Event::Favorites,
+        );
     }
 
-    fn refresh_favorites(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.favorites_loading {
-            self.release_active_cover_images(window);
-            self.load_favorites(cx);
-        }
-    }
-
-    fn open_author_videos(
-        &mut self,
-        mid: i64,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if mid <= 0 {
-            cx.notify();
-            return;
-        }
-        Self::release_cover_images(&mut self.author_videos, window);
-        self.reset_cover_loading();
-        self.active_tab = AppTab::Author;
-        self.author_mid = mid;
-        self.author_name = name;
-        self.author_page = 0;
-        self.author_has_more = true;
-        self.author_generation = self.author_generation.wrapping_add(1);
-        self.author_videos.clear();
-        self.selected = 0;
-        self.load_author_page(cx, true);
-    }
-
-    fn load_author_page(&mut self, cx: &mut Context<Self>, reset: bool) {
-        if self.author_mid <= 0 || self.author_loading || (!reset && !self.author_has_more) {
+    fn load_author_page(&mut self, reset: bool) {
+        if !reset && (self.author_loading || !self.author_has_more) {
             return;
         }
         if reset {
+            self.author_generation = self.author_generation.wrapping_add(1);
             self.author_page = 0;
             self.author_has_more = true;
             self.author_videos.clear();
@@ -1164,3269 +591,1460 @@ impl BiliGuga {
         let mid = self.author_mid;
         let cookie = self.session.as_ref().map(|session| session.cookie.clone());
         self.author_loading = true;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(
-                        async move { fetch_author_videos(mid, page, cookie.as_deref()).await },
-                    )
-                    .await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                if app.author_generation != generation || app.active_tab != AppTab::Author {
-                    return;
-                }
-                app.author_loading = false;
-                match result {
-                    Ok(result) => {
-                        let mut seen = app
-                            .author_videos
-                            .iter()
-                            .map(|video| video.bvid.clone())
-                            .collect::<std::collections::HashSet<_>>();
-                        for video in result.videos {
-                            if seen.insert(video.bvid.clone()) {
-                                app.author_videos.push(video);
-                            }
-                        }
-                        app.author_page = result.page;
-                        app.author_has_more = result.has_more;
-                        app.start_cover_loading(cx);
-                    }
-                    Err(_error) => {
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn refresh_author_videos(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.author_loading {
-            return;
-        }
-        Self::release_cover_images(&mut self.author_videos, window);
-        self.reset_cover_loading();
-        self.author_generation = self.author_generation.wrapping_add(1);
-        self.load_author_page(cx, true);
-    }
-
-    fn load_more_author_videos(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.load_author_page(cx, false);
-    }
-
-    fn show_login(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tab != AppTab::Login {
-            self.leave_current_tab(window, cx);
-            self.active_tab = AppTab::Login;
-            cx.notify();
-        }
-        if self.session.is_none() && self.login_image.is_none() && !self.login_loading {
-            self.start_login(window, cx);
-        }
-        if self.session.is_some() && self.account_avatar.is_none() {
-            self.start_avatar_loading(cx);
-        }
-    }
-
-    fn start_avatar_loading(&self, cx: &mut Context<Self>) {
-        let Some(face_url) = self
-            .session
-            .as_ref()
-            .map(|session| session.face.clone())
-            .filter(|face| !face.is_empty())
-        else {
-            return;
-        };
-        cx.spawn(async move |view, cx| {
-            let image = cx
-                .background_spawn(async move {
-                    network::run(async move { download_avatar(&face_url).await }).await
-                })
-                .await;
-            if let Some(image) = image {
-                view.update(cx, |app, cx| {
-                    app.account_avatar = Some(image);
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
-
-    fn start_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.login_loading {
-            return;
-        }
-        self.login_generation = self.login_generation.wrapping_add(1);
-        let generation = self.login_generation;
-        self.login_loading = true;
-        Self::release_image(&mut self.login_image, window);
-        self.login_key = None;
-        self.login_status = SharedString::from("正在获取登录二维码…");
-        cx.notify();
-
-        cx.spawn(async move |view, cx| {
-            let qr = cx
-                .background_spawn(async { network::run(login::fetch_qr_code()).await })
-                .await;
-            let qr = match qr {
-                Ok(qr) => qr,
-                Err(error) => {
-                    view.update(cx, |app, cx| {
-                        if app.login_generation == generation {
-                            app.login_loading = false;
-                            app.login_status = SharedString::from(format!("登录失败：{error}"));
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                    return;
-                }
-            };
-            let key = qr.key.clone();
-            let active = view
-                .update(cx, |app, cx| {
-                    if app.login_generation != generation {
-                        return false;
-                    }
-                    app.login_image = Some(qr.image);
-                    app.login_key = Some(key.clone());
-                    app.login_status = SharedString::from("请使用哔哩哔哩 App 扫码");
-                    cx.notify();
-                    true
-                })
-                .ok()
-                .unwrap_or(false);
-            if !active {
-                return;
-            }
-
-            loop {
-                Timer::after(Duration::from_secs(2)).await;
-                let active = view
-                    .update(cx, |app, _| app.login_generation == generation)
-                    .ok()
-                    .unwrap_or(false);
-                if !active {
-                    return;
-                }
-                let poll_key = key.clone();
-                let result = cx
-                    .background_spawn(async move {
-                        network::run(async move { login::poll_qr_code(&poll_key).await }).await
-                    })
-                    .await;
-                match result {
-                    Ok(PollResult::Waiting) => {}
-                    Ok(PollResult::Scanned) => {
-                        view.update(cx, |app, cx| {
-                            if app.login_generation == generation {
-                                app.login_status = SharedString::from("已扫码，请在手机上确认登录");
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    }
-                    Ok(PollResult::Expired) => {
-                        view.update(cx, |app, cx| {
-                            if app.login_generation == generation {
-                                app.login_loading = false;
-                                app.login_status = SharedString::from("二维码已过期，请点击刷新");
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                        return;
-                    }
-                    Ok(PollResult::LoggedIn(session)) => {
-                        let save_error = login::save_session(&session).err();
-                        view.update(cx, |app, cx| {
-                            if app.login_generation == generation {
-                                app.session = Some(session.clone());
-                                app.login_loading = false;
-                                app.login_image = None;
-                                app.login_key = None;
-                                app.login_status =
-                                    SharedString::from(if let Some(error) = save_error {
-                                        format!("登录成功，但保存登录状态失败：{error}")
-                                    } else {
-                                        format!("登录成功：{}", session.username)
-                                    });
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                        return;
-                    }
-                    Err(error) => {
-                        view.update(cx, |app, cx| {
-                            if app.login_generation == generation {
-                                app.login_status =
-                                    SharedString::from(format!("等待登录确认（{error}）"));
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    }
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn refresh_login(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.login_loading {
-            return;
-        }
-        self.start_login(window, cx);
-    }
-
-    fn logout(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        login::clear_session();
-        self.release_active_cover_images(window);
-        Self::release_cover_images(&mut self.videos, window);
-        Self::release_cover_images(&mut self.search_results, window);
-        Self::release_cover_images(&mut self.dynamic_videos, window);
-        Self::release_cover_images(&mut self.watch_later, window);
-        Self::release_cover_images(&mut self.favorites, window);
-        Self::release_cover_images(&mut self.history, window);
-        Self::release_cover_images(&mut self.author_videos, window);
-        Self::release_image(&mut self.account_avatar, window);
-        Self::release_image(&mut self.login_image, window);
-        self.session = None;
-        self.home_feed_mid = None;
-        self.reset_cover_loading();
-        self.history.clear();
-        self.watch_later.clear();
-        self.favorites.clear();
-        self.dynamic_videos.clear();
-        self.author_videos.clear();
-        self.author_mid = 0;
-        self.author_name.clear();
-        self.login_image = None;
-        self.login_key = None;
-        self.login_status = SharedString::from("已退出登录");
-        cx.notify();
-    }
-
-    fn add_video_to_watch_later(
-        &mut self,
-        index: usize,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = &self.session else {
-            cx.notify();
-            return;
-        };
-        let Some(video) = self.current_videos().get(index).cloned() else {
-            return;
-        };
-        if video.aid <= 0 {
-            cx.notify();
-            return;
-        }
-        let cookie = session.cookie.clone();
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let _result = cx
-                .background_spawn(async move {
-                    network::run(async move { add_to_watch_later(&cookie, video.aid).await }).await
-                })
-                .await;
-            view.update(cx, |_, cx| {
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn add_video_to_favorites(
-        &mut self,
-        index: usize,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = &self.session else {
-            cx.notify();
-            return;
-        };
-        let Some(video) = self.current_videos().get(index).cloned() else {
-            return;
-        };
-        if video.aid <= 0 {
-            cx.notify();
-            return;
-        }
-        let cookie = session.cookie.clone();
-        let mid = session.mid;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let _result = cx
-                .background_spawn(async move {
-                    network::run(async move { add_to_favorites(&cookie, mid, video.aid).await })
-                        .await
-                })
-                .await;
-            view.update(cx, |_, cx| {
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn like_current_video(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            cx.notify();
-            return;
-        };
-        let Some(video) = self.selected_video_ref().cloned() else {
-            return;
-        };
-        if video.aid <= 0 {
-            cx.notify();
-            return;
-        }
-        let cookie = session.cookie.clone();
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let _result = cx
-                .background_spawn(async move {
-                    network::run(async move { like_video(&cookie, video.aid).await }).await
-                })
-                .await;
-            view.update(cx, |_, cx| {
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn coin_current_video(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            cx.notify();
-            return;
-        };
-        let Some(video) = self.selected_video_ref().cloned() else {
-            return;
-        };
-        if video.aid <= 0 {
-            cx.notify();
-            return;
-        }
-        let cookie = session.cookie.clone();
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let _result = cx
-                .background_spawn(async move {
-                    network::run(async move { coin_video(&cookie, video.aid).await }).await
-                })
-                .await;
-            view.update(cx, |_, cx| {
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn save_current_to_watch_later(
-        &mut self,
-        event: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let index = self.selected;
-        self.add_video_to_watch_later(index, event, window, cx);
-    }
-
-    fn save_current_to_favorites(
-        &mut self,
-        event: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let index = self.selected;
-        self.add_video_to_favorites(index, event, window, cx);
-    }
-
-    fn start_collection_cover_loading(&mut self, cx: &mut Context<Self>) {
-        const MAX_IN_FLIGHT: usize = 8;
-
-        if self.collection_cover_loading {
-            return;
-        }
-        let Some(collection) = &self.collection else {
-            return;
-        };
-        let collection_id = collection.id;
-        let covers = collection
-            .episodes
-            .iter()
-            .enumerate()
-            .filter(|(_, episode)| episode.cover_image.is_none())
-            .map(|(index, episode)| (index, episode.bvid.clone(), episode.cover.clone()))
-            .collect::<Vec<_>>();
-        if covers.is_empty() {
-            return;
-        }
-
-        self.collection_cover_loading = true;
-        let generation = self.collection_cover_generation;
-        let cancelled = self.collection_cover_cancelled.clone();
-        cx.spawn(async move |view, cx| {
-            type CoverFuture = BoxFuture<'static, (usize, String, Option<Arc<RenderImage>>)>;
-
-            let make_future = |index: usize, bvid: String, cover_url: String| -> CoverFuture {
-                let cancelled = cancelled.clone();
-                async move {
-                    let image = match queue_cover_download(cover_url, cancelled) {
-                        Some(receiver) => receiver.await.ok().flatten(),
-                        None => None,
-                    };
-                    (index, bvid, image)
-                }
-                .boxed()
-            };
-
-            let mut covers = covers.into_iter();
-            let mut pending = FuturesUnordered::<CoverFuture>::new();
-            for _ in 0..MAX_IN_FLIGHT {
-                if let Some((index, bvid, cover_url)) = covers.next() {
-                    pending.push(make_future(index, bvid, cover_url));
-                }
-            }
-
-            while let Some((index, bvid, image)) = pending.next().await {
-                let keep_loading = view
-                    .update(cx, |app, cx| {
-                        if app.collection_cover_generation != generation {
-                            return false;
-                        }
-                        let is_same_collection = app
-                            .collection
-                            .as_ref()
-                            .filter(|collection| collection.id == collection_id)
-                            .and_then(|collection| collection.episodes.get(index))
-                            .map(|episode| episode.bvid == bvid)
-                            .unwrap_or(false);
-                        if is_same_collection {
-                            if let Some(image) = image {
-                                Self::debug_image("store-collection", &image, &bvid);
-                                if let Some(episode) = app
-                                    .collection
-                                    .as_mut()
-                                    .and_then(|collection| collection.episodes.get_mut(index))
-                                {
-                                    episode.cover_image = Some(image);
-                                    cx.notify();
-                                }
-                            }
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep_loading {
-                    cancelled.store(true, Ordering::Release);
-                    return;
-                }
-                if let Some((index, bvid, cover_url)) = covers.next() {
-                    pending.push(make_future(index, bvid, cover_url));
-                }
-            }
-
-            view.update(cx, |app, _| {
-                if app.collection_cover_generation == generation {
-                    app.collection_cover_loading = false;
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn start_cover_loading(&mut self, cx: &mut Context<Self>) {
-        const MAX_IN_FLIGHT: usize = 8;
-
-        if self.cover_loading {
-            return;
-        }
-        let covers = self
-            .current_videos()
-            .iter()
-            .enumerate()
-            .filter(|(_, video)| video.cover_image.is_none())
-            .map(|(index, video)| (index, video.bvid.clone(), video.cover.clone()))
-            .collect::<Vec<_>>();
-        if covers.is_empty() {
-            return;
-        }
-
-        self.cover_loading = true;
-        let generation = self.cover_generation;
-        let cancelled = self.cover_cancelled.clone();
-        cx.spawn(async move |view, cx| {
-            type CoverFuture = BoxFuture<'static, (usize, String, Option<Arc<RenderImage>>)>;
-
-            let make_future = |index: usize, bvid: String, cover_url: String| -> CoverFuture {
-                let cancelled = cancelled.clone();
-                async move {
-                    let image = match queue_cover_download(cover_url, cancelled) {
-                        Some(receiver) => receiver.await.ok().flatten(),
-                        None => None,
-                    };
-                    (index, bvid, image)
-                }
-                .boxed()
-            };
-
-            let mut covers = covers.into_iter();
-            let mut pending = FuturesUnordered::<CoverFuture>::new();
-            for _ in 0..MAX_IN_FLIGHT {
-                if let Some((index, bvid, cover_url)) = covers.next() {
-                    pending.push(make_future(index, bvid, cover_url));
-                }
-            }
-
-            while let Some((index, bvid, image)) = pending.next().await {
-                let keep_loading = view
-                    .update(cx, |app, cx| {
-                        if app.cover_generation != generation {
-                            return false;
-                        }
-                        if let Some(image) = image {
-                            let is_same_video = app
-                                .current_videos()
-                                .get(index)
-                                .map(|video| video.bvid == bvid)
-                                .unwrap_or(false);
-                            if is_same_video {
-                                Self::debug_image("store", &image, &bvid);
-                                if let Some(video) = app.current_videos_mut().get_mut(index) {
-                                    video.cover_image = Some(image);
-                                    cx.notify();
-                                }
-                            }
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep_loading {
-                    cancelled.store(true, Ordering::Release);
-                    return;
-                }
-                if let Some((index, bvid, cover_url)) = covers.next() {
-                    pending.push(make_future(index, bvid, cover_url));
-                }
-            }
-
-            view.update(cx, |app, cx| {
-                if app.cover_generation == generation {
-                    app.cover_loading = false;
-                    let has_pending_covers = app
-                        .current_videos()
-                        .iter()
-                        .any(|video| video.cover_image.is_none());
-                    if has_pending_covers {
-                        app.start_cover_loading(cx);
-                    }
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn search_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.keystroke.key.eq_ignore_ascii_case("enter") {
-            self.start_search(window, cx);
-        }
-    }
-
-    fn submit_search(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_search(window, cx);
-    }
-
-    fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let keyword = self.search_input.read(cx).content.trim().to_string();
-        if keyword.is_empty() {
-            cx.notify();
-            return;
-        }
-        self.active_tab = AppTab::Search;
-        self.search_query = keyword.clone();
-        self.feed_generation = self.feed_generation.wrapping_add(1);
-        let feed_generation = self.feed_generation;
-        Self::release_cover_images(&mut self.search_results, window);
-        self.loading = true;
-        self.search_results.clear();
-        self.reset_cover_loading();
-        self.selected = 0;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(async move { fetch_search_results(&keyword).await }).await
-                })
-                .await;
-            view.update(cx, |app, cx| {
-                if app.feed_generation != feed_generation {
-                    return;
-                }
-                app.loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.search_results = videos;
-                        if app.active_tab == AppTab::Search {
-                            app.start_cover_loading(cx);
-                        }
-                    }
-                    Err(_error) => {
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn refresh(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.active_tab = AppTab::Home;
-        Self::release_cover_images(&mut self.videos, window);
-        self.search_query.clear();
-        self.search_input.update(cx, |input, cx| input.reset(cx));
-        self.reset_cover_loading();
-        self.load_home_page(cx, true);
-    }
-
-    fn select_video(
-        &mut self,
-        index: usize,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(video) = self.current_videos().get(index).cloned() else {
-            return;
-        };
-        let same_video = self
-            .selected_video_ref()
-            .map(|current| {
-                current.bvid == video.bvid
-                    && (video.cid <= 0 || current.cid <= 0 || current.cid == video.cid)
-            })
-            .unwrap_or(false);
-        if same_video {
-            if self.playback == PlaybackState::Paused {
-                self.player.set_pause(false);
-                self.pending_pause = Some(false);
-                self.playback = PlaybackState::Playing;
-                cx.notify();
-            } else if self.playback == PlaybackState::Idle {
-                self.begin_play_selected(cx);
-            }
-            return;
-        }
-        self.debug_memory("before-video-switch");
-        self.queue_history_report(cx, 2);
-        self.selected = index;
-        self.pin_playing_video(&video);
-        let frames = self.player.stop_playback();
-        self.drop_player_frames(frames, window);
-        self.debug_memory("after-video-stop");
-        self.playback = PlaybackState::Idle;
-        self.pending_seek = None;
-        self.quality_options.clear();
-        self.clear_collection(window);
-        self.collection_loading = true;
-        self.playback_request = self.playback_request.wrapping_add(1);
-        self.controls_visible = false;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-        self.detail_view_count = SharedString::from("—");
-        self.detail_danmaku_count = SharedString::from("—");
-        self.detail_like_count = SharedString::from("—");
-        self.published_at = SharedString::from("发布时间未知");
-        self.playback_error = None;
-        self.speed_menu_open = false;
-        self.quality_menu_open = false;
-        self.begin_play_selected(cx);
-    }
-
-    fn collection_episode_index(&self) -> Option<usize> {
-        let current = self.playing_video.as_ref()?;
-        self.collection.as_ref()?.episodes.iter().position(|episode| {
-            episode.bvid == current.bvid
-                && (episode.cid <= 0 || current.cid <= 0 || episode.cid == current.cid)
-        })
-    }
-
-    fn play_collection_episode(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(video) = self
-            .collection
-            .as_ref()
-            .and_then(|collection| collection.episodes.get(index))
-            .cloned()
-        else {
-            return;
-        };
-        self.queue_history_report(cx, 2);
-        self.pin_playing_video(&video);
-        let frames = self.player.stop_playback();
-        self.drop_player_frames(frames, window);
-        self.playback = PlaybackState::Idle;
-        self.pending_pause = None;
-        self.pending_seek = None;
-        self.quality_options.clear();
-        self.clear_collection(window);
-        self.collection_loading = true;
-        self.playback_request = self.playback_request.wrapping_add(1);
-        self.controls_visible = false;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-        self.detail_view_count = SharedString::from("—");
-        self.detail_danmaku_count = SharedString::from("—");
-        self.detail_like_count = SharedString::from("—");
-        self.published_at = SharedString::from("发布时间未知");
-        self.playback_error = None;
-        self.speed_menu_open = false;
-        self.quality_menu_open = false;
-        self.collection_menu_open = false;
-        self.begin_play_selected(cx);
-    }
-
-    fn select_collection_episode(
-        &mut self,
-        index: usize,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(video) = self
-            .collection
-            .as_ref()
-            .and_then(|collection| collection.episodes.get(index))
-            .cloned()
-        else {
-            return;
-        };
-        self.collection_menu_open = false;
-        let same_video = self
-            .selected_video_ref()
-            .map(|current| {
-                current.bvid == video.bvid
-                    && (video.cid <= 0 || current.cid <= 0 || current.cid == video.cid)
-            })
-            .unwrap_or(false);
-        if same_video {
-            if self.playback == PlaybackState::Paused {
-                self.player.set_pause(false);
-                self.pending_pause = Some(false);
-                self.playback = PlaybackState::Playing;
-                cx.notify();
-            } else if self.playback == PlaybackState::Idle {
-                self.begin_play_selected(cx);
-            }
-            return;
-        }
-        self.play_collection_episode(index, window, cx);
-    }
-
-    fn play_previous_episode(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(index) = self.collection_episode_index()
-            && index > 0
-        {
-            self.play_collection_episode(index - 1, window, cx);
-        }
-    }
-
-    fn play_next_episode(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(index) = self.collection_episode_index()
-            && self
-                .collection
-                .as_ref()
-                .is_some_and(|collection| index + 1 < collection.episodes.len())
-        {
-            self.play_collection_episode(index + 1, window, cx);
-        }
-    }
-
-    fn play_selected(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.playback == PlaybackState::Paused {
-            self.player.set_pause(false);
-            self.pending_pause = Some(false);
-            self.playback = PlaybackState::Playing;
-            cx.notify();
-            return;
-        }
-        let status = self.player.status();
-        if self.playback == PlaybackState::Idle
-            && status.time_pos.is_finite()
-            && status.duration.is_finite()
-            && status.duration > 0.
-            && status.time_pos >= status.duration - 0.25
-        {
-            self.pending_seek = Some(0.);
-        }
-        self.begin_play_selected(cx);
-    }
-
-    fn begin_play_selected(&mut self, cx: &mut Context<Self>) {
-        if self.playback == PlaybackState::Buffering {
-            return;
-        }
-        self.pending_pause = None;
-        let Some(video) = self.selected_video_ref().cloned() else {
-            cx.notify();
-            return;
-        };
-        self.playback_error = None;
-        self.pin_playing_video(&video);
-        self.load_comments_for_current(cx);
-        self.cloud_resume_progress = None;
-        self.cloud_resume_applied = false;
-        self.collection_loading = true;
-        self.history_report_at = Instant::now();
-        self.playback = PlaybackState::Buffering;
-        cx.notify();
-        let video_bvid = video.bvid.clone();
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
-        self.playback_request = self.playback_request.wrapping_add(1);
-        let playback_request = self.playback_request;
-        let quality = self.quality;
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    network::run(async move {
-                        let context = fetch_video_context(&video, cookie.as_deref()).await.ok();
-                        let mut resolved_video = video.clone();
-                        if let Some(context) = &context {
-                            resolved_video.aid = context.aid;
-                            resolved_video.cid = context.cid;
-                            resolved_video.uploader = context.uploader.clone();
-                            resolved_video.uploader_mid = context.uploader_mid;
-                        }
-                        let result =
-                            resolve_play_url(&resolved_video, cookie.as_deref(), quality).await?;
-                        let mut resolved_video = video.clone();
-                        resolved_video.cid = result.cid;
-                        resolved_video.aid = result.aid;
-                        let progress =
-                            fetch_last_play_progress(&resolved_video, cookie.as_deref()).await;
-                        Ok::<_, String>((result, progress, context))
-                    })
-                    .await
-                })
-                .await;
-            let message = match result {
-                Ok((play_url, progress, context)) => {
-                    view.update(cx, |app, cx| {
-                        if app.playback_request != playback_request
-                            || app
-                                .selected_video_ref()
-                                .map(|current| current.bvid != video_bvid)
-                                .unwrap_or(true)
-                        {
-                            return;
-                        }
-                        if let Some(playing_video) = app.playing_video.as_mut() {
-                            playing_video.cid = play_url.cid;
-                            playing_video.aid = play_url.aid;
-                            if let Some(context) = &context {
-                                playing_video.uploader = context.uploader.clone();
-                                playing_video.uploader_mid = context.uploader_mid;
-                            }
-                        }
-                        if let Some(context) = &context {
-                            app.detail_view_count = SharedString::from(context.view_count.clone());
-                            app.detail_danmaku_count =
-                                SharedString::from(context.danmaku_count.clone());
-                            app.detail_like_count = SharedString::from(context.like_count.clone());
-                        }
-                        app.published_at = SharedString::from(
-                            context
-                                .as_ref()
-                                .map(|context| format_publish_date(context.pubdate))
-                                .unwrap_or_else(|| "发布时间未知".into()),
-                        );
-                        app.playback_error = None;
-                        app.reset_collection_cover_loading();
-                        app.collection = context.and_then(|context| context.collection);
-                        app.collection_menu_open = false;
-                        app.start_collection_cover_loading(cx);
-                        app.collection_loading = false;
-                        app.quality_options = play_url.qualities.clone();
-                        if play_url.actual_quality > 0 {
-                            app.quality = play_url.actual_quality;
-                        }
-                        if let Some(progress) = progress {
-                            app.cloud_resume_progress = Some(progress as f64);
-                        }
-                        app.debug_memory("before-video-load");
-                        app.player.load(play_url.url, play_url.audio_url, app.volume, app.speed);
-                        if let Some((width, height)) = app.player_viewport_size {
-                            app.player.set_render_viewport(width, height);
-                        }
-                        app.cloud_resume_applied = false;
-                        app.playback = PlaybackState::Buffering;
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-                Err(error) => format!("播放失败：{error}"),
-            };
-            view.update(cx, |app, cx| {
-                if app.playback_request != playback_request {
-                    return;
-                }
-                app.playback = PlaybackState::Idle;
-                app.collection_loading = false;
-                app.playback_error = Some(SharedString::from(message));
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn toggle_pause_state(&mut self, cx: &mut Context<Self>) {
-        match self.playback {
-            PlaybackState::Playing => {
-                self.queue_history_report(cx, 2);
-                self.player.set_pause(true);
-                self.pending_pause = Some(true);
-                self.playback = PlaybackState::Paused;
-                cx.notify();
-            }
-            PlaybackState::Paused => {
-                self.player.set_pause(false);
-                self.pending_pause = Some(false);
-                self.playback = PlaybackState::Playing;
-                cx.notify();
-            }
-            PlaybackState::Buffering => {
-                cx.notify();
-            }
-            PlaybackState::Idle => self.begin_play_selected(cx),
-        }
-    }
-
-    fn sync_power_inhibition(&mut self) {
-        let should_inhibit = matches!(
-            self.playback,
-            PlaybackState::Playing | PlaybackState::Buffering
+        self.worker().spawn(
+            async move { fetch_author_videos(mid, page, cookie.as_deref()).await },
+            move |result| Event::Author(result, generation),
         );
-        self.power_inhibitor.set_active(should_inhibit);
     }
 
-    fn update_player_viewport(&mut self, width: usize, height: usize) {
-        if width == 0 || height == 0 || self.player_viewport_size == Some((width, height)) {
+    fn show_tab(&mut self, tab: AppTab) {
+        if self.active_tab == tab {
             return;
         }
-        self.player_viewport_size = Some((width, height));
-        self.player.set_render_viewport(width, height);
-    }
-
-    fn toggle_pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_pause_state(cx);
-    }
-
-    fn set_progress_from_position(
-        &mut self,
-        position: gpui::Point<Pixels>,
-        bounds: Bounds<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        if bounds.size.width <= px(0.) {
-            return;
+        self.active_tab = tab;
+        self.selected = None;
+        match tab {
+            AppTab::Home if self.videos.is_empty() => self.load_home_page(false),
+            AppTab::Dynamic => self.load_dynamic(),
+            AppTab::History => self.load_history(),
+            AppTab::WatchLater => self.load_watch_later(),
+            AppTab::Favorites => self.load_favorites(),
+            AppTab::Login => self.start_login(),
+            _ => {}
         }
-        let percent =
-            ((position.x - bounds.origin.x) / bounds.size.width).clamp(0., 1.) as f64;
-        self.seek_percent(percent, cx);
     }
 
-    fn set_volume_from_position(
-        &mut self,
-        position: gpui::Point<Pixels>,
-        bounds: Bounds<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        if bounds.size.width <= px(0.) {
+    // ---- Playback ------------------------------------------------------------------------
+
+    fn play_video(&mut self, video: Video) {
+        self.playing_video = Some(video.clone());
+        self.playback = PlaybackState::Buffering;
+        self.playback_error = None;
+        self.comments.clear();
+        self.comments_for.clear();
+        self.comments_page = 0;
+        self.cloud_resume_applied = false;
+        self.pending_seek = None;
+        self.collection = None;
+        self.detail_view_count = "—".into();
+        self.detail_danmaku_count = "—".into();
+        self.detail_like_count = "—".into();
+        self.published_at = "发布时间未知".into();
+
+        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let quality = self.quality;
+        let for_context = video.clone();
+        let for_url = video.clone();
+        self.worker().spawn(
+            async move { fetch_video_context(&for_context, cookie.as_deref()).await },
+            move |result| match result {
+                Ok(context) => Event::VideoContext(Box::new(context)),
+                Err(_) => Event::Action("context-failed"),
+            },
+        );
+        let play_cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        self.worker().spawn(
+            async move { resolve_play_url(&for_url, play_cookie.as_deref(), quality).await },
+            Event::PlayUrl,
+        );
+        self.load_comments(true);
+    }
+
+    fn finish_play(&mut self, result: api::PlayUrlResult) {
+        self.quality_options = result.qualities.clone();
+        self.quality = result.actual_quality;
+        self.player.load(
+            result.url,
+            result.audio_url,
+            self.volume,
+            self.speed,
+        );
+        self.playback = PlaybackState::Buffering;
+        let Some(video) = self.playing_video.clone() else {
             return;
-        }
-        let volume =
-            (((position.x - bounds.origin.x) / bounds.size.width).clamp(0., 1.) * 100.) as f64;
-        self.volume = volume.clamp(0., 100.);
-        self.player.set_volume(self.volume);
-        cx.notify();
+        };
+        let play_cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        self.worker().spawn(
+            async move {
+                fetch_last_play_progress(&video, play_cookie.as_deref())
+                    .await
+                    .map(|progress| progress as f64)
+            },
+            Event::Resume,
+        );
+    }
+
+    fn toggle_pause(&mut self) {
+        let paused = self.playback == PlaybackState::Playing;
+        self.pending_pause = Some(paused);
+        self.player.set_pause(paused);
+        self.playback = if paused {
+            PlaybackState::Paused
+        } else {
+            PlaybackState::Playing
+        };
+    }
+
+    fn stop_playback(&mut self) {
+        self.player.stop_playback();
+        self.playback = PlaybackState::Idle;
+        self.pending_pause = None;
+        self.pending_seek = None;
+        self.cloud_resume_progress = None;
+        self.cloud_resume_applied = true;
+        self.power_inhibitor.set_active(false);
+    }
+
+    fn seek_percent(&mut self, percent: f64) {
+        self.player.seek_percent(percent.clamp(0., 1.));
     }
 
     fn persist_player_settings(&self) {
         save_player_settings(self.volume, self.speed);
     }
 
-    fn toggle_speed_menu(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let closed_menu = self.menu_closed_by_outside.take();
-        if closed_menu == Some(PlayerMenu::Speed) {
+    /// Selects a feed row and plays it.
+    fn select(&mut self, index: usize) {
+        self.selected = Some(index);
+        if let Some(video) = self.current_videos().get(index).cloned() {
+            self.play_video(video);
+        }
+    }
+
+    fn show_controls(&mut self) {
+        self.controls_until = Some(Instant::now() + CONTROLS_LINGER);
+    }
+
+    fn controls_visible(&self) -> bool {
+        self.controls_until
+            .is_some_and(|until| Instant::now() < until)
+            || self.open_menu.is_some()
+            || self.seek_dragging
+            || self.volume_dragging
+            || self.playback == PlaybackState::Paused
+    }
+
+    fn queue_history_report(&mut self) {
+        if self.history_report_in_flight {
             return;
         }
-        self.speed_menu_open = if closed_menu.is_some() {
-            true
-        } else {
-            !self.speed_menu_open
+        let (Some(cookie), Some(video)) = (
+            self.session.as_ref().map(|session| session.cookie.clone()),
+            self.playing_video.clone(),
+        ) else {
+            return;
         };
-        self.quality_menu_open = false;
-        self.collection_menu_open = false;
-        cx.notify();
-    }
-
-    fn select_speed(&mut self, speed: f64, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.speed = speed;
-        self.player.set_speed(self.speed);
-        self.persist_player_settings();
-        self.speed_menu_open = false;
-        cx.notify();
-    }
-
-    fn toggle_quality_menu(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let closed_menu = self.menu_closed_by_outside.take();
-        if closed_menu == Some(PlayerMenu::Quality) {
+        if video.aid <= 0 || video.cid <= 0 {
             return;
         }
-        self.quality_menu_open = if closed_menu.is_some() {
-            true
-        } else {
-            !self.quality_menu_open
+        let position = self.player.status().time_pos;
+        if !position.is_finite() || position < 1. {
+            return;
+        }
+        self.history_report_in_flight = true;
+        self.history_report_at = Instant::now();
+        self.worker().spawn(
+            async move {
+                let _ = report_video_progress(&cookie, video.aid, video.cid, position).await;
+                let _ = report_video_heartbeat(&cookie, &video, position, 0).await;
+            },
+            |()| Event::Action("history-reported"),
+        );
+    }
+
+    // ---- Comments ------------------------------------------------------------------------
+
+    fn load_comments(&mut self, reset: bool) {
+        let Some(video) = self.playing_video.clone() else {
+            return;
         };
-        self.speed_menu_open = false;
-        self.collection_menu_open = false;
-        cx.notify();
-    }
-
-    fn close_player_menus(
-        &mut self,
-        _: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let closed_menu = if self.speed_menu_open {
-            Some(PlayerMenu::Speed)
-        } else if self.quality_menu_open {
-            Some(PlayerMenu::Quality)
-        } else if self.collection_menu_open {
-            Some(PlayerMenu::Collection)
-        } else {
-            None
-        };
-        if let Some(closed_menu) = closed_menu {
-            self.speed_menu_open = false;
-            self.quality_menu_open = false;
-            self.collection_menu_open = false;
-            self.menu_closed_by_outside = Some(closed_menu);
-            cx.defer_in(window, |app, _, _| {
-                app.menu_closed_by_outside = None;
-            });
-            cx.notify();
-        }
-    }
-
-    fn select_quality(
-        &mut self,
-        quality: u32,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.quality_menu_open = false;
-        if self.quality == quality {
-            cx.notify();
+        if !reset && (self.comments_loading || !self.comments_has_more) {
             return;
         }
-        self.quality = quality;
-        let status = self.player.status();
-        if self.playback != PlaybackState::Idle {
-            if status.time_pos.is_finite() && status.time_pos >= 0. {
-                self.pending_seek = Some(status.time_pos);
-            }
-            self.queue_history_report(cx, 2);
-            let frames = self.player.stop_playback();
-            self.drop_player_frames(frames, window);
-            self.playback = PlaybackState::Idle;
-            self.cloud_resume_applied = false;
-            self.playback_request = self.playback_request.wrapping_add(1);
-            self.begin_play_selected(cx);
+        if reset {
+            self.comments_generation = self.comments_generation.wrapping_add(1);
+            self.comments.clear();
+            self.comments_page = 0;
+            self.comments_error = None;
         }
-    }
-
-    fn toggle_player_fullscreen(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.screen_fullscreen {
-            self.screen_fullscreen = false;
-            window.toggle_fullscreen();
-            cx.notify();
-            return;
-        }
-        self.player_fullscreen = !self.player_fullscreen;
-        self.controls_visible = true;
-        self.controls_opacity = 1.;
-        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
-        cx.notify();
-    }
-
-    fn exit_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen_fullscreen {
-            self.screen_fullscreen = false;
-            window.toggle_fullscreen();
-        }
-        self.player_fullscreen = false;
-        self.controls_visible = true;
-        self.controls_opacity = 1.;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
-        cx.notify();
-    }
-
-    fn handle_global_key(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.is_held {
-            return;
-        }
-        let key = event.keystroke.key.as_str();
-        let search_focused = self.search_input.read(cx).is_focused(window);
-        if key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc") {
-            if self.player_fullscreen || self.screen_fullscreen {
-                self.exit_fullscreen(window, cx);
-            }
-        } else if key.eq_ignore_ascii_case("f")
-            && !event.keystroke.modifiers.modified()
-            && !search_focused
-        {
-            self.toggle_screen_fullscreen_state(window, cx);
-        } else if (key.eq_ignore_ascii_case("space") || key == " ")
-            && !event.keystroke.modifiers.modified()
-            && !search_focused
-        {
-            self.toggle_pause_state(cx);
-        } else if (key.eq_ignore_ascii_case("left") || key.eq_ignore_ascii_case("arrowleft"))
-            && !event.keystroke.modifiers.modified()
-            && !search_focused
-            && self.playback != PlaybackState::Idle
-        {
-            self.player.seek_relative(-10.);
-            cx.notify();
-        } else if (key.eq_ignore_ascii_case("right") || key.eq_ignore_ascii_case("arrowright"))
-            && !event.keystroke.modifiers.modified()
-            && !search_focused
-            && self.playback != PlaybackState::Idle
-        {
-            self.player.seek_relative(10.);
-            cx.notify();
-        }
-    }
-
-    fn toggle_screen_fullscreen(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.toggle_screen_fullscreen_state(window, cx);
-    }
-
-    fn toggle_screen_fullscreen_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.screen_fullscreen = !self.screen_fullscreen;
-        self.player_fullscreen = self.screen_fullscreen;
-        window.toggle_fullscreen();
-        self.controls_visible = true;
-        self.controls_opacity = 1.;
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
-        cx.notify();
-    }
-
-    fn seek_percent(&mut self, percent: f64, cx: &mut Context<Self>) {
-        self.player.seek_percent(percent);
-        cx.notify();
-    }
-
-    fn show_player_controls(&mut self, _: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let was_hidden = !self.controls_visible;
-        self.controls_visible = true;
-        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
-        let animation_generation = self.controls_animation_generation;
-        if was_hidden {
-            self.controls_opacity = 0.;
-            self.fade_controls_in(animation_generation, cx);
-        } else {
-            self.controls_opacity = 1.;
-        }
-        self.controls_generation = self.controls_generation.wrapping_add(1);
-        let generation = self.controls_generation;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            Timer::after(Duration::from_millis(2400)).await;
-            view.update(cx, |app, cx| {
-                if app.controls_generation == generation {
-                    if app.volume_dragging
-                        || app.seek_dragging
-                        || app.speed_menu_open
-                        || app.quality_menu_open
-                        || app.collection_menu_open
-                    {
-                        return;
-                    }
-                    app.fade_controls_out(cx);
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn fade_controls_in(&mut self, animation_generation: u64, cx: &mut Context<Self>) {
-        cx.spawn(async move |view, cx| {
-            for step in 1..=6 {
-                Timer::after(Duration::from_millis(16)).await;
-                let updated = view.update(cx, |app, cx| {
-                    if app.controls_animation_generation != animation_generation {
-                        return false;
-                    }
-                    app.controls_opacity = step as f32 / 6.;
-                    cx.notify();
-                    true
-                });
-                if !updated.unwrap_or(false) {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn fade_controls_out(&mut self, cx: &mut Context<Self>) {
-        self.controls_animation_generation = self.controls_animation_generation.wrapping_add(1);
-        let animation_generation = self.controls_animation_generation;
-        cx.spawn(async move |view, cx| {
-            for step in 1..=6 {
-                Timer::after(Duration::from_millis(16)).await;
-                let updated = view.update(cx, |app, cx| {
-                    if app.controls_animation_generation != animation_generation {
-                        return false;
-                    }
-                    app.controls_opacity = 1. - step as f32 / 6.;
-                    if step == 6 {
-                        app.controls_visible = false;
-                    }
-                    cx.notify();
-                    true
-                });
-                if !updated.unwrap_or(false) {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(64.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_1()
-            .pt_3()
-            .bg(rgb(0x10141c))
-            .child(
-                div()
-                    .w_full()
-                    .h(px(48.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0x8e8aff))
-                            .child("◈"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x6e7890))
-                            .child("GUGA"),
-                    ),
-            )
-            .child(clickable_sidebar_item(
-                "⌂",
-                "首页",
-                self.active_tab == AppTab::Home,
-                cx.listener(Self::show_home),
-            ))
-            .child(clickable_sidebar_item(
-                "▣",
-                "动态",
-                self.active_tab == AppTab::Dynamic,
-                cx.listener(Self::show_dynamic),
-            ))
-            .child(clickable_sidebar_item(
-                "♡",
-                "收藏",
-                self.active_tab == AppTab::Favorites,
-                cx.listener(Self::show_favorites),
-            ))
-            .child(clickable_sidebar_item(
-                "＋",
-                "稍后",
-                self.active_tab == AppTab::WatchLater,
-                cx.listener(Self::show_watch_later),
-            ))
-            .child(clickable_sidebar_item(
-                "◷",
-                "历史",
-                self.active_tab == AppTab::History,
-                cx.listener(Self::show_history),
-            ))
-            .child(clickable_sidebar_item(
-                "⌕",
-                "搜索",
-                self.active_tab == AppTab::Search,
-                cx.listener(Self::show_search),
-            ))
-            .child(clickable_sidebar_item(
-                "◉",
-                if self.session.is_some() {
-                    "账号"
-                } else {
-                    "登录"
-                },
-                self.active_tab == AppTab::Login,
-                cx.listener(Self::show_login),
-            ))
-    }
-
-    fn render_video_card(
-        index: usize,
-        video: Video,
-        selected: bool,
-        entity: Entity<BiliGuga>,
-    ) -> impl IntoElement + use<> {
-        let title = video.title.clone();
-        let click_entity = entity.clone();
-        div()
-            .id(SharedString::from(format!("video-card-{index}")))
-            .w_full()
-            .h(px(76.))
-            .flex()
-            .flex_none()
-            .gap_2()
-            .cursor_pointer()
-            .border_b_1()
-            .border_color(rgb(0x1d2533))
-            .when(selected, |this| {
-                this.bg(rgb(0x202a42))
-                    .border_l_2()
-                    .border_color(rgb(0x8580ff))
-            })
-            .when(!selected, |this| {
-                this.hover(|style| style.bg(rgb(0x182131)))
-            })
-            .child(thumbnail(&video, 126., 76.))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .justify_between()
-                    .py_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_height(px(20.))
-                            .text_color(rgb(0xdce0e5))
-                            .text_ellipsis()
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xa9afbc))
-                            .text_ellipsis()
-                            .child(format!("{}  ·  {}", video.uploader, video.duration)),
-                    ),
-            )
-            .on_click(move |event, window, cx| {
-                click_entity.update(cx, |this, cx| {
-                    this.select_video(index, event, window, cx);
-                });
-            })
-    }
-
-    fn render_video_grid_card(
-        index: usize,
-        video: Video,
-        selected: bool,
-        entity: Entity<BiliGuga>,
-    ) -> impl IntoElement + use<> {
-        let title = video.title.clone();
-        let click_entity = entity.clone();
-        div()
-            .id(SharedString::from(format!("video-grid-card-{index}")))
-            .w(px(HOME_GRID_CARD_WIDTH))
-            .flex_none()
-            .h(px(160.))
-            .flex()
-            .flex_col()
-            .cursor_pointer()
-            .when(selected, |this| {
-                this.bg(rgb(0x182039))
-                    .border_b_2()
-                    .border_color(rgb(0x8580ff))
-            })
-            .when(!selected, |this| {
-                this.hover(|style| style.bg(rgb(0x151d2c)))
-            })
-            .child(thumbnail_fill(&video, 106.))
-            .child(
-                div()
-                    .w_full()
-                    .px_1()
-                    .pt_2()
-                    .text_sm()
-                    .line_height(px(19.))
-                    .text_color(if selected {
-                        rgb(0xe9eaff)
-                    } else {
-                        rgb(0xdce0e5)
+        let page = self.comments_page + 1;
+        let generation = self.comments_generation;
+        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        self.comments_loading = true;
+        self.worker().spawn(
+            async move {
+                fetch_comments(&video, cookie.as_deref(), page)
+                    .await
+                    .map(|page_result| {
+                        (
+                            page as usize,
+                            page_result.comments,
+                            page_result.total,
+                            page_result.has_more,
+                        )
                     })
-                    .text_ellipsis()
-                    .child(title),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .px_1()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(rgb(0x7f8ca8))
-                    .text_ellipsis()
-                    .child(format!("{}  ·  {}", video.uploader, video.duration)),
-            )
-            .on_click(move |event, window, cx| {
-                click_entity.update(cx, |this, cx| {
-                    this.select_video(index, event, window, cx);
-                });
-            })
+            },
+            move |result| Event::Comments(result, generation),
+        );
     }
 
-    fn render_login(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut panel = div()
-            .flex_1()
-            .flex()
-            .flex_col()
+    // ---- Login ---------------------------------------------------------------------------
+
+    fn start_login(&mut self) {
+        self.login_generation = self.login_generation.wrapping_add(1);
+        let generation = self.login_generation;
+        self.login_loading = true;
+        self.login_status = "正在获取登录二维码…".into();
+        self.login_qr = None;
+        self.login_key = None;
+        self.active_tab = AppTab::Login;
+        self.worker().spawn(fetch_qr_code_event(), move |result| {
+            Event::QrCode(result, generation)
+        });
+    }
+
+    fn poll_login(&mut self) {
+        let Some(key) = self.login_key.clone() else {
+            return;
+        };
+        let generation = self.login_generation;
+        self.worker()
+            .spawn(async move { login::poll_qr_code(&key).await }, move |result| {
+                Event::QrPoll(result, generation)
+            });
+    }
+
+    fn refresh_session(&mut self) {
+        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
+            return;
+        };
+        self.worker().spawn(
+            async move { login::fetch_user(cookie).await },
+            Event::Session,
+        );
+    }
+
+    // ---- Covers --------------------------------------------------------------------------
+
+    fn request_cover(&mut self, video: &Video) {
+        let url = video.cover.clone();
+        if url.is_empty() {
+            return;
+        }
+        let cancelled = self.covers.requested.clone();
+        let Some(receiver) = queue_cover_download(url, cancelled) else {
+            return;
+        };
+        let bvid = video.bvid.clone();
+        self.worker().spawn(
+            async move { receiver.await.ok().flatten() },
+            move |image| match image {
+                Some(image) => Event::Cover(bvid, image),
+                None => Event::Action("cover-missing"),
+            },
+        );
+    }
+
+    fn attach_cover(&mut self, bvid: &str, pixels: Arc<Rgba8>) {
+        let Some(cache) = self.images.as_ref() else {
+            return;
+        };
+        let image = cache.rgba(pixels.width, pixels.height, pixels.pixels.clone());
+        self.cover_images.insert(bvid.to_string(), image);
+    }
+
+    fn cover_for(&self, video: &Video) -> Option<&Image> {
+        self.cover_images.get(&video.bvid)
+    }
+}
+
+// ---- The view -------------------------------------------------------------------------------
+
+/// The app's colour for a video's placeholder, picked from its accent so a feed of
+/// half-loaded covers does not look broken.
+fn card_cover(video: &Video, image: Option<&Image>, width: f32, height: f32) -> El {
+    let mut frame = el()
+        .w(width)
+        .h(height)
+        .radius(6.0)
+        .fill(theme::cover_placeholder(video.accent));
+    if let Some(image) = image {
+        frame = frame.child(
+            el()
+                .w_full()
+                .h_full()
+                .radius(6.0)
+                .pixels_fit(image.pixels(), SurfaceFit::Fill),
+        );
+    }
+    frame
+}
+
+fn sidebar_item(label: &'static str, glyph: &'static str, active: bool, tab: AppTab) -> El {
+    let mut item = col()
+        .w(SIDEBAR_WIDTH)
+        .h(52.0)
+        .items_center()
+        .justify_center()
+        .gap(2.0)
+        .cursor(rune::Cursor::Pointer)
+        .hover(theme::hover())
+        .on_press(move |app: &mut BiliGuga| app.show_tab(tab));
+    if active {
+        item = item
+            .fill(theme::active_row())
+            .child(text(glyph).font(type_::TITLE).color(theme::text()))
+            .child(
+                text(label)
+                    .font(type_::SECTION)
+                    .color(theme::accent_soft()),
+            );
+    } else {
+        item = item
+            .child(text(glyph).font(type_::TITLE).color(theme::text_dim()))
+            .child(
+                text(label)
+                    .font(type_::SECTION)
+                    .color(theme::text_faint()),
+            );
+    }
+    item
+}
+
+fn render_sidebar(app: &BiliGuga) -> El {
+    col()
+        .w(SIDEBAR_WIDTH)
+        .h_full()
+        .items_center()
+        .py(8.0)
+        .gap(4.0)
+        .fill(theme::bg())
+        .child(sidebar_item("首页", "⌂", app.active_tab == AppTab::Home, AppTab::Home))
+        .child(sidebar_item("动态", "◈", app.active_tab == AppTab::Dynamic, AppTab::Dynamic))
+        .child(sidebar_item("历史", "◷", app.active_tab == AppTab::History, AppTab::History))
+        .child(sidebar_item("稍后", "▤", app.active_tab == AppTab::WatchLater, AppTab::WatchLater))
+        .child(sidebar_item("收藏", "★", app.active_tab == AppTab::Favorites, AppTab::Favorites))
+        .child(
+            sidebar_item(
+                "登录",
+                "◎",
+                app.active_tab == AppTab::Login,
+                AppTab::Login,
+            ),
+        )
+}
+
+/// One row of the feed: a 16:9 cover, the title over two lines, and the uploader and duration.
+fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
+    let selected = app.selected == Some(index);
+    let image = app.cover_for(video);
+    let mut row_el = row()
+        .key(format!("row-{}", video.bvid))
+        .w_full()
+        .gap(10.0)
+        .padding(8.0)
+        .radius(8.0)
+        .cursor(rune::Cursor::Pointer)
+        .hover(theme::hover())
+        .on_press(move |app: &mut BiliGuga| app.select(index))
+        .child(card_cover(video, image, 132.0, 74.0))
+        .child(
+            col()
+                .grow(1.0)
+                .min_h(0.0)
+                .gap(4.0)
+                .child(
+                    text(video.title.clone())
+                        .font(type_::BODY)
+                        .color(theme::text())
+                        .max_lines(2),
+                )
+                .child(
+                    text(video.uploader.clone())
+                        .font(type_::LABEL)
+                        .color(theme::text_faint())
+                        .truncate(),
+                )
+                .child(
+                    text(video.duration.clone())
+                        .font(type_::LABEL)
+                        .color(theme::text_faint()),
+                ),
+        );
+    if selected {
+        row_el = row_el.fill(theme::active_row());
+    }
+    row_el
+}
+
+/// A two-column card for the home grid.
+fn video_card(app: &BiliGuga, index: usize, video: &Video) -> El {
+    let image = app.cover_for(video);
+    let mut card = col()
+        .key(format!("card-{}", video.bvid))
+        .w(GRID_CARD_WIDTH)
+        .h(GRID_CARD_HEIGHT)
+        .shrink()
+        .gap(4.0)
+        .padding(4.0)
+        .radius(8.0)
+        .cursor(rune::Cursor::Pointer)
+        .hover(theme::hover())
+        .on_press(move |app: &mut BiliGuga| app.select(index))
+        .child(card_cover(video, image, GRID_CARD_WIDTH - 8.0, 106.0))
+        .child(
+            text(video.title.clone())
+                .font(type_::LABEL)
+                .color(theme::text())
+                .max_lines(2),
+        )
+        .child(
+            text(video.uploader.clone())
+                .font(type_::SECTION)
+                .color(theme::text_faint())
+                .truncate(),
+        );
+    if app.selected == Some(index) {
+        card = card.fill(theme::active_row());
+    }
+    card
+}
+
+fn feed_title(tab: AppTab, author_name: &str) -> String {
+    match tab {
+        AppTab::Home => "为你推荐".into(),
+        AppTab::Search => "搜索".into(),
+        AppTab::Dynamic => "动态".into(),
+        AppTab::WatchLater => "稍后再看".into(),
+        AppTab::Favorites => "收藏夹".into(),
+        AppTab::History => "观看历史".into(),
+        AppTab::Author => author_name.to_string(),
+        AppTab::Login => "登录".into(),
+    }
+}
+
+fn empty_message(app: &BiliGuga) -> &'static str {
+    let logged_in = app.session.is_some();
+    match app.active_tab {
+        AppTab::Search => "没有找到视频，请换个关键词试试",
+        AppTab::Dynamic if !logged_in => "请先登录后查看动态",
+        AppTab::Dynamic => "暂时没有关注中的视频动态",
+        AppTab::WatchLater if !logged_in => "请先登录后查看稍后再看",
+        AppTab::WatchLater => "还没有稍后再看",
+        AppTab::Favorites if !logged_in => "请先登录后查看收藏夹",
+        AppTab::Favorites => "还没有收藏视频",
+        AppTab::History if !logged_in => "请先登录后查看观看历史",
+        AppTab::History => "还没有观看历史",
+        AppTab::Author => "该作者暂时没有公开视频",
+        _ => "没有加载到视频，请点击刷新重试",
+    }
+}
+
+fn loading_message(tab: AppTab) -> &'static str {
+    match tab {
+        AppTab::Search => "正在搜索 B 站视频…",
+        AppTab::Dynamic => "正在加载动态视频…",
+        AppTab::WatchLater => "正在加载稍后再看…",
+        AppTab::Favorites => "正在加载收藏夹…",
+        AppTab::History => "正在加载观看历史…",
+        AppTab::Author => "正在加载作者视频…",
+        _ => "正在加载 B 站推荐…",
+    }
+}
+
+fn render_search_bar(app: &BiliGuga) -> El {
+    row()
+        .w_full()
+        .gap(8.0)
+        .px(12.0)
+        .py(8.0)
+        .items_center()
+        .fill(theme::panel())
+        .child(
+            el()
+                .key("search-field")
+                .grow(1.0)
+                .h(32.0)
+                .radius(6.0)
+                .fill(theme::bg())
+                .border(1.0, theme::border())
+                .px(8.0)
+                .items_center()
+                .child(
+                    text_input(&app.search_edit, type_::BODY)
+                        .key("search-input")
+                        .w_full()
+                        .single_line()
+                        .placeholder("搜索视频", theme::text_faint())
+                        .color(theme::text())
+                        .on_edit(|app: &mut BiliGuga| &mut app.search_edit)
+                        .on_input_change(|app: &mut BiliGuga, _: &mut Tx| {
+                            app.search_query = app.search_edit.text.clone();
+                        })
+                        .on_submit(|app: &mut BiliGuga, _: &mut Tx| {
+                            app.search_query = app.search_edit.text.clone();
+                            app.load_search();
+                        }),
+                ),
+        )
+        .child(
+            el()
+                .key("search-button")
+                .h(32.0)
+                .px(12.0)
+                .radius(6.0)
+                .items_center()
+                .justify_center()
+                .cursor(rune::Cursor::Pointer)
+                .fill(theme::accent())
+                .hover(theme::accent_soft())
+                .on_press(|app: &mut BiliGuga| {
+                    app.search_query = app.search_edit.text.clone();
+                    app.load_search();
+                })
+                .child(text("搜索").font(type_::LABEL).color(Color::WHITE)),
+        )
+}
+
+fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
+    if app.active_tab == AppTab::Login {
+        return render_login(app);
+    }
+    let is_home = app.active_tab == AppTab::Home;
+    let is_loading = match app.active_tab {
+        AppTab::Home => app.loading && app.videos.is_empty(),
+        AppTab::Dynamic => app.dynamic_loading,
+        AppTab::WatchLater => app.watch_later_loading,
+        AppTab::Favorites => app.favorites_loading,
+        AppTab::History => app.history_loading,
+        AppTab::Author => app.author_loading,
+        _ => app.loading,
+    };
+    let videos = app.current_videos();
+
+    let mut header = row()
+        .w_full()
+        .px(12.0)
+        .py(12.0)
+        .items_center()
+        .justify_between()
+        .fill(theme::panel())
+        .child(
+            text(feed_title(app.active_tab, &app.author_name))
+                .font(type_::TITLE)
+                .color(theme::text()),
+        );
+    if app.active_tab != AppTab::Search {
+        header = header.child(
+            el()
+                .key("refresh")
+                .px(8.0)
+                .py(4.0)
+                .radius(4.0)
+                .cursor(rune::Cursor::Pointer)
+                .hover(theme::hover())
+                .on_press(|app: &mut BiliGuga| app.refresh_feed())
+                .child(text("刷新").font(type_::SECTION).color(theme::accent_soft())),
+        );
+    }
+
+    let body = if is_loading {
+        col().w_full().py(32.0).items_center().gap(6.0).child(
+            text(loading_message(app.active_tab))
+                .font(type_::BODY)
+                .color(theme::text_faint()),
+        )
+    } else if videos.is_empty() {
+        col().w_full().py(32.0).items_center().child(
+            text(empty_message(app))
+                .font(type_::BODY)
+                .color(theme::text_faint()),
+        )
+    } else if is_home {
+        col()
+            .key("home-grid")
+            .w_full()
+            .growth(GrowthSpec::default())
+            .gap(4.0)
+            .padding(4.0)
+            .virtual_rows(
+                videos.len().div_ceil(2),
+                GRID_CARD_HEIGHT + 4.0,
+                |_app: &BiliGuga, row_index| format!("grid-row-{row_index}").into(),
+                |app: &BiliGuga, row_index| {
+                    let videos = app.current_videos();
+                    let first = row_index * 2;
+                    let mut line = row().w_full().gap(4.0);
+                    if let Some(video) = videos.get(first) {
+                        line = line.child(video_card(app, first, video));
+                    }
+                    if let Some(video) = videos.get(first + 1) {
+                        line = line.child(video_card(app, first + 1, video));
+                    }
+                    line
+                },
+            )
+    } else {
+        col()
+            .key("video-list")
+            .w_full()
+            .growth(GrowthSpec::default())
+            .gap(2.0)
+            .padding(4.0)
+            .virtual_rows(
+                videos.len(),
+                90.0,
+                |app: &BiliGuga, index| {
+                    app.current_videos()
+                        .get(index)
+                        .map(|video| format!("row-{}", video.bvid))
+                        .unwrap_or_else(|| format!("row-{index}"))
+                        .into()
+                },
+                |app: &BiliGuga, index| {
+                    let videos = app.current_videos();
+                    match videos.get(index) {
+                        Some(video) => video_row(app, index, video),
+                        None => el(),
+                    }
+                },
+            )
+    };
+
+    let mut root = col()
+        .w(FEED_WIDTH)
+        .h_full()
+        .shrink()
+        .fill(theme::feed())
+        .child(header);
+    if app.active_tab == AppTab::Search {
+        root = root.child(render_search_bar(app));
+    }
+    let _ = cx;
+    root.child(
+        col()
+            .key("feed-scroll")
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .scroll(ScrollSpec { stick_bottom: false })
+            .child(body),
+    )
+}
+
+fn render_login(app: &BiliGuga) -> El {
+    let mut panel = col()
+        .w_full()
+        .h_full()
+        .padding(20.0)
+        .gap(12.0)
+        .items_center()
+        .fill(theme::feed());
+    if let Some(session) = &app.session {
+        panel = panel
+            .child(
+                text(format!("已登录：{}", session.username))
+                    .font(type_::TITLE)
+                    .color(theme::text()),
+            )
+            .child(
+                el()
+                    .px(12.0)
+                    .py(6.0)
+                    .radius(6.0)
+                    .cursor(rune::Cursor::Pointer)
+                    .fill(theme::panel())
+                    .hover(theme::hover())
+                    .on_press(|app: &mut BiliGuga| {
+                        login::clear_session();
+                        app.session = None;
+                        app.account_avatar = None;
+                        app.login_status = "使用哔哩哔哩 App 扫码登录".into();
+                        app.active_tab = AppTab::Home;
+                    })
+                    .child(text("退出登录").font(type_::LABEL).color(theme::danger())),
+            );
+        return panel;
+    }
+    if let Some(qr) = &app.login_qr {
+        panel = panel.child(
+            el()
+                .w(220.0)
+                .h(220.0)
+                .radius(8.0)
+                .pixels_fit(qr.pixels(), SurfaceFit::Fit),
+        );
+    }
+    panel = panel
+        .child(
+            text(app.login_status.clone())
+                .font(type_::BODY)
+                .color(theme::text_dim()),
+        )
+        .child(
+            el()
+                .px(12.0)
+                .py(6.0)
+                .radius(6.0)
+                .cursor(rune::Cursor::Pointer)
+                .fill(theme::accent())
+                .hover(theme::accent_soft())
+                .on_press(|app: &mut BiliGuga| app.start_login())
+                .child(text("刷新二维码").font(type_::LABEL).color(Color::WHITE)),
+        );
+    panel
+}
+
+/// A thin progress track with a filled portion, used for the seek bar and the volume.
+fn progress_bar(fraction: f32, height: f32) -> El {
+    let fraction = fraction.clamp(0., 1.);
+    col()
+        .w_full()
+        .h(height)
+        .radius(height / 2.0)
+        .fill(theme::track())
+        .child(
+            el()
+                .h(height)
+                .w_frac(fraction)
+                .radius(height / 2.0)
+                .fill(theme::accent()),
+        )
+}
+
+fn control_button(label: &'static str, key: &'static str) -> El {
+    el()
+        .key(key)
+        .px(8.0)
+        .py(4.0)
+        .radius(4.0)
+        .cursor(rune::Cursor::Pointer)
+        .hover(theme::hover())
+        .child(text(label).font(type_::LABEL).color(theme::text()))
+}
+
+fn render_player(app: &BiliGuga) -> El {
+    let Some(video) = &app.playing_video else {
+        return col()
+            .grow(1.0)
+            .h_full()
             .items_center()
             .justify_center()
-            .gap_3()
-            .text_center();
-        if let Some(session) = &self.session {
-            if let Some(image) = &self.account_avatar {
-                panel = panel.child(img(image.clone()).w(px(72.)).h(px(72.)));
-            } else {
-                panel = panel.child(
-                    div()
-                        .w(px(72.))
-                        .h(px(72.))
-                        .bg(rgb(0x454a56))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_2xl()
-                        .text_color(rgb(0xdce0e5))
-                        .child(session.username.chars().next().unwrap_or('?').to_string()),
-                );
-            }
-            panel = panel
-                .child(
-                    div()
-                        .text_lg()
-                        .text_color(rgb(0xdce0e5))
-                        .child(session.username.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x878a98))
-                        .child(format!("UID {} · 已登录", session.mid)),
-                );
-        } else {
-            if let Some(image) = &self.login_image {
-                panel = panel.child(img(image.clone()).w(px(240.)).h(px(240.)));
-            } else {
-                panel = panel.child(div().text_sm().text_color(rgb(0xa9afbc)).child(
-                    if self.login_loading {
-                        "正在准备登录…"
-                    } else {
-                        "点击刷新获取二维码"
-                    },
-                ));
-            }
-            panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0xa9afbc))
-                    .child(self.login_status.clone()),
-            );
-        }
-
-        if self.session.is_some() {
-            panel = panel.child(
-                div()
-                    .id("logout")
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(0xd07277))
-                    .bg(rgb(0x363c46))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x454a56)))
-                    .child("退出登录")
-                    .on_click(cx.listener(Self::logout)),
-            );
-        } else if !self.login_loading {
-            panel = panel.child(
-                div()
-                    .id("refresh-login")
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(0x74ade8))
-                    .bg(rgb(0x363c46))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x454a56)))
-                    .child("刷新二维码")
-                    .on_click(cx.listener(Self::refresh_login)),
-            );
-        }
-
-        div()
-            .w(px(414.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x2f343e))
+            .fill(theme::panel())
             .child(
-                div()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xdce0e5))
-                    .child(if self.session.is_some() {
-                        "账号"
-                    } else {
-                        "登录"
-                    }),
-            )
-            .child(panel)
-    }
+                text("暂无正在播放的视频")
+                    .font(type_::BODY)
+                    .color(theme::text_faint()),
+            );
+    };
 
-    fn render_feed(&mut self, cx: &mut Context<Self>) -> gpui::Div {
-        if self.active_tab == AppTab::Login {
-            return self.render_login(cx);
-        }
-        let is_home = self.active_tab == AppTab::Home;
-        let is_search = self.active_tab == AppTab::Search;
-        let is_dynamic = self.active_tab == AppTab::Dynamic;
-        let is_watch_later = self.active_tab == AppTab::WatchLater;
-        let is_favorites = self.active_tab == AppTab::Favorites;
-        let is_history = self.active_tab == AppTab::History;
-        let is_author = self.active_tab == AppTab::Author;
-        if is_home {
-            self.maybe_load_home_page(cx);
-        }
-        let is_loading = if is_home {
-            self.loading && self.videos.is_empty()
-        } else if is_dynamic {
-            self.dynamic_loading
-        } else if is_watch_later {
-            self.watch_later_loading
-        } else if is_favorites {
-            self.favorites_loading
-        } else if is_history {
-            self.history_loading
-        } else if is_author {
-            self.author_loading
-        } else {
-            self.loading
-        };
-        let search_input = self.search_input.clone();
-        let entity = cx.entity();
-        let mut feed = div()
-            .id("feed-scroll")
-            .w_full()
-            .flex_1()
-            .bg(rgb(0x0f141d))
-            .overflow_x_hidden();
-        if is_loading {
-            feed = feed.child(
-                div()
+    let status = app.player.status();
+    let duration = if status.duration.is_finite() && status.duration > 0. {
+        status.duration
+    } else {
+        0.
+    };
+    let position = if status.time_pos.is_finite() {
+        status.time_pos.clamp(0., duration.max(0.))
+    } else {
+        0.
+    };
+    let progress = if duration > 0. {
+        (position / duration) as f32
+    } else {
+        0.
+    };
+
+    // The stage: the video frame letterboxed on black, or a message until one arrives.
+    let stage_size = app.player_viewport_size.unwrap_or((1280, 720));
+    let mut stage = col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .items_center()
+        .justify_center()
+        .fill(Color::BLACK)
+        .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
+    match app.player.presented() {
+        Some(pixels) => {
+            stage = stage.child(
+                el()
+                    .key("video-frame")
                     .w_full()
-                    .py_8()
-                    .text_center()
-                    .text_sm()
-                    .text_color(rgb(0x7f8ca8))
-                    .child(div().text_color(rgb(0x8e8aff)).child("·  ·  ·"))
-                    .child(if is_search {
-                        "正在搜索 B 站视频…"
-                    } else if is_dynamic {
-                        "正在加载动态视频…"
-                    } else if is_watch_later {
-                        "正在加载稍后再看…"
-                    } else if is_favorites {
-                        "正在加载收藏夹…"
-                    } else if is_history {
-                        "正在加载观看历史…"
-                    } else if is_author {
-                        "正在加载作者视频…"
-                    } else {
-                        "正在加载 B 站推荐…"
-                    }),
+                    .h_full()
+                    .pixels_fit(&pixels, SurfaceFit::Fit),
             );
-        } else if self.current_videos().is_empty() {
-            feed = feed.child(
-                div()
-                    .w_full()
-                    .py_8()
-                    .text_center()
-                    .text_sm()
-                    .text_color(rgb(0x8d99b2))
-                    .child(div().text_color(rgb(0x505d78)).child("──"))
-                    .child(if is_search {
-                        "没有找到视频，请换个关键词试试"
-                    } else if is_dynamic {
-                        if self.session.is_some() {
-                            "暂时没有关注中的视频动态"
-                        } else {
-                            "请先登录后查看动态"
-                        }
-                    } else if is_watch_later {
-                        if self.session.is_some() {
-                            "还没有稍后再看"
-                        } else {
-                            "请先登录后查看稍后再看"
-                        }
-                    } else if is_favorites {
-                        if self.session.is_some() {
-                            "还没有收藏视频"
-                        } else {
-                            "请先登录后查看收藏夹"
-                        }
-                    } else if is_history {
-                        if self.session.is_some() {
-                            "还没有观看历史"
-                        } else {
-                            "请先登录后查看观看历史"
-                        }
-                    } else if is_author {
-                        "该作者暂时没有公开视频"
-                    } else {
-                        "没有加载到视频，请点击刷新重试"
-                    }),
-            );
-        } else {
-            let list = if is_home {
-                let row_count = self.videos.len().div_ceil(2);
-                uniform_list(
-                    "video-grid",
-                    row_count,
-                    cx.processor(move |this, range: Range<usize>, _window, _cx| {
-                        range
-                            .filter_map(|row_index| {
-                                let first_index = row_index * 2;
-                                let first_video = this.videos.get(first_index)?.clone();
-                                let mut row = div()
-                                    .w_full()
-                                    .h(px(HOME_GRID_ROW_HEIGHT))
-                                    .flex()
-                                    .gap_2()
-                                    .px_3()
-                                    .pt_2();
-                                row = row.child(BiliGuga::render_video_grid_card(
-                                    first_index,
-                                    first_video,
-                                    first_index == this.selected,
-                                    entity.clone(),
-                                ));
-                                if let Some(second_video) = this.videos.get(first_index + 1).cloned()
-                                {
-                                    row = row.child(BiliGuga::render_video_grid_card(
-                                        first_index + 1,
-                                        second_video,
-                                        first_index + 1 == this.selected,
-                                        entity.clone(),
-                                    ));
-                                } else {
-                                    row = row.child(
-                                        div()
-                                            .w(px(HOME_GRID_CARD_WIDTH))
-                                            .flex_none(),
-                                    );
-                                }
-                                Some(row)
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
-                .size_full()
-            } else {
-                uniform_list(
-                    "video-list",
-                    self.current_videos().len(),
-                    cx.processor(move |this, range: Range<usize>, _window, _cx| {
-                        range
-                            .filter_map(|index| {
-                                let video = this.current_videos().get(index)?.clone();
-                                let selected = index == this.selected;
-                                Some(BiliGuga::render_video_card(
-                                    index,
-                                    video,
-                                    selected,
-                                    entity.clone(),
-                                ))
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::FitList)
-                .size_full()
-            };
-            let list = if is_home {
-                list.track_scroll(self.home_scroll_handle.clone())
-                    .on_scroll_wheel(cx.listener(Self::note_home_scroll))
-            } else {
-                list
-            };
-            feed = feed.child(list);
         }
-        let feed_title = if is_search {
-            SharedString::from("搜索")
-        } else if is_dynamic {
-            SharedString::from("动态")
-        } else if is_watch_later {
-            SharedString::from("稍后再看")
-        } else if is_favorites {
-            SharedString::from("收藏夹")
-        } else if is_history {
-            SharedString::from("观看历史")
-        } else if is_author {
-            SharedString::from(self.author_name.clone())
-        } else {
-            SharedString::from("为你推荐")
-        };
-        let mut header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .py_3()
-            .bg(rgb(0x111722))
-            .border_b_1()
-            .border_color(rgb(0x20293a))
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xe1e5f2))
-                    .child(feed_title),
+        None => {
+            let message = app.playback_error.clone().unwrap_or_else(|| {
+                if app.playback == PlaybackState::Buffering {
+                    "正在缓冲…".into()
+                } else {
+                    "点击播放开始观看".into()
+                }
+            });
+            stage = stage.child(
+                text(message).font(type_::BODY).color(if app.playback_error.is_some() {
+                    theme::danger()
+                } else {
+                    theme::text_faint()
+                }),
             );
-        if !is_search {
-            header = header.child(
-                div()
-                    .id("refresh-feed")
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(0x74ade8))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x363c46)))
-                    .child("刷新")
-                    .on_click(cx.listener(move |app, event, window, cx| {
-                        if is_author {
-                            app.refresh_author_videos(event, window, cx);
-                        } else if is_dynamic {
-                            app.refresh_dynamic(event, window, cx);
-                        } else if is_watch_later {
-                            app.refresh_watch_later(event, window, cx);
-                        } else if is_favorites {
-                            app.refresh_favorites(event, window, cx);
-                        } else if is_history {
-                            app.refresh_history(event, window, cx);
-                        } else {
-                            app.refresh(event, window, cx);
-                        }
-                    })),
-            );
-            if is_author && self.author_has_more {
-                header = header.child(
-                    div()
-                        .id("author-load-more")
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .text_color(rgb(0x74ade8))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x363c46)))
-                        .child("加载更多")
-                        .on_click(cx.listener(Self::load_more_author_videos)),
-                );
-            }
         }
-        let search_bar = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .bg(rgb(0x111722))
-            .child(
-                div()
-                    .id("search-box")
-                    .flex_1()
-                    .h(px(32.))
-                    .on_key_down(cx.listener(Self::search_key_down))
-                    .child(search_input),
-            )
-            .child(
-                div()
-                    .id("search-button")
-                    .h(px(32.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(rgb(0xe9eaff))
-                    .bg(rgb(0x5d59c8))
-                    .border_1()
-                    .border_color(rgb(0x8e8aff))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x716cf0)))
-                    .child("搜索")
-                    .on_click(cx.listener(Self::submit_search)),
-            );
-        let mut root = div()
-            .w(px(414.))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x0f141d))
-            .child(header);
-        if is_search {
-            root = root.child(search_bar);
-        }
-        root.child(feed)
     }
+    let _ = stage_size;
 
-    fn render_comments(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut section = div()
-            .w_full()
-            .px(px(10.))
-            .pb(px(12.))
-            .flex()
-            .flex_col()
-            .gap_2();
-        let count = if self.comments_total > 0 {
-            self.comments_total
-        } else {
-            self.comments.len() as i64
-        };
-        section = section.child(
-            div()
+    // The controls, over the stage, while the pointer has been around recently.
+    let controls_visible = app.controls_visible();
+    let controls = col()
+        .w_full()
+        .gap(6.0)
+        .px(12.0)
+        .py(8.0)
+        .fill(theme::panel())
+        .child(progress_bar(progress, 4.0))
+        .child(
+            row()
                 .w_full()
-                .flex()
+                .items_center()
+                .gap(8.0)
+                .child(
+                    control_button(
+                        if app.playback == PlaybackState::Playing {
+                            "暂停"
+                        } else {
+                            "播放"
+                        },
+                        "play-pause",
+                    )
+                    .on_press(|app: &mut BiliGuga| app.toggle_pause()),
+                )
+                .child(
+                    text(format!(
+                        "{} / {}",
+                        format_time(position),
+                        format_time(duration)
+                    ))
+                    .font(type_::LABEL)
+                    .color(theme::text_dim()),
+                )
+                .child(el().grow(1.0))
+                .child(
+                    control_button("倍速", "speed")
+                        .on_press(|app: &mut BiliGuga| app.cycle_speed()),
+                )
+                .child(
+                    text(format!("{:.2}x", app.speed))
+                        .font(type_::LABEL)
+                        .color(theme::text_dim()),
+                )
+                .child(
+                    control_button("全屏", "fullscreen")
+                        .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
+                            app.player_fullscreen = !app.player_fullscreen;
+                            tx.toggle_full_screen();
+                        }),
+                ),
+        );
+
+    let mut root = col()
+        .key("player")
+        .grow(1.0)
+        .min_h(0.0)
+        .h_full()
+        .fill(theme::panel())
+        .child(stage);
+    if controls_visible {
+        root = root.child(controls);
+    }
+    root.child(render_comments(app, video))
+}
+
+fn render_comments(app: &BiliGuga, video: &Video) -> El {
+    let mut section = col()
+        .key("comments")
+        .w_full()
+        .max_h(220.0)
+        .gap(4.0)
+        .px(12.0)
+        .py(8.0)
+        .fill(theme::panel())
+        .child(
+            row()
+                .w_full()
                 .items_center()
                 .justify_between()
                 .child(
-                    div()
-                        .text_lg()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0xdce0e5))
-                        .child(format!("评论 {}", count)),
+                    text(format!("评论 {}", app.comments_total.max(0)))
+                        .font(type_::LABEL)
+                        .color(theme::text_dim()),
                 )
-                .child(div().text_xs().text_color(rgb(0x878a98)).child(
-                    if self.comments_page > 0 {
-                        "按热度"
-                    } else {
-                        "正在准备"
-                    },
-                )),
+                .child(
+                    text(video.uploader.clone())
+                        .font(type_::LABEL)
+                        .color(theme::text_faint()),
+                ),
         );
-
-        if self.comments.is_empty() && self.comments_loading {
-            return section.child(
-                div()
-                    .py_5()
-                    .text_sm()
-                    .text_color(rgb(0x878a98))
-                    .child("正在加载评论…"),
-            );
-        }
-        if let Some(error) = &self.comments_error {
-            return section.child(
-                div()
-                    .py_4()
-                    .flex()
+    if app.comments_loading && app.comments.is_empty() {
+        section = section.child(
+            text("正在加载评论…")
+                .font(type_::LABEL)
+                .color(theme::text_faint()),
+        );
+    } else if let Some(error) = &app.comments_error {
+        section = section.child(text(error.clone()).font(type_::LABEL).color(theme::danger()));
+    } else if app.comments.is_empty() {
+        section = section.child(
+            text("还没有评论")
+                .font(type_::LABEL)
+                .color(theme::text_faint()),
+        );
+    } else {
+        // A scroll viewport needs a bounded height: inside an auto-height column `.grow()`
+        // resolves to 0 pt (Rune's own debug warning says so), so the list gets one outright.
+        section = section.child(
+            col()
+                .key("comment-list")
+                .w_full()
+                .h(150.0)
+                .scroll(ScrollSpec { stick_bottom: false })
+                .children(app.comments.iter().map(|comment| {
+                    col()
+                        .w_full()
+                        .gap(1.0)
+                        .padding(4.0)
+                        .child(
+                            row()
+                                .gap(6.0)
+                                .child(
+                                    text(comment.username.clone())
+                                        .font(type_::LABEL)
+                                        .color(theme::accent_soft()),
+                                )
+                                .child(
+                                    text(comment.time.clone())
+                                        .font(type_::SECTION)
+                                        .color(theme::text_faint()),
+                                ),
+                        )
+                        .child(
+                            text(comment.message.clone())
+                                .font(type_::LABEL)
+                                .color(theme::text_dim())
+                                .wrap(),
+                        )
+                })),
+        );
+        if app.comments_has_more {
+            section = section.child(
+                el()
+                    .w_full()
+                    .py(4.0)
                     .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(rgb(0xd07277))
-                    .child(error.clone())
+                    .cursor(rune::Cursor::Pointer)
+                    .hover(theme::hover())
+                    .on_press(|app: &mut BiliGuga| app.load_comments(false))
                     .child(
-                        div()
-                            .id("comments-retry")
-                            .cursor_pointer()
-                            .text_color(rgb(0x74ade8))
-                            .child("重试")
-                            .on_click(cx.listener(Self::retry_comments)),
+                        text("加载更多评论")
+                            .font(type_::SECTION)
+                            .color(theme::accent_soft()),
                     ),
             );
         }
-        if self.comments.is_empty() {
-            return section.child(
-                div()
-                    .py_5()
-                    .text_sm()
-                    .text_color(rgb(0x878a98))
-                    .child("还没有评论"),
-            );
-        }
-
-        for comment in &self.comments {
-            let mut item = div()
-                .id(SharedString::from(format!("comment-{}", comment.rpid)))
-                .w_full()
-                .py_2()
-                .flex()
-                .flex_col()
-                .gap_1();
-            item = item
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .child(div().text_color(rgb(0x74ade8)).child(
-                            if comment.username.is_empty() {
-                                "用户".to_string()
-                            } else {
-                                comment.username.clone()
-                            },
-                        ))
-                        .child(
-                            div()
-                                .text_color(rgb(0x878a98))
-                                .child(format!("{}  ·  {}赞", comment.time, comment.like)),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .text_sm()
-                        .line_height(px(22.))
-                        .text_color(rgb(0xdce0e5))
-                        .child(comment.message.clone()),
-                );
-            section = section.child(item);
-        }
-
-        if self.comments_loading {
-            section = section.child(
-                div()
-                    .py_3()
-                    .text_center()
-                    .text_xs()
-                    .text_color(rgb(0x878a98))
-                    .child("正在加载更多…"),
-            );
-        } else if self.comments_has_more {
-            section = section.child(
-                div()
-                    .id("comments-load-more")
-                    .w_full()
-                    .py_2()
-                    .text_center()
-                    .text_xs()
-                    .text_color(rgb(0x74ade8))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x363c46)))
-                    .child("加载更多评论")
-                    .on_click(cx.listener(Self::load_more_comments)),
-            );
-        }
-        section
     }
+    section
+}
 
-    fn toggle_collection(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let closed_menu = self.menu_closed_by_outside.take();
-        if closed_menu == Some(PlayerMenu::Collection) {
-            return;
-        }
-        self.collection_menu_open = if closed_menu.is_some() {
-            true
-        } else {
-            !self.collection_menu_open
-        };
-        self.speed_menu_open = false;
-        self.quality_menu_open = false;
-        if self.collection_menu_open
-            && let Some(index) = self.collection_episode_index()
-        {
-            self.collection_scroll_handle
-                .scroll_to_item_strict(index, ScrollStrategy::Center);
-        }
-        cx.notify();
+fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
+    let mut root = row().w_full().h_full().fill(theme::bg());
+    if app.player_fullscreen {
+        return root.child(render_player(app));
     }
+    root = root
+        .child(render_sidebar(app))
+        .child(render_feed(app, cx));
+    root.child(render_player(app))
+}
 
-    fn render_collection_popup(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(collection) = &self.collection else {
-            return div().into_any_element();
-        };
-        if collection.episodes.is_empty() {
-            return div().into_any_element();
-        }
-        let episode_count = collection.episodes.len();
-        let popup_height = px(collection.episodes.len().min(8) as f32 * 34. + 26.);
-        let entity = cx.entity();
-        let collection_scroll_handle = self.collection_scroll_handle.clone();
-        let list = uniform_list(
-            "collection-popup-list",
-            episode_count,
-            cx.processor(move |this, range: Range<usize>, _window, _cx| {
-                range
-                    .filter_map(|index| {
-                        let episode = this.collection.as_ref()?.episodes.get(index)?.clone();
-                        let current = this.playing_video.as_ref();
-                        let is_current = current
-                            .map(|current| {
-                                episode.bvid == current.bvid
-                                    && (episode.cid <= 0
-                                        || current.cid <= 0
-                                        || episode.cid == current.cid)
-                            })
-                            .unwrap_or(false);
-                        let click_entity = entity.clone();
-                        let mut row = div()
-                            .id(SharedString::from(format!("collection-episode-{index}")))
-                            .w_full()
-                            .h(px(34.))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .cursor_pointer()
-                            .when(is_current, |this| this.bg(rgb(0x454a56)))
-                            .when(!is_current, |this| {
-                                this.hover(|style| style.bg(rgb(0x3d4350)))
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_xs()
-                                    .text_color(if is_current {
-                                        rgb(0x74ade8)
-                                    } else {
-                                        rgb(0xdce0e5)
-                                    })
-                                    .text_ellipsis()
-                                    .child(format!("{}. {}", index + 1, episode.title)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x878a98))
-                                    .child(episode.duration.clone()),
-                            )
-                            .on_click(move |event, window, cx| {
-                                click_entity.update(cx, |app, cx| {
-                                    app.select_collection_episode(index, event, window, cx);
-                                });
-                            });
-                        if is_current {
-                            row = row.text_color(rgb(0x74ade8));
+// ---- Runtime hooks ---------------------------------------------------------------------------
+
+/// Called once, before the first frame, with the handle other threads use to wake the window.
+fn setup(app: &mut BiliGuga, waker: Waker) {
+    app.images = Some(ImageCache::new(waker.clone()));
+    if let Some(worker) = app.worker.as_mut() {
+        worker.waker = waker;
+    }
+    // Everything slow starts here, after the first frame: the window opens at once.
+    let cookie = app.session.as_ref().map(|session| session.cookie.clone());
+    app.load_home_page(false);
+    let _ = cookie;
+    if app.session.is_some() {
+        app.refresh_session();
+    }
+}
+
+/// Runs at the start of every frame. Returns true only when something visibly changed, so an
+/// idle window draws nothing and arms no timer.
+fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
+    let mut changed = false;
+
+    while let Ok(event) = app.events.try_recv() {
+        changed = true;
+        match event {
+            Event::Home(result, generation) => {
+                if generation != app.home_generation || app.active_tab != AppTab::Home {
+                    continue;
+                }
+                app.home_loading = false;
+                app.loading = false;
+                match result {
+                    Ok(page) => {
+                        app.home_page = app.home_page.max(1);
+                        let old_len = app.videos.len();
+                        for video in page.videos {
+                            if !app.videos.iter().any(|current| current.bvid == video.bvid) {
+                                app.videos.push(video);
+                            }
                         }
-                        Some(row)
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .track_scroll(collection_scroll_handle)
-        .flex_1();
-        div()
-            .id("collection-popup")
-            .absolute()
-            .bottom(px(36.))
-            .right_0()
-            .w(px(300.))
-            .h(popup_height)
-            .bg(rgb(0x1d2027))
-            .flex()
-            .flex_col()
-            .on_mouse_down_out(cx.listener(Self::close_player_menus))
-            .on_scroll_wheel(|_, _, cx| {
-                // The collection popup owns the wheel while it is open. Otherwise a
-                // wheel event that reaches the popup can continue to the player page.
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .w_full()
-                    .h(px(26.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(0x878a98))
-                    .text_ellipsis()
-                    .child(collection.title.clone()),
-            )
-            .child(list)
-            .into_any_element()
+                        let added = app.videos.len().saturating_sub(old_len);
+                        app.home_has_more = page.has_more && (app.home_page == 1 || added > 0);
+                        app.trim_home_items();
+                        app.request_missing_covers();
+                    }
+                    Err(_) => app.home_has_more = false,
+                }
+            }
+            Event::Search(result) => {
+                app.loading = false;
+                match result {
+                    Ok(videos) => {
+                        app.search_results = videos;
+                        app.selected = None;
+                        app.request_missing_covers();
+                    }
+                    Err(error) => app.playback_error = Some(error),
+                }
+            }
+            Event::Dynamic(result) => {
+                app.dynamic_loading = false;
+                if let Ok(videos) = result {
+                    app.dynamic_videos = videos;
+                    app.request_missing_covers();
+                }
+            }
+            Event::History(result) => {
+                app.history_loading = false;
+                if let Ok(videos) = result {
+                    app.history = videos;
+                    app.request_missing_covers();
+                }
+            }
+            Event::WatchLater(result) => {
+                app.watch_later_loading = false;
+                if let Ok(videos) = result {
+                    app.watch_later = videos;
+                    app.request_missing_covers();
+                }
+            }
+            Event::Favorites(result) => {
+                app.favorites_loading = false;
+                if let Ok(videos) = result {
+                    app.favorites = videos;
+                    app.request_missing_covers();
+                }
+            }
+            Event::Author(result, generation) => {
+                if generation != app.author_generation {
+                    continue;
+                }
+                app.author_loading = false;
+                if let Ok(page) = result {
+                    app.author_page = page.page;
+                    app.author_has_more = page.has_more;
+                    app.author_videos.extend(page.videos);
+                    app.request_missing_covers();
+                }
+            }
+            Event::VideoContext(context) => {
+                app.detail_view_count = context.view_count;
+                app.detail_danmaku_count = context.danmaku_count;
+                app.detail_like_count = context.like_count;
+                app.published_at = format_publish_date(context.pubdate);
+                app.collection = context.collection;
+                if let Some(video) = app.playing_video.as_mut() {
+                    if video.aid == 0 {
+                        video.aid = context.aid;
+                    }
+                    if video.cid == 0 {
+                        video.cid = context.cid;
+                    }
+                }
+            }
+            Event::PlayUrl(result) => match result {
+                Ok(play) => app.finish_play(play),
+                Err(error) => {
+                    app.playback = PlaybackState::Idle;
+                    app.playback_error = Some(error);
+                }
+            },
+            Event::Resume(progress) => {
+                app.cloud_resume_progress = progress.filter(|progress| *progress > 3.);
+                app.cloud_resume_applied = app.cloud_resume_progress.is_none();
+            }
+            Event::Comments(result, generation) => {
+                if generation != app.comments_generation {
+                    continue;
+                }
+                app.comments_loading = false;
+                match result {
+                    Ok((page, comments, total, has_more)) => {
+                        if page <= 1 {
+                            app.comments.clear();
+                        }
+                        app.comments.extend(comments);
+                        app.comments_total = total;
+                        app.comments_has_more = has_more;
+                        app.comments_page = page as u32;
+                    }
+                    Err(error) => app.comments_error = Some(error),
+                }
+            }
+            Event::Avatar(image) => {
+                if let Some(image) = image
+                    && let Some(cache) = app.images.as_ref()
+                {
+                    app.account_avatar =
+                        Some(cache.rgba(image.width, image.height, image.pixels.clone()));
+                }
+            }
+            Event::QrCode(result, generation) => {
+                if generation != app.login_generation {
+                    continue;
+                }
+                app.login_loading = false;
+                match result {
+                    Ok(data) => {
+                        app.login_key = Some(data.key);
+                        if let Some(cache) = app.images.as_ref() {
+                            app.login_qr = Some(cache.rgba(
+                                data.image.width,
+                                data.image.height,
+                                data.image.pixels.clone(),
+                            ));
+                        }
+                        app.login_status = "请使用哔哩哔哩 App 扫码登录".into();
+                        app.poll_login();
+                    }
+                    Err(error) => app.login_status = error,
+                }
+            }
+            Event::QrPoll(result, generation) => {
+                if generation != app.login_generation {
+                    continue;
+                }
+                match result {
+                    Ok(PollResult::Waiting) => app.poll_login(),
+                    Ok(PollResult::Scanned) => {
+                        app.login_status = "已扫码，请在手机上确认".into();
+                        app.poll_login();
+                    }
+                    Ok(PollResult::LoggedIn(session)) => {
+                        let _ = login::save_session(&session);
+                        app.session = Some(session);
+                        app.login_status = "登录成功".into();
+                        app.active_tab = AppTab::Home;
+                        app.load_home_page(true);
+                    }
+                    Ok(PollResult::Expired) => {
+                        app.login_status = "二维码已过期，请刷新".into();
+                        app.login_qr = None;
+                    }
+                    Err(error) => app.login_status = error,
+                }
+            }
+            Event::Session(result) => {
+                if let Ok(session) = result {
+                    let _ = login::save_session(&session);
+                    app.session = Some(session);
+                    app.load_dynamic();
+                }
+            }
+            Event::Action(_action) => {}
+            Event::PlaybackMessage(message) => {
+                app.playback_error = message;
+            }
+            Event::Cover(bvid, pixels) => app.attach_cover(&bvid, pixels),
+        }
     }
 
-    fn render_player(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(video) = self.playing_video.clone() else {
-            return div()
-                .id("player-scroll")
-                .flex_1()
-                .h_full()
-                .bg(rgb(0x0f141d))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x878a98))
-                        .child("暂无正在播放的视频"),
-                )
-                .into_any_element();
-        };
-        let status = self.player.status();
-        let playing = self.playback == PlaybackState::Playing;
-        let paused = self.playback == PlaybackState::Paused;
-        let buffering = self.playback == PlaybackState::Buffering;
-        let frame = self.player.frame();
-        let frame_size = self.player.frame_size();
-        let source_size = self.player.source_size().or(frame_size);
+    // Player state. Only while something is playing, and only a changed value counts as a
+    // change: the video frames themselves do not need this loop at all, because `Pixels::set`
+    // wakes the window on its own. What runs here keeps the seek bar and the clock honest,
+    // about ten times a second.
+    if app.playback != PlaybackState::Idle {
+        if app.player.poll_frame() {
+            changed = true;
+        }
+        let status = app.player.status();
         let duration = if status.duration.is_finite() && status.duration > 0. {
             status.duration
         } else {
             0.
         };
-        let position = if status.time_pos.is_finite() {
-            status.time_pos.clamp(0., duration.max(0.))
-        } else {
-            0.
-        };
-        let progress = if duration > 0. {
-            (position / duration).clamp(0., 1.) as f32
-        } else {
-            0.
-        };
-        let entity = cx.entity();
-        let author_mid = video.uploader_mid;
-        let author_name = video.uploader.clone();
-        let author_entity = entity.clone();
-        let detail_view_count = self.detail_view_count.clone();
-        let detail_danmaku_count = self.detail_danmaku_count.clone();
-        let detail_like_count = self.detail_like_count.clone();
-        let published_at = self.published_at.clone();
-        let mut stage = div()
-            .w_full()
-            .overflow_hidden()
-            .bg(rgb(0x000000))
-            .flex()
-            .items_center()
-            .justify_center()
-            .relative()
-            .on_mouse_move(cx.listener(Self::show_player_controls));
-        if self.player_fullscreen {
-            stage = stage.h_full();
-        } else {
-            let aspect_ratio = source_size
-                .filter(|(_, height)| *height > 0)
-                .map(|(width, height)| width as f32 / height as f32)
-                .unwrap_or(16. / 9.);
-            stage.style().aspect_ratio = Some(aspect_ratio);
-        }
-
-        if let Some(frame) = frame {
-            stage = stage.child(
-                img(frame)
-                    .w_full()
-                    .h_full()
-                    .object_fit(gpui::ObjectFit::Contain),
-            );
-        } else {
-            let player_message = self.playback_error.clone().unwrap_or_else(|| {
-                SharedString::from(if buffering {
-                    "正在缓冲…"
-                } else {
-                    "点击播放开始观看"
-                })
-            });
-            stage = stage.child(
-                div()
-                    .text_sm()
-                    .text_color(if self.playback_error.is_some() {
-                        rgb(0xd07277)
-                    } else {
-                        rgb(0x878a98)
-                    })
-                    .child(player_message),
-            );
-        }
-
-        if !self.controls_visible && duration > 0. {
-            let mini_progress = div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .h(px(2.))
-                .bg(rgba(0x00000066))
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(progress))
-                        .bg(rgb(0x74ade8)),
-                );
-            stage = stage.child(mini_progress);
-        }
-
-        if self.controls_visible {
-            let seek_entity = entity.clone();
-            let progress_bar = div()
-                .id("player-progress-bar")
-                .relative()
-                .w_full()
-                .h(px(14.))
-                .cursor_pointer()
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .top(px(5.))
-                        .h(px(4.))
-                        .bg(rgba(0xffffff33)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(5.))
-                        .h(px(4.))
-                        .w(relative(progress))
-                        .bg(rgb(0x74ade8)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(3.))
-                        .left(relative(progress))
-                        .w(px(8.))
-                        .h(px(8.))
-                        .bg(rgb(0xffffff)),
-                )
-                .child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds, _, window, _| {
-                            let entity = seek_entity.clone();
-                            window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
-                                if phase == DispatchPhase::Bubble
-                                    && event.button == MouseButton::Left
-                                    && bounds.contains(&event.position)
-                                {
-                                    entity.update(cx, |app, cx| {
-                                        app.seek_dragging = true;
-                                        app.set_progress_from_position(event.position, bounds, cx);
-                                    });
-                                }
-                            });
-                            let entity = seek_entity.clone();
-                            window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
-                                entity.update(cx, |app, cx| {
-                                    if app.seek_dragging
-                                        && event.pressed_button == Some(MouseButton::Left)
-                                    {
-                                        app.set_progress_from_position(event.position, bounds, cx);
-                                    }
-                                });
-                            });
-                            let entity = seek_entity.clone();
-                            window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
-                                if event.button == MouseButton::Left {
-                                    entity.update(cx, |app, _| {
-                                        app.seek_dragging = false;
-                                    });
-                                }
-                            });
-                        },
-                    )
-                    .size_full(),
-                );
-            let play_label = if buffering {
-                "…"
-            } else if playing {
-                "⏸"
+        let reaching_end = duration > 0.
+            && status.time_pos.is_finite()
+            && status.time_pos >= duration - 0.25
+            && app.playback != PlaybackState::Buffering;
+        if reaching_end {
+            app.playback = PlaybackState::Idle;
+            app.pending_pause = None;
+            changed = true;
+        } else if app.playback == PlaybackState::Buffering && status.time_pos.is_finite() {
+            app.playback = if status.paused {
+                PlaybackState::Paused
             } else {
-                "▶"
+                PlaybackState::Playing
             };
-            let play_handler = if playing || paused {
-                Self::toggle_pause
-            } else {
-                Self::play_selected
-            };
-            let volume_entity = entity.clone();
-            let volume_slider = div()
-                .relative()
-                .w(px(72.))
-                .h(px(14.))
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .top(px(5.))
-                        .h(px(4.))
-                        .bg(rgb(0x464b57)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(5.))
-                        .h(px(4.))
-                        .w(relative((self.volume / 100.).clamp(0., 1.) as f32))
-                        .bg(rgb(0x74ade8)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(3.))
-                        .left(relative((self.volume / 100.).clamp(0., 1.) as f32))
-                        .w(px(7.))
-                        .h(px(8.))
-                        .bg(rgb(0xdce0e5)),
-                )
-                .child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds, _, window, _| {
-                            let entity = volume_entity.clone();
-                            window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
-                                if phase == DispatchPhase::Bubble
-                                    && event.button == MouseButton::Left
-                                    && bounds.contains(&event.position)
-                                {
-                                    entity.update(cx, |app, cx| {
-                                        app.volume_dragging = true;
-                                        app.set_volume_from_position(event.position, bounds, cx);
-                                    });
-                                }
-                            });
-                            let entity = volume_entity.clone();
-                            window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
-                                entity.update(cx, |app, cx| {
-                                    if app.volume_dragging
-                                        && event.pressed_button == Some(MouseButton::Left)
-                                    {
-                                        app.set_volume_from_position(event.position, bounds, cx);
-                                    }
-                                });
-                            });
-                            let entity = volume_entity.clone();
-                            window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
-                                if event.button == MouseButton::Left {
-                                    entity.update(cx, |app, _| {
-                                        app.volume_dragging = false;
-                                        app.persist_player_settings();
-                                    });
-                                }
-                            });
-                        },
-                    )
-                    .size_full(),
-                );
-
-            let mut speed_popup = div()
-                .id("speed-popup")
-                .absolute()
-                .bottom(px(36.))
-                .right_0()
-                .w(px(76.))
-                .bg(rgb(0x252a33))
-                .flex()
-                .flex_col();
-            speed_popup = speed_popup.on_mouse_down_out(cx.listener(Self::close_player_menus));
-            for speed in SPEED_OPTIONS {
-                let selected_speed = (speed - self.speed).abs() < 0.01;
-                speed_popup = speed_popup.child(
-                    div()
-                        .id(SharedString::from(format!("speed-option-{speed}")))
-                        .w_full()
-                        .py_1()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_center()
-                        .text_xs()
-                        .whitespace_nowrap()
-                        .text_color(if selected_speed {
-                            rgb(0x74ade8)
-                        } else {
-                            rgb(0xdce0e5)
-                        })
-                        .when(selected_speed, |this| this.bg(rgb(0x363c46)))
-                        .when(!selected_speed, |this| {
-                            this.hover(|style| style.bg(rgb(0x363c46)))
-                        })
-                        .cursor_pointer()
-                        .child(format!("{speed:.2}x"))
-                        .on_click(cx.listener(move |app, event, window, cx| {
-                            app.select_speed(speed, event, window, cx);
-                        })),
-                );
-            }
-
-            let quality_text = self
-                .quality_options
-                .iter()
-                .find(|option| option.qn == self.quality)
-                .map(|option| option.label.clone())
-                .unwrap_or_else(|| quality_label(self.quality));
-            let mut quality_popup = div()
-                .id("quality-popup")
-                .absolute()
-                .bottom(px(36.))
-                .right_0()
-                .w(px(112.))
-                .bg(rgb(0x1d2027))
-                .flex()
-                .flex_col();
-            quality_popup = quality_popup.on_mouse_down_out(cx.listener(Self::close_player_menus));
-            for option in self.quality_options.iter().cloned() {
-                let quality = option.qn;
-                let selected_quality = quality == self.quality;
-                let requires_vip = quality >= 112;
-                let requires_login = (80..112).contains(&quality);
-                let has_permission = if requires_vip {
-                    self.session
-                        .as_ref()
-                        .map(|session| session.is_vip)
-                        .unwrap_or(false)
-                } else if requires_login {
-                    self.session.is_some()
-                } else {
-                    true
-                };
-                let enabled = has_permission && option.switchable;
-                let mut quality_row = div()
-                    .id(SharedString::from(format!("quality-option-{quality}")))
-                    .w_full()
-                    .h(px(26.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_xs()
-                    .whitespace_nowrap()
-                    .text_color(if selected_quality {
-                        rgb(0x74ade8)
-                    } else if enabled {
-                        rgb(0xdce0e5)
-                    } else {
-                        rgb(0x737985)
-                    })
-                    .when(enabled && !selected_quality, |this| {
-                        this.hover(|style| style.bg(rgb(0x2a303a)))
-                    });
-
-                quality_row = quality_row.child(option.label);
-                if requires_vip && !has_permission {
-                    quality_row = quality_row.child(div().text_color(rgb(0xf0bd58)).child("VIP"));
-                } else if requires_login && !has_permission {
-                    quality_row = quality_row.child(div().text_color(rgb(0xaeb4c0)).child("登录"));
-                }
-                if enabled && !selected_quality {
-                    quality_row = quality_row.on_click(cx.listener(move |app, event, window, cx| {
-                        app.select_quality(quality, event, window, cx);
-                    }));
-                }
-                quality_popup = quality_popup.child(quality_row);
-            }
-            let collection_popup = self.render_collection_popup(cx);
-            let collection_index = self.collection_episode_index();
-            let has_previous_episode = collection_index.is_some_and(|index| index > 0);
-            let has_next_episode = collection_index.is_some_and(|index| {
-                self.collection
-                    .as_ref()
-                    .is_some_and(|collection| index + 1 < collection.episodes.len())
-            });
-            let mut previous_episode = div()
-                .id("player-previous-episode")
-                .px_1()
-                .py_1()
-                .text_xs()
-                .text_color(if has_previous_episode {
-                    rgb(0xdce0e5)
-                } else {
-                    rgb(0x737985)
-                })
-                .child("上一集");
-            if has_previous_episode {
-                previous_episode = previous_episode
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x363c46)))
-                    .on_click(cx.listener(Self::play_previous_episode));
-            }
-            let mut next_episode = div()
-                .id("player-next-episode")
-                .px_1()
-                .py_1()
-                .text_xs()
-                .text_color(if has_next_episode {
-                    rgb(0xdce0e5)
-                } else {
-                    rgb(0x737985)
-                })
-                .child("下一集");
-            if has_next_episode {
-                next_episode = next_episode
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x363c46)))
-                    .on_click(cx.listener(Self::play_next_episode));
-            }
-
-            let controls = div()
-                .id("player-controls-bar")
-                .absolute()
-                .left_0()
-                .right_0()
-            .bottom_0()
-            .bg(rgba(0x000000cc))
-            .opacity(self.controls_opacity)
-            .text_color(rgb(0xdce0e5))
-                .flex()
-                .flex_col()
-                .child(progress_bar)
-                .child(
-                    div()
-                        .w_full()
-                        .px_3()
-                        .pt_1()
-                        .pb_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id("player-play-overlay")
-                                .w(px(28.))
-                                .h(px(28.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x363c46)))
-                                .child(play_label)
-                                .on_click(cx.listener(play_handler)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xa9afbc))
-                                .child(format!(
-                                    "{} / {}",
-                                    format_time(position),
-                                    format_time(duration)
-                                )),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(rgb(0xa9afbc))
-                                .child("音量")
-                                .child(volume_slider),
-                        )
-                        .child(
-                            div()
-                                .id("player-speed-menu")
-                                .relative()
-                                .child(
-                                    div()
-                                        .id("player-speed")
-                                        .px_2()
-                                        .py_1()
-                                        .cursor_pointer()
-                                        .text_xs()
-                                        .hover(|style| style.bg(rgb(0x363c46)))
-                                        .child(format!("{:.2}x", self.speed))
-                                        .on_click(cx.listener(Self::toggle_speed_menu)),
-                                )
-                                .when(self.speed_menu_open, |this| this.child(speed_popup)),
-                        )
-                        .child(
-                            div()
-                                .id("player-quality-menu")
-                                .relative()
-                                .child(
-                                    div()
-                                        .id("player-quality")
-                                        .px_2()
-                                        .py_1()
-                                        .cursor_pointer()
-                                        .text_xs()
-                                        .whitespace_nowrap()
-                                        .hover(|style| style.bg(rgb(0x363c46)))
-                                        .child(quality_text.clone())
-                                        .on_click(cx.listener(Self::toggle_quality_menu)),
-                                )
-                                .when(self.quality_menu_open, |this| this.child(quality_popup)),
-                        )
-                        .when(self.collection.is_some(), |this| {
-                            this.child(
-                                previous_episode,
-                            )
-                            .child(next_episode)
-                            .child(
-                                div()
-                                    .id("player-collection-menu")
-                                    .relative()
-                                    .child(
-                                        div()
-                                            .id("player-collection")
-                                            .px_2()
-                                            .py_1()
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .whitespace_nowrap()
-                                            .hover(|style| style.bg(rgb(0x363c46)))
-                                            .child("选集")
-                                            .on_click(cx.listener(Self::toggle_collection)),
-                                    )
-                                    .when(self.collection_menu_open, |this| {
-                                        this.child(collection_popup)
-                                    }),
-                            )
-                        })
-                        .child(
-                            div()
-                                .id("player-window-fullscreen")
-                                .w(px(24.))
-                                .h(px(24.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x363c46)))
-                                .child(
-                                    svg()
-                                        .path(if self.player_fullscreen {
-                                            WINDOW_FULLSCREEN_EXIT_ICON
-                                        } else {
-                                            WINDOW_FULLSCREEN_ICON
-                                        })
-                                        .size(px(16.))
-                                        .text_color(rgb(0xdce0e5)),
-                                )
-                                .on_click(cx.listener(Self::toggle_player_fullscreen)),
-                        )
-                        .child(
-                            div()
-                                .id("player-screen-fullscreen")
-                                .w(px(24.))
-                                .h(px(24.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x363c46)))
-                                .child(
-                                    svg()
-                                        .path(if self.screen_fullscreen {
-                                            SCREEN_FULLSCREEN_EXIT_ICON
-                                        } else {
-                                            SCREEN_FULLSCREEN_ICON
-                                        })
-                                        .size(px(16.))
-                                        .text_color(rgb(0xdce0e5)),
-                                )
-                                .on_click(cx.listener(Self::toggle_screen_fullscreen)),
-                        ),
-                );
-            stage = stage.child(controls);
+            changed = true;
+        } else if status.time_pos.is_finite()
+            && (status.time_pos - app.last_position).abs() >= 0.2
+        {
+            // The clock and the bar follow the playhead, not every frame of the video.
+            app.last_position = status.time_pos;
+            changed = true;
         }
-
-        let viewport_entity = cx.entity();
-        let stage = div()
-            .on_children_prepainted(move |children, window, cx| {
-                if let Some(bounds) = children.first() {
-                    let scale_factor = window.scale_factor();
-                    let width =
-                        (f32::from(bounds.size.width) * scale_factor).round().max(1.) as usize;
-                    let height =
-                        (f32::from(bounds.size.height) * scale_factor).round().max(1.) as usize;
-                    let _ = viewport_entity
-                        .update(cx, |app, _| app.update_player_viewport(width, height));
+        if status.volume.is_finite() && (status.volume - app.volume).abs() > 0.5 {
+            app.volume = status.volume.clamp(0., 100.);
+            changed = true;
+        }
+        if status.speed.is_finite() && (status.speed - app.speed).abs() > 0.001 {
+            app.speed = status.speed.max(0.1);
+            changed = true;
+        }
+        if !app.cloud_resume_applied {
+            if let Some(target) = app.pending_seek.take() {
+                app.player.seek_seconds(target);
+                app.cloud_resume_applied = true;
+            } else if let Some(progress) = app.cloud_resume_progress.take() {
+                if status.duration.is_finite() && progress < status.duration - 3. {
+                    app.player.seek_seconds(progress);
                 }
+                app.cloud_resume_applied = true;
+            } else {
+                app.cloud_resume_applied = true;
+            }
+        }
+        if app.playback == PlaybackState::Playing
+            && app.history_report_at.elapsed() >= Duration::from_secs(15)
+        {
+            app.queue_history_report();
+        }
+        app.sync_power();
+        if let Some(message) = app.player.take_message() {
+            app.playback_error = Some(message);
+            changed = true;
+        }
+        // Keeps the clock moving while nothing else asks for a frame. An idle window still
+        // draws nothing: this only runs while a video is loaded.
+        tx.wake_after(Duration::from_millis(100));
+    }
+
+    if let Some(until) = app.controls_until
+        && Instant::now() >= until
+    {
+        app.controls_until = None;
+        changed = true;
+    }
+    changed
+}
+
+fn on_key(app: &mut BiliGuga, event: &KeyEvent, tx: &mut Tx) -> bool {
+    let mods = event.mods;
+    match event.key {
+        Key::Text(ref typed) if typed == " " && !mods.ctrl && !mods.alt => {
+            app.toggle_pause();
+            true
+        }
+        Key::Left => {
+            app.player.seek_relative(-10.);
+            true
+        }
+        Key::Right => {
+            app.player.seek_relative(10.);
+            true
+        }
+        Key::Up => {
+            app.volume = (app.volume + 5.).clamp(0., 100.);
+            app.player.set_volume(app.volume);
+            app.persist_player_settings();
+            true
+        }
+        Key::Down => {
+            app.volume = (app.volume - 5.).clamp(0., 100.);
+            app.player.set_volume(app.volume);
+            app.persist_player_settings();
+            true
+        }
+        Key::Text(ref typed) if typed.eq_ignore_ascii_case("f") && !mods.ctrl && !mods.alt => {
+            app.player_fullscreen = !app.player_fullscreen;
+            tx.toggle_full_screen();
+            true
+        }
+        Key::Escape => {
+            if app.player_fullscreen {
+                app.player_fullscreen = false;
+                tx.toggle_full_screen();
+                return true;
+            }
+            false
+        }
+        Key::Enter if mods.ctrl || mods.alt => {
+            app.search_query = app.search_edit.text.clone();
+            app.load_search();
+            true
+        }
+        _ => false,
+    }
+}
+
+impl BiliGuga {
+    fn refresh_feed(&mut self) {
+        match self.active_tab {
+            AppTab::Home => self.load_home_page(true),
+            AppTab::Dynamic => self.load_dynamic(),
+            AppTab::History => self.load_history(),
+            AppTab::WatchLater => self.load_watch_later(),
+            AppTab::Favorites => self.load_favorites(),
+            AppTab::Author => self.load_author_page(true),
+            AppTab::Search => self.load_search(),
+            AppTab::Login => self.start_login(),
+        }
+    }
+
+    fn cycle_speed(&mut self) {
+        let index = SPEED_OPTIONS
+            .iter()
+            .position(|speed| (*speed - self.speed).abs() < 0.01)
+            .unwrap_or(1);
+        self.speed = SPEED_OPTIONS[(index + 1) % SPEED_OPTIONS.len()];
+        self.player.set_speed(self.speed);
+        self.persist_player_settings();
+    }
+
+    fn sync_power(&mut self) {
+        self.power_inhibitor
+            .set_active(self.playback == PlaybackState::Playing);
+    }
+
+    /// Asks for the covers the current feed is missing, skipping ones already downloaded or in
+    /// flight for that bvid.
+    fn request_missing_covers(&mut self) {
+        let missing: Vec<Video> = self
+            .current_videos()
+            .iter()
+            .filter(|video| {
+                !video.cover.is_empty() && !self.cover_images.contains_key(&video.bvid)
             })
-            .id("player-stage-viewport")
-            .w_full()
-            .flex_none()
-            .when(self.player_fullscreen, |this| this.h_full())
-            .child(stage);
-
-        let mut player = div()
-            .id("player-scroll")
-            .flex_1()
-            .when(self.player_fullscreen, |this| this.w_full())
-            .h_full()
-            .flex()
-            .flex_col()
-            .when(self.player_fullscreen, |this| this.overflow_hidden())
-            .overflow_x_hidden()
-            .bg(rgb(0x0f141d))
-            .child(stage);
-        if !self.player_fullscreen {
-            player = player.child(
-                div()
-                        .id("player-details-scroll")
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .child(
-                            div()
-                                .w_full()
-                                .px(px(10.))
-                                .py(px(8.))
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .text_xl()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(0xdce0e5))
-                                        .text_ellipsis()
-                                        .child(video.title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .items_center()
-                                        .gap_4()
-                                        .text_xs()
-                                        .text_color(rgb(0x8f97a6))
-                                        .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .id("player-author")
-                                                .flex_shrink_0()
-                                                .text_color(rgb(0xdce0e5))
-                                                .cursor_pointer()
-                                                .hover(|style| style.text_color(rgb(0x74ade8)))
-                                                .child(author_name.clone())
-                                                .on_click(move |_, window, cx| {
-                                                    author_entity.update(cx, |app, cx| {
-                                                        app.open_author_videos(
-                                                            author_mid,
-                                                            author_name.clone(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .flex_shrink_0()
-                                                .child(detail_view_count)
-                                                .child("播放"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .flex_shrink_0()
-                                                .child(detail_danmaku_count)
-                                                .child("弹幕"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .flex_shrink_0()
-                                                .child(detail_like_count)
-                                                .child("点赞"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_color(rgb(0x737b8b))
-                                                .child(published_at),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_3()
-                                        .text_sm()
-                                        .text_color(rgb(0xa9afbc))
-                                        .child(
-                                            div()
-                                                .id("player-like")
-                                                .cursor_pointer()
-                                                .hover(|style| style.text_color(rgb(0x74ade8)))
-                                                .child("♡ 点赞")
-                                                .on_click(cx.listener(Self::like_current_video)),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("player-coin")
-                                                .cursor_pointer()
-                                                .hover(|style| style.text_color(rgb(0x74ade8)))
-                                                .child("◇ 投币")
-                                                .on_click(cx.listener(Self::coin_current_video)),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("player-favorite")
-                                                .cursor_pointer()
-                                                .hover(|style| style.text_color(rgb(0x74ade8)))
-                                                .child("收藏")
-                                                .on_click(
-                                                    cx.listener(Self::save_current_to_favorites),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("player-watch-later")
-                                                .cursor_pointer()
-                                                .hover(|style| style.text_color(rgb(0x74ade8)))
-                                                .child("稍后")
-                                                .on_click(
-                                                    cx.listener(Self::save_current_to_watch_later),
-                                                ),
-                                        ),
-                                ),
-                        )
-                        .child(self.render_comments(cx)),
-            );
+            .cloned()
+            .collect();
+        for video in missing {
+            self.request_cover(&video);
         }
-        player.into_any_element()
     }
 }
 
-impl Render for BiliGuga {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = div()
-            .size_full()
-            .flex()
-            .bg(rgb(0x0b0f16))
-            .track_focus(&self.root_focus)
-            .capture_key_down(cx.listener(Self::handle_global_key));
-        if self.player_fullscreen {
-            root = root.child(self.render_player(cx));
-        } else {
-            root = root.child(
-                div()
-                    .size_full()
-                    .flex()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_feed(cx))
-                    .child(self.render_player(cx)),
-            );
-        }
-        root
-    }
-}
-
-fn clickable_sidebar_item<F>(
-    icon: &'static str,
-    label: &'static str,
-    active: bool,
-    on_click: F,
-) -> impl IntoElement
-where
-    F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+fn fetch_qr_code_event() -> impl std::future::Future<Output = Result<login::QrCodeData, String>> + Send
 {
-    sidebar_item(icon, label, active)
-        .id(SharedString::from(format!("sidebar-{label}")))
-        .on_click(on_click)
+    login::fetch_qr_code()
 }
 
-fn sidebar_item(icon: &'static str, label: &'static str, active: bool) -> gpui::Div {
-    div()
-        .relative()
-        .w(px(64.))
-        .h(px(52.))
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .when(active, |this| {
-            this.bg(rgb(0x202a42))
-                .text_color(rgb(0xe4e6ff))
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(2.))
-                        .bg(rgb(0x8580ff)),
-                )
+/// Builds a feed of placeholder videos, so `--snap feed` can check the layout without a
+/// network round trip. Only reachable from a named scene.
+fn demo_videos(count: usize) -> Vec<Video> {
+    let titles = [
+        "【4K】这可能是今年最好看的旅行短片，一次看遍北海道",
+        "用 Rust 从零写一个窗口管理器｜第一期：到底难在哪",
+        "深夜食堂：一个人也要好好吃饭",
+        "钢琴改编《千本樱》，手指快到看不清",
+        "拆解一台二十年前的随身听，里面比想象中复杂",
+        "3 小时讲透线性代数，看完你就懂了",
+        "在海拔 5000 米看星空，是什么体验",
+        "手工复原宋代点茶，全过程",
+    ];
+    let uploaders = [
+        "影视飓风",
+        "Rust 语言中文社区",
+        "曼食慢语",
+        "指尖琴键",
+        "硬件茶谈",
+        "3Blue1Brown",
+        "星球研究所",
+        "南翔不爱吃饭",
+    ];
+    (0..count)
+        .map(|index| Video {
+            bvid: format!("BV1demo{index:04}"),
+            aid: 1000 + index as i64,
+            cid: 2000 + index as i64,
+            title: titles[index % titles.len()].to_string(),
+            uploader: uploaders[index % uploaders.len()].to_string(),
+            uploader_mid: 100 + index as i64,
+            duration: format!("{:02}:{:02}", 3 + index % 40, index * 7 % 60),
+            cover: String::new(),
+            accent: [
+                0x3e4654, 0x39455a, 0x4b4240, 0x4c4255, 0x354c4a, 0x46503d,
+            ][index % 6],
         })
-        .when(!active, |this| {
-            this.text_color(rgb(0xa9afbc))
-                .hover(|style| style.bg(rgb(0x192131)))
-        })
-        .child(div().text_lg().child(icon))
-        .child(div().text_xs().child(label))
+        .collect()
 }
 
-fn thumbnail(video: &Video, width: f32, height: f32) -> impl IntoElement {
-    let mut thumbnail = div()
-        .w(px(width))
-        .h(px(height))
-        .flex_none()
-        .bg(rgb(video.accent));
-    if let Some(image) = &video.cover_image {
-        thumbnail = thumbnail.child(
-            img(image.clone())
-                .w_full()
-                .h_full()
-                .object_fit(gpui::ObjectFit::Cover),
-        );
+/// Named states for `--snap`: each seeds the app so a headless run shows a real screen.
+fn scenes() -> &'static [(&'static str, fn(&mut BiliGuga))] {
+    fn feed(app: &mut BiliGuga) {
+        app.videos = demo_videos(12);
+        app.loading = false;
+        app.home_loading = false;
     }
-    thumbnail
-}
-
-fn thumbnail_fill(video: &Video, height: f32) -> impl IntoElement {
-    let mut thumbnail = div()
-        .w_full()
-        .h(px(height))
-        .flex_none()
-        .overflow_hidden()
-        .bg(rgb(video.accent));
-    if let Some(image) = &video.cover_image {
-        thumbnail = thumbnail.child(
-            img(image.clone())
-                .w_full()
-                .h_full()
-                .object_fit(gpui::ObjectFit::Cover),
-        );
+    fn player(app: &mut BiliGuga) {
+        app.videos = demo_videos(12);
+        app.loading = false;
+        app.home_loading = false;
+        app.playing_video = Some(demo_videos(1).remove(0));
+        app.playback = PlaybackState::Buffering;
+        app.show_controls();
+        app.detail_view_count = "128.4万".into();
+        app.detail_danmaku_count = "1.2万".into();
+        app.detail_like_count = "9.8万".into();
+        app.comments = (0..6)
+            .map(|index| Comment {
+                rpid: index as i64,
+                username: format!("用户{}", index + 1),
+                message: "这个镜头调色太舒服了，请问用的是什么预设？".into(),
+                like: 128 - index as i64,
+                time: "3 小时前".into(),
+            })
+            .collect();
+        app.comments_total = 6;
     }
-    thumbnail
+    fn search(app: &mut BiliGuga) {
+        app.videos = demo_videos(12);
+        app.loading = false;
+        app.home_loading = false;
+        app.active_tab = AppTab::Search;
+        app.search_results = demo_videos(8);
+        app.search_query = "旅行短片".into();
+        app.search_edit = TextEdit::new("旅行短片");
+    }
+    static SCENES: OnceLock<Vec<(&'static str, fn(&mut BiliGuga))>> = OnceLock::new();
+    SCENES.get_or_init(|| vec![("feed", feed as fn(&mut BiliGuga)), ("player", player), ("search", search)])
 }
 
 pub(crate) fn launch() {
-    Application::new()
-        .with_assets(AppAssets)
-        .run(|cx: &mut App| {
-            bind_search_keys(cx);
-            let bounds = Bounds::centered(None, size(px(1360.), px(820.)), cx);
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        titlebar: Some(gpui::TitlebarOptions {
-                            title: Some("哔哩咕嘎".into()),
-                            ..Default::default()
-                        }),
-                        app_id: Some("biliguga".into()),
-                        ..Default::default()
-                    },
-                    |_, cx| cx.new(BiliGuga::new),
-                )
-                .expect("failed to open biliguga window");
-            let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-            window
-                .update(cx, |app, window, _| window.focus(&app.root_focus))
-                .unwrap();
-            let window_handle = window
-                .update(cx, |_, window, _| window.window_handle())
-                .unwrap();
-            let frame_view = view.clone();
-            cx.spawn(async move |cx| {
-                let mut last_memory_log = Instant::now();
-                loop {
-                    Timer::after(Duration::from_millis(50)).await;
-                    if cx
-                        .update_window(window_handle.clone(), |_, window, cx| {
-                            let expired_frames = frame_view.update(cx, |app, cx| {
-                                let was_active = app.playback != PlaybackState::Idle;
-                                if !was_active {
-                                    app.player.discard_pending_frames();
-                                } else {
-                                    app.player.poll_frame();
-                                }
-                                let status = app.player.status();
-                                if app.playback != PlaybackState::Idle
-                                    && status.time_pos.is_finite()
-                                {
-                                    let reached_end = app.playback != PlaybackState::Buffering
-                                        && status.duration.is_finite()
-                                        && status.duration > 0.
-                                        && status.time_pos >= status.duration - 0.25;
-                                    if reached_end {
-                                        let next_episode = app.collection_episode_index().and_then(
-                                            |index| {
-                                                app.collection
-                                                    .as_ref()
-                                                    .and_then(|collection| {
-                                                        (index + 1 < collection.episodes.len())
-                                                            .then_some(index + 1)
-                                                    })
-                                            },
-                                        );
-                                        if let Some(next_episode) = next_episode {
-                                            app.play_collection_episode(next_episode, window, cx);
-                                        } else {
-                                            app.playback = PlaybackState::Idle;
-                                            app.pending_pause = None;
-                                            app.pending_seek = None;
-                                            app.cloud_resume_progress = None;
-                                            app.cloud_resume_applied = true;
-                                        }
-                                    }
-                                    if !reached_end && !app.cloud_resume_applied {
-                                        if let Some(target) = app.pending_seek {
-                                            if target > 0. {
-                                                app.player.seek_seconds(target);
-                                            }
-                                            app.pending_seek = None;
-                                            app.cloud_resume_applied = true;
-                                        } else if let Some(cloud_progress) = app.cloud_resume_progress {
-                                            if status.duration.is_finite() && status.duration > 0. {
-                                                if cloud_progress > 3. && cloud_progress < status.duration - 3. {
-                                                    app.player.seek_seconds(cloud_progress);
-                                                }
-                                                app.cloud_resume_progress = None;
-                                                app.cloud_resume_applied = true;
-                                            }
-                                        } else {
-                                            app.cloud_resume_applied = true;
-                                        }
-                                    }
-                                    if !reached_end {
-                                        if let Some(target_paused) = app.pending_pause {
-                                            if status.paused == target_paused {
-                                                app.pending_pause = None;
-                                            }
-                                        }
-                                        if app.pending_pause.is_none() {
-                                            app.playback = if status.paused {
-                                                PlaybackState::Paused
-                                            } else {
-                                                PlaybackState::Playing
-                                            };
-                                        }
-                                        if status.volume.is_finite() {
-                                            app.volume = status.volume.clamp(0., 100.);
-                                        }
-                                        if status.speed.is_finite() {
-                                            app.speed = status.speed.max(0.1);
-                                        }
-                                        if app.playback == PlaybackState::Playing
-                                            && app.history_report_at.elapsed()
-                                                >= Duration::from_secs(15)
-                                        {
-                                            app.queue_history_report(cx, 0);
-                                        }
-                                    }
-                                }
-                                app.sync_power_inhibition();
-                                let expired_frames = app.player.take_expired_frames();
-                                if was_active || !expired_frames.is_empty() {
-                                    cx.notify();
-                                }
-                                if last_memory_log.elapsed() >= Duration::from_secs(2) {
-                                    app.debug_memory("tick");
-                                    last_memory_log = Instant::now();
-                                }
-                                app.maybe_load_home_page(cx);
-                                expired_frames
-                            });
-                            for frame in &expired_frames {
-                                let _ = window.drop_image(frame.clone());
-                            }
-                            let pending_cover_drops = frame_view
-                                .update(cx, |app, _| std::mem::take(&mut app.pending_cover_drops));
-                            for image in pending_cover_drops {
-                                let _ = window.drop_image(image);
-                            }
-                            frame_view.update(cx, |app, _| {
-                                for frame in expired_frames {
-                                    app.player.recycle_frame(frame);
-                                }
-                            });
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .detach();
-            let initial_cookie = view
-                .read(cx)
-                .session
-                .as_ref()
-                .map(|session| session.cookie.clone());
-            let initial_session = view.read(cx).session.clone();
-            if let Some(session) = initial_session {
-                let refresh_view = view.clone();
-                let cookie = session.cookie.clone();
-                cx.spawn(async move |cx| {
-                    let refreshed = cx
-                        .background_spawn(async move {
-                            network::run(login::fetch_user(cookie)).await
-                        })
-                        .await;
-                    if let Ok(refreshed) = refreshed {
-                        refresh_view
-                            .update(cx, |app, cx| {
-                                let is_same_session = app
-                                    .session
-                                    .as_ref()
-                                    .map(|active| active.cookie == refreshed.cookie)
-                                    .unwrap_or(false);
-                                if is_same_session {
-                                    let _ = login::save_session(&refreshed);
-                                    app.session = Some(refreshed);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                    }
-                })
-                .detach();
-            }
-            cx.spawn(async move |cx| {
-                let result = cx
-                    .background_spawn(async move {
-                        network::run(async move {
-                            fetch_recommendations(1, initial_cookie.as_deref()).await
-                        })
-                        .await
-                    })
-                    .await;
-                view.update(cx, |app, cx| {
-                    if app.home_generation != 0 || app.active_tab != AppTab::Home {
-                        return;
-                    }
-                    app.home_loading = false;
-                    app.loading = false;
-                    match result {
-                        Ok(videos) => {
-                            app.home_page = 1;
-                            app.home_has_more = videos.has_more;
-                            app.home_feed_mid = app.session.as_ref().map(|session| session.mid);
-                            app.videos = videos.videos;
-                            app.start_cover_loading(cx);
-                        }
-                    Err(_error) => {
-                    }
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-            cx.activate(true);
-        });
+    rune::run(AppSpec {
+        setup: Some(setup),
+        poll: Some(poll),
+        on_key: Some(on_key),
+        scenes: scenes(),
+        ..AppSpec::new("哔哩咕嘎", (1360.0, 820.0), BiliGuga::new, view)
+    });
 }

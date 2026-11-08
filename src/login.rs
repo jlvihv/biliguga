@@ -1,16 +1,14 @@
-use gpui::RenderImage;
-use image::{Frame, Luma};
+use image::Luma;
 use qrcode::QrCode;
 use reqwest::header::SET_COOKIE;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
-use smallvec::SmallVec;
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use url::Url;
 
 pub(crate) struct QrCodeData {
     pub(crate) key: String,
-    pub(crate) image: Arc<RenderImage>,
+    pub(crate) image: Arc<crate::model::Rgba8>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,7 +93,11 @@ pub(crate) async fn fetch_qr_code() -> Result<QrCodeData, String> {
     let rgba = image::DynamicImage::ImageLuma8(image).into_rgba8();
     Ok(QrCodeData {
         key,
-        image: Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(rgba), 1))),
+        image: Arc::new(crate::model::Rgba8::new(
+            rgba.width(),
+            rgba.height(),
+            rgba.into_raw(),
+        )),
     })
 }
 
