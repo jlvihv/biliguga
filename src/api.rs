@@ -133,12 +133,55 @@ fn duration(value: Option<&Value>) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
-pub(crate) fn format_time(seconds: f64) -> String {
-    if !seconds.is_finite() || seconds < 0. {
-        return "--:--".into();
+/// A clock reading, written into a fixed buffer.
+///
+/// This runs twice per render of the player's control bar, which is several times a second
+/// while a video plays. As a `String` that was two heap allocations per call; `mm:ss` never
+/// needs more than a handful of bytes, so the caller supplies them.
+pub(crate) struct Clock {
+    bytes: [u8; 8],
+    len: u8,
+}
+
+impl Clock {
+    pub(crate) fn new(seconds: f64) -> Self {
+        let mut clock = Clock {
+            bytes: [0; 8],
+            len: 0,
+        };
+        if !seconds.is_finite() || seconds < 0. {
+            clock.push_bytes("--:--");
+            return clock;
+        }
+        let total = seconds as u64;
+        // Hours are rare (a stream, a long video) but they do happen; over 100 hours the
+        // minutes stop being meaningful, so print minutes, which is what the old code did too.
+        let (minutes, secs) = ((total / 60).min(99), total % 60);
+        clock.push_u8(b'0' + (minutes / 10) as u8);
+        clock.push_u8(b'0' + (minutes % 10) as u8);
+        clock.push_bytes(":");
+        clock.push_u8(b'0' + (secs / 10) as u8);
+        clock.push_u8(b'0' + (secs % 10) as u8);
+        clock
     }
-    let seconds = seconds as u64;
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+
+    fn push_u8(&mut self, byte: u8) {
+        if let Some(slot) = self.bytes.get_mut(self.len as usize) {
+            *slot = byte;
+            self.len += 1;
+        }
+    }
+
+    fn push_bytes(&mut self, text: &str) {
+        for byte in text.bytes() {
+            self.push_u8(byte);
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // Every byte written above is ASCII by construction.
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("--:--")
+    }
 }
 
 pub(crate) fn format_publish_date(timestamp: i64) -> String {
@@ -1955,74 +1998,36 @@ pub(crate) async fn resolve_play_url(
     let mut errors = Vec::new();
 
     // WBI 是当前接口，但接口策略会变化，所以失败时继续尝试旧接口。
-    let nav_result = match with_cookie(
-        client.get("https://api.bilibili.com/x/web-interface/nav"),
-        cookie,
-    )
-    .send()
-    .await
-    {
-        Ok(response) => response
-            .json::<Value>()
+    //
+    // This block used to carry the fifth hand-copied WBI key extraction, and the only one that
+    // bypassed the cache: every play fetched from `nav` keys it had already been given.
+    match fetch_wbi_keys(client, cookie).await {
+        Ok((img_key, sub_key)) => {
+            let play_result = match with_cookie(
+                client
+                    .get("https://api.bilibili.com/x/player/wbi/playurl")
+                    .header("Referer", &referer)
+                    .query(&wbi_sign(&params, &img_key, &sub_key)),
+                cookie,
+            )
+            .send()
             .await
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    };
-    match nav_result {
-        Ok(nav) => {
-            if let Some(wbi_img) = nav.get("data").and_then(|data| data.get("wbi_img")) {
-                let img_key = text(wbi_img.get("img_url"))
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("")
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let sub_key = text(wbi_img.get("sub_url"))
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("")
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                if !img_key.is_empty() && !sub_key.is_empty() {
-                    let play_result = match with_cookie(
-                        client
-                            .get("https://api.bilibili.com/x/player/wbi/playurl")
-                            .header("Referer", &referer)
-                            .query(&wbi_sign(&params, &img_key, &sub_key)),
-                        cookie,
-                    )
-                    .send()
+            {
+                Ok(response) => response
+                    .json::<Value>()
                     .await
-                    {
-                        Ok(response) => response
-                            .json::<Value>()
-                            .await
-                            .map_err(|error| error.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    };
-                    match play_result {
-                        Ok(response) if number(response.get("code")) == 0 => {
-                            if let Some(result) = parse_play_url(&response, cid, aid, quality) {
-                                return Ok(result);
-                            }
-                            errors.push("WBI 接口没有返回 MP4 地址".to_string());
-                        }
-                        Ok(response) => errors.push(format!(
-                            "WBI 播放接口返回错误 {}：{}",
-                            number(response.get("code")),
-                            text(response.get("message"))
-                        )),
-                        Err(error) => errors.push(format!("WBI 播放请求失败：{error}")),
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            match play_result {
+                Ok(response) if number(response.get("code")) == 0 => {
+                    if let Some(result) = parse_play_url(&response, cid, aid, quality) {
+                        return Ok(result);
                     }
-                } else {
-                    errors.push("播放 WBI 密钥为空".to_string());
+                    errors.push("WBI 接口没有返回 MP4 地址".to_string());
                 }
-            } else {
-                errors.push("B 站没有返回播放 WBI 密钥".to_string());
+                Ok(response) => errors.push(api_error(&response, "WBI 播放")),
+                Err(error) => errors.push(format!("WBI 播放请求失败：{error}")),
             }
         }
         Err(error) => errors.push(format!("获取播放 WBI 密钥失败：{error}")),
@@ -2263,5 +2268,29 @@ pub(crate) fn quality_label(qn: u32) -> String {
         16 => "360P 流畅".into(),
         6 => "240P 极速".into(),
         _ => format!("{qn}P"),
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::Clock;
+
+    #[test]
+    fn the_clock_writes_mm_ss_without_allocating() {
+        assert_eq!(Clock::new(0.0).as_str(), "00:00");
+        assert_eq!(Clock::new(9.9).as_str(), "00:09");
+        assert_eq!(Clock::new(61.0).as_str(), "01:01");
+        assert_eq!(Clock::new(599.9).as_str(), "09:59");
+        assert_eq!(Clock::new(3600.0).as_str(), "60:00");
+        // Nonsense inputs keep the placeholder the old formatter returned.
+        assert_eq!(Clock::new(f64::NAN).as_str(), "--:--");
+        assert_eq!(Clock::new(-1.0).as_str(), "--:--");
+    }
+
+    /// Past 99 minutes the two-digit field would overflow; it clamps instead of writing a
+    /// third digit, which is what the fixed buffer is sized for.
+    #[test]
+    fn the_clock_clamps_minutes_to_two_digits() {
+        assert_eq!(Clock::new(6.0 * 3600.0).as_str(), "99:00");
     }
 }

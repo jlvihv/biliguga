@@ -20,7 +20,7 @@ use crate::{
         fetch_author_videos, fetch_comments, fetch_dynamic_feed, fetch_favorites, fetch_history,
         fetch_last_play_progress, fetch_recommendations, fetch_search_results,
         download_avatar, fetch_video_context, fetch_watch_later, like_video, format_publish_date,
-        format_time,
+        Clock,
         queue_cover_download, report_video_heartbeat, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
@@ -41,6 +41,9 @@ use std::{
 };
 
 const HOME_MAX_ITEMS: usize = 120;
+/// How many decoded covers to keep. A cover is 57 KB, so this bounds the cache at a few
+/// megabytes even if some path keeps adding rows without trimming.
+const COVER_CACHE_LIMIT: usize = 256;
 const SPEED_OPTIONS: [f64; 5] = [0.5, 1., 1.25, 1.5, 2.];
 const DEFAULT_VOLUME: f64 = 100.;
 const DEFAULT_SPEED: f64 = 1.;
@@ -187,6 +190,21 @@ enum PlaybackState {
 
 /// Which popup the player has open. Only one kind exists: speed cycles in place and the
 /// collection is reached with previous/next, so neither ever needed a menu.
+/// Whose uploads the Author tab is showing.
+struct Author {
+    mid: i64,
+    name: String,
+}
+
+/// The numbers the detail call brings back. They always arrive together, so they are one value
+/// rather than four fields that a caller has to remember to set in step.
+struct VideoStats {
+    view_count: String,
+    danmaku_count: String,
+    like_count: String,
+    published_at: String,
+}
+
 /// The feeds that need a session. Each one used to own a `load_..` method, a `.._loading` flag
 /// and an `Event` arm holding the same three lines; the enum is the one place they differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,7 +318,6 @@ impl Worker {
 pub(crate) struct BiliGuga {
     // Identity and navigation.
     search_edit: TextEdit,
-    search_query: String,
     active_tab: AppTab,
     // Feeds. Only one is shown at a time; `selected` indexes into whichever that is.
     videos: Vec<Video>,
@@ -310,8 +327,10 @@ pub(crate) struct BiliGuga {
     favorites: Vec<Video>,
     dynamic_videos: Vec<Video>,
     author_videos: Vec<Video>,
-    author_mid: i64,
-    author_name: String,
+    /// Whose page the feed column is showing, while the Author tab is active. `mid` is only
+    /// needed to ask for a page, `name` to label the column, and both are set together: they
+    /// were two fields with a `0` / `""` pair standing for "nobody".
+    author: Option<Author>,
     author_page: usize,
     author_has_more: bool,
     author_loading: bool,
@@ -335,7 +354,10 @@ pub(crate) struct BiliGuga {
     login_qr: Option<Image>,
     login_key: Option<String>,
     login_loading: bool,
-    login_status: String,
+    /// What the login panel tells the viewer. Almost every value is a fixed sentence, so this
+    /// is a `Cow`: the seven static messages cost no allocation, and only an error from the
+    /// API is a `String`.
+    login_status: std::borrow::Cow<'static, str>,
     login_generation: u64,
     // Player.
     playback: PlaybackState,
@@ -356,10 +378,11 @@ pub(crate) struct BiliGuga {
     /// command channel to mpv — is what acts on it. mpv remembers the size it is already
     /// decoding for, so nothing has to mirror it here.
     stage_size: std::cell::Cell<Option<(usize, usize)>>,
-    detail_view_count: String,
-    detail_danmaku_count: String,
-    detail_like_count: String,
-    published_at: String,
+    /// The clip's own numbers, once the detail call lands. `None` means "not loaded yet", which
+    /// is what the four `String` fields this replaces expressed by holding a sentinel `"—"`:
+    /// a placeholder that a real API value could collide with, and four fields that always
+    /// moved together.
+    stats: Option<VideoStats>,
     playback_error: Option<String>,
     cloud_resume_progress: Option<f64>,
     cloud_resume_applied: bool,
@@ -404,14 +427,13 @@ impl BiliGuga {
     fn new() -> Self {
         let session = login::load_session();
         let (volume, speed) = load_player_settings();
-        let login_status = session
-            .as_ref()
-            .map(|session| format!("已登录：{}", session.username))
-            .unwrap_or_else(|| "使用哔哩哔哩 App 扫码登录".into());
+        let login_status = match &session {
+            Some(session) => format!("已登录：{}", session.username).into(),
+            None => "使用哔哩哔哩 App 扫码登录".into(),
+        };
         let (events_tx, events) = std::sync::mpsc::channel();
         Self {
             search_edit: TextEdit::new(""),
-            search_query: String::new(),
             active_tab: AppTab::Home,
             videos: Vec::new(),
             search_results: Vec::new(),
@@ -420,8 +442,7 @@ impl BiliGuga {
             favorites: Vec::new(),
             dynamic_videos: Vec::new(),
             author_videos: Vec::new(),
-            author_mid: 0,
-            author_name: String::new(),
+            author: None,
             author_page: 0,
             author_has_more: false,
             author_loading: false,
@@ -459,10 +480,7 @@ impl BiliGuga {
             player_fullscreen: false,
             playing_video: None,
             stage_size: std::cell::Cell::new(None),
-            detail_view_count: "—".into(),
-            detail_danmaku_count: "—".into(),
-            detail_like_count: "—".into(),
-            published_at: "发布时间未知".into(),
+            stats: None,
             playback_error: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
@@ -508,7 +526,14 @@ impl BiliGuga {
         self.session.as_ref().map(|session| session.cookie.clone())
     }
 
-    fn current_videos(&self) -> &Vec<Video> {
+    /// The uploader's name for the feed heading, empty when no author page is open.
+    fn author_name(&self) -> &str {
+        self.author.as_ref().map_or("", |author| author.name.as_str())
+    }
+
+    /// The rows of the feed the feed column is showing. A slice, not a `&Vec`: no caller needs
+    /// to know it is a `Vec`, and this way none of them can push to it by accident.
+    fn current_videos(&self) -> &[Video] {
         match self.active_tab {
             AppTab::Home => &self.videos,
             AppTab::Search => &self.search_results,
@@ -521,15 +546,51 @@ impl BiliGuga {
         }
     }
 
+    /// Drops the oldest rows once the home feed grows past its limit.
+    ///
+    /// This removes their decoded covers too. It did not before, so every thumbnail the viewer
+    /// ever scrolled past stayed in memory: a 160x90 cover is 57 KB, and a session that pages
+    /// through a few hundred videos held every one of them for good.
     fn trim_home_items(&mut self) {
         if self.videos.len() <= HOME_MAX_ITEMS {
             return;
         }
         let remove_count = self.videos.len() - HOME_MAX_ITEMS;
-        self.videos.drain(..remove_count);
+        let dropped: Vec<String> = self.videos.drain(..remove_count).map(|v| v.bvid).collect();
+        for bvid in dropped {
+            self.forget_cover(&bvid);
+        }
         self.selected = self
             .selected
             .map(|selected| selected.saturating_sub(remove_count));
+    }
+
+    /// Every bvid any feed column, the player or the open collection can still show. A cover
+    /// for one of these is in use; anything else is a candidate for eviction.
+    fn bvids_on_screen(&self) -> impl Iterator<Item = &str> {
+        self.videos
+            .iter()
+            .chain(&self.search_results)
+            .chain(&self.dynamic_videos)
+            .chain(&self.watch_later)
+            .chain(&self.favorites)
+            .chain(&self.history)
+            .chain(&self.author_videos)
+            .chain(self.playing_video.as_ref())
+            .chain(
+                self.collection
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|collection| &collection.episodes),
+            )
+            .map(|video| video.bvid.as_str())
+    }
+
+    /// Releases a cover nothing is showing any more.
+    fn forget_cover(&mut self, bvid: &str) {
+        if !self.bvids_on_screen().any(|shown| shown == bvid) {
+            self.cover_images.remove(bvid);
+        }
     }
 
     // ---- Feeds ---------------------------------------------------------------------------
@@ -560,7 +621,10 @@ impl BiliGuga {
     }
 
     fn load_search(&mut self) {
-        let query = self.search_query.trim().to_string();
+        // Read from the field itself: `search_query` was a second copy kept in step by hand at
+        // four call sites, and three of those synced it immediately before this function
+        // overwrote its only reader anyway.
+        let query = self.search_edit.text.trim().to_string();
         if query.is_empty() {
             return;
         }
@@ -622,7 +686,10 @@ impl BiliGuga {
         }
         let page = self.author_page + 1;
         let generation = self.author_generation;
-        let mid = self.author_mid;
+        let Some(author) = self.author.as_ref() else {
+            return;
+        };
+        let mid = author.mid;
         let cookie = self.cookie();
         self.author_loading = true;
         self.worker().spawn(
@@ -636,8 +703,7 @@ impl BiliGuga {
         if mid <= 0 {
             return;
         }
-        self.author_mid = mid;
-        self.author_name = name;
+        self.author = Some(Author { mid, name });
         self.active_tab = AppTab::Author;
         self.selected = None;
         self.load_author_page(true);
@@ -677,10 +743,7 @@ impl BiliGuga {
         self.cloud_resume_applied = false;
         self.pending_seek = None;
         self.collection = None;
-        self.detail_view_count = "—".into();
-        self.detail_danmaku_count = "—".into();
-        self.detail_like_count = "—".into();
-        self.published_at = "发布时间未知".into();
+        self.stats = None;
 
         let cookie = self.cookie();
         let quality = self.quality;
@@ -945,6 +1008,17 @@ impl BiliGuga {
         };
         // `Arc<[u8]>` clones here, the bytes do not: the cache becomes the second owner.
         let image = cache.rgba(pixels.width, pixels.height, pixels.pixels.clone());
+        if self.cover_images.len() >= COVER_CACHE_LIMIT && !self.cover_images.contains_key(&bvid)
+        {
+            // Over the limit: drop whatever no feed is showing. If everything is shown, the
+            // cap waits for a row to go away rather than evicting a cover in use.
+            let shown: std::collections::HashSet<String> = self
+                .bvids_on_screen()
+                .map(str::to_string)
+                .collect();
+            self.cover_images
+                .retain(|key, _| shown.contains(key.as_str()));
+        }
         self.cover_images.insert(bvid, image);
     }
 
@@ -1177,7 +1251,9 @@ fn video_card(app: &BiliGuga, index: usize, video: &Video) -> El {
     card
 }
 
-fn feed_title(tab: AppTab, author_name: &str) -> String {
+/// The feed column's heading: a fixed sentence for every tab but one, which borrows the
+/// uploader's name. Returning `String` allocated on every render for seven of the eight cases.
+fn feed_title<'a>(tab: AppTab, author_name: &'a str) -> std::borrow::Cow<'a, str> {
     match tab {
         AppTab::Home => "为你推荐".into(),
         AppTab::Search => "搜索".into(),
@@ -1185,7 +1261,7 @@ fn feed_title(tab: AppTab, author_name: &str) -> String {
         AppTab::WatchLater => "稍后再看".into(),
         AppTab::Favorites => "收藏夹".into(),
         AppTab::History => "观看历史".into(),
-        AppTab::Author => author_name.to_string(),
+        AppTab::Author => author_name.into(),
         AppTab::Login => "登录".into(),
     }
 }
@@ -1245,13 +1321,7 @@ fn render_search_bar(app: &BiliGuga) -> El {
                         .placeholder("搜索视频", theme::TEXT_FAINT)
                         .color(theme::TEXT)
                         .on_edit(|app: &mut BiliGuga| &mut app.search_edit)
-                        .on_input_change(|app: &mut BiliGuga, _: &mut Tx| {
-                            app.search_query = app.search_edit.text.clone();
-                        })
-                        .on_submit(|app: &mut BiliGuga, _: &mut Tx| {
-                            app.search_query = app.search_edit.text.clone();
-                            app.load_search();
-                        }),
+                        .on_submit(|app: &mut BiliGuga, _: &mut Tx| app.load_search()),
                 ),
         )
         .child(
@@ -1265,10 +1335,7 @@ fn render_search_bar(app: &BiliGuga) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .fill(theme::ACCENT)
                 .hover(theme::ACCENT_SOFT)
-                .on_press(|app: &mut BiliGuga| {
-                    app.search_query = app.search_edit.text.clone();
-                    app.load_search();
-                })
+                .on_press(|app: &mut BiliGuga| app.load_search())
                 .child(text("搜索").font(type_::LABEL).color(Color::WHITE)),
         )
 }
@@ -1298,7 +1365,7 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         .justify_between()
         .fill(theme::PANEL)
         .child(
-            text(feed_title(app.active_tab, &app.author_name))
+            text(feed_title(app.active_tab, app.author_name()))
                 .font(type_::TITLE)
                 .color(theme::TEXT),
         );
@@ -1465,7 +1532,7 @@ fn render_login(app: &BiliGuga) -> El {
     }
     panel = panel
         .child(
-            text(app.login_status.clone())
+            text(app.login_status.as_ref())
                 .font(type_::BODY)
                 .color(theme::TEXT_DIM),
         )
@@ -1649,11 +1716,13 @@ fn render_player(app: &BiliGuga) -> El {
             );
         }
         None => {
-            let message = app.playback_error.clone().unwrap_or_else(|| {
+            // Borrowed, not cloned: this runs on every commit, and the message is either an
+            // error already in the state or one of two fixed sentences.
+            let message = app.playback_error.as_deref().unwrap_or({
                 if app.playback == PlaybackState::Buffering {
-                    "正在缓冲…".into()
+                    "正在缓冲…"
                 } else {
-                    "点击播放开始观看".into()
+                    "点击播放开始观看"
                 }
             });
             stage = stage.child(
@@ -1683,11 +1752,15 @@ fn render_player(app: &BiliGuga) -> El {
             .on_press(|app: &mut BiliGuga| app.toggle_pause()),
         )
         .child(
-            text(format!(
-                "{} / {}",
-                format_time(position),
-                format_time(duration)
-            ))
+            text({
+                // Written into stack buffers: this runs on every commit, and two times plus a
+                // separator used to be three allocations.
+                let mut line = String::with_capacity(16);
+                line.push_str(Clock::new(position).as_str());
+                line.push_str(" / ");
+                line.push_str(Clock::new(duration).as_str());
+                line
+            })
             .font(type_::LABEL)
             .color(theme::TEXT_DIM),
         )
@@ -1851,17 +1924,28 @@ fn render_detail(app: &BiliGuga, video: &Video) -> El {
                 .color(theme::TEXT)
                 .truncate(),
         );
-    for (label, value) in [
-        ("播放", &app.detail_view_count),
-        ("弹幕", &app.detail_danmaku_count),
-        ("点赞", &app.detail_like_count),
-        ("发布于", &app.published_at),
-    ] {
-        line = line.child(
-            text(format!("{label} {value}"))
-                .font(type_::SECTION)
-                .color(theme::TEXT_FAINT),
-        );
+    match &app.stats {
+        Some(stats) => {
+            for (label, value) in [
+                ("播放", &stats.view_count),
+                ("弹幕", &stats.danmaku_count),
+                ("点赞", &stats.like_count),
+                ("发布于", &stats.published_at),
+            ] {
+                // Two elements rather than one `format!`: this runs for every commit, and a
+                // label plus its value costs no allocation this way.
+                line = line
+                    .child(
+                        text(label)
+                            .font(type_::SECTION)
+                            .color(theme::TEXT_FAINT),
+                    )
+                    .child(text(value).font(type_::SECTION).color(theme::TEXT_FAINT));
+            }
+        }
+        None => {
+            // Nothing has arrived yet: no numbers is honest, a row of dashes is noise.
+        }
     }
     line
 }
@@ -2193,10 +2277,12 @@ impl BiliGuga {
                 if !still_current {
                     return;
                 }
-                app.detail_view_count = context.view_count;
-                app.detail_danmaku_count = context.danmaku_count;
-                app.detail_like_count = context.like_count;
-                app.published_at = format_publish_date(context.pubdate);
+                app.stats = Some(VideoStats {
+                    view_count: context.view_count,
+                    danmaku_count: context.danmaku_count,
+                    like_count: context.like_count,
+                    published_at: format_publish_date(context.pubdate),
+                });
                 app.collection = context.collection;
                 if let Some(video) = app.playing_video.as_mut() {
                     if video.aid == 0 {
@@ -2268,7 +2354,7 @@ impl BiliGuga {
                         app.login_status = "请使用哔哩哔哩 App 扫码登录".into();
                         app.poll_login();
                     }
-                    Err(error) => app.login_status = error,
+                    Err(error) => app.login_status = error.into(),
                 }
             }
             Event::QrPoll(result, generation) => {
@@ -2292,7 +2378,7 @@ impl BiliGuga {
                         app.login_status = "二维码已过期，请刷新".into();
                         app.login_qr = None;
                     }
-                    Err(error) => app.login_status = error,
+                    Err(error) => app.login_status = error.into(),
                 }
             }
             Event::Session(result) => {
@@ -2361,7 +2447,6 @@ fn on_key(app: &mut BiliGuga, event: &KeyEvent, tx: &mut Tx) -> bool {
             false
         }
         Key::Enter if mods.ctrl || mods.alt => {
-            app.search_query = app.search_edit.text.clone();
             app.load_search();
             true
         }
@@ -2516,10 +2601,12 @@ fn seed_player(app: &mut BiliGuga) {
     app.playing_video = Some(demo_video(0));
     app.playback = PlaybackState::Buffering;
     app.show_controls();
-    app.detail_view_count = "128.4万".into();
-    app.detail_danmaku_count = "1.2万".into();
-    app.detail_like_count = "9.8万".into();
-    app.published_at = "2026-11-02 18:20".into();
+    app.stats = Some(VideoStats {
+        view_count: "128.4万".into(),
+        danmaku_count: "1.2万".into(),
+        like_count: "9.8万".into(),
+        published_at: "2026-11-02 18:20".into(),
+    });
     app.comments = (0..6)
         .map(|index| Comment {
             rpid: index as i64,
@@ -2536,7 +2623,6 @@ fn seed_search(app: &mut BiliGuga) {
     seed_loaded(app);
     app.active_tab = AppTab::Search;
     app.search_results = demo_videos(8);
-    app.search_query = "旅行短片".into();
     app.search_edit = TextEdit::new("旅行短片");
 }
 
