@@ -196,11 +196,17 @@ enum Event {
     QrCode(Result<login::QrCodeData, String>, u64),
     QrPoll(Result<PollResult, String>, u64),
     Session(Result<UserSession, String>),
-    Action(&'static str),
-    /// Text for the player's status line, or its error.
-    PlaybackMessage(Option<String>),
-    /// A cover arrived: which feed generation, which index by bvid, and its pixels.
+    /// The outcome of a like, coin or favourite, shown as a short note under the player.
+    ActionDone(&'static str, Result<(), String>),
+    /// A cover arrived, keyed by bvid, with its pixels.
     Cover(String, Arc<Rgba8>),
+    /// A cover download failed or was cancelled, so its bvid may be asked for again.
+    CoverFailed(String),
+    /// A history report finished, freeing the next one. Carries nothing: it is a gate, not
+    /// news for the UI.
+    HistoryReported,
+    /// Work finished with nothing to show. `poll` counts it as activity but changes no state.
+    Silent,
 }
 
 /// Everything that talks to the network or the player. All of it is one-way: an [`Event`]
@@ -226,12 +232,6 @@ impl Worker {
             }
         });
     }
-}
-
-/// Cover downloads in flight, keyed by bvid, so scrolling past a card twice does not fetch it
-/// twice. Covers land as `Event::Cover` and are attached to whichever feed row matches.
-struct Covers {
-    requested: Arc<AtomicBool>,
 }
 
 pub(crate) struct BiliGuga {
@@ -287,6 +287,10 @@ pub(crate) struct BiliGuga {
     controls_until: Option<Instant>,
     player_fullscreen: bool,
     playing_video: Option<Video>,
+    /// The stage size the view last drew at. `view` gets `&self`, so it publishes here and
+    /// `poll` — which owns the command channel to mpv — is what acts on it.
+    stage_size: std::cell::Cell<Option<(usize, usize)>>,
+    /// The stage size mpv was last told to decode for, so a resize asks exactly once.
     player_viewport_size: Option<(usize, usize)>,
     detail_view_count: String,
     detail_danmaku_count: String,
@@ -311,7 +315,13 @@ pub(crate) struct BiliGuga {
     // Runtime plumbing.
     power_inhibitor: PowerInhibitor,
     player: mpv::MpvPlayer,
-    covers: Covers,
+    /// The cancel flag this app's covers share. Nothing flips it: a cover that arrives late for
+    /// a card that scrolled away is stored and reused, so cancelling would only throw the work
+    /// away. `queue_cover_download` takes one, and one flag for the process is the honest value.
+    covers_cancelled: Arc<AtomicBool>,
+    /// Covers asked for and not yet arrived, by bvid. Without this, every page load asked for
+    /// every missing cover again: a 20-row feed could fire 20 identical downloads per page.
+    covers_in_flight: std::collections::HashSet<String>,
     images: Option<ImageCache>,
     worker: Option<Worker>,
     events: std::sync::mpsc::Receiver<Event>,
@@ -322,6 +332,9 @@ pub(crate) struct BiliGuga {
     last_position: f64,
     /// The last thing an action (like, coin, favourite) told the user.
     action_note: Option<String>,
+    /// Set by any `Event` that added rows, so `poll` looks for missing covers once per frame
+    /// rather than once per answer.
+    new_rows: bool,
 }
 
 impl BiliGuga {
@@ -351,13 +364,16 @@ impl BiliGuga {
             author_loading: false,
             author_generation: 0,
             selected: None,
-            loading: true,
+            loading: false,
             history_loading: false,
             watch_later_loading: false,
             favorites_loading: false,
             dynamic_loading: false,
             home_page: 0,
-            home_loading: true,
+            // Nothing is in flight yet: the load in `setup` is what starts the first page.
+            // Starting this true made that load return immediately on its own guard, so the
+            // feed stayed empty until the user pressed 刷新.
+            home_loading: false,
             home_has_more: true,
             home_generation: 0,
             session,
@@ -379,6 +395,7 @@ impl BiliGuga {
             controls_until: None,
             player_fullscreen: false,
             playing_video: None,
+            stage_size: std::cell::Cell::new(None),
             player_viewport_size: None,
             detail_view_count: "—".into(),
             detail_danmaku_count: "—".into(),
@@ -401,9 +418,8 @@ impl BiliGuga {
             comments_error: None,
             power_inhibitor: PowerInhibitor::default(),
             player: mpv::MpvPlayer::new(),
-            covers: Covers {
-                requested: Arc::new(AtomicBool::new(false)),
-            },
+            covers_cancelled: Arc::new(AtomicBool::new(false)),
+            covers_in_flight: std::collections::HashSet::new(),
             images: None,
             worker: Some(Worker {
                 events: events_tx,
@@ -413,6 +429,7 @@ impl BiliGuga {
             cover_images: std::collections::HashMap::new(),
             last_position: 0.,
             action_note: None,
+            new_rows: false,
         }
     }
 }
@@ -606,7 +623,7 @@ impl BiliGuga {
             async move { fetch_video_context(&for_context, cookie.as_deref()).await },
             move |result| match result {
                 Ok(context) => Event::VideoContext(Box::new(context)),
-                Err(_) => Event::Action("context-failed"),
+                Err(_) => Event::Silent,
             },
         );
         let play_cookie = self.session.as_ref().map(|session| session.cookie.clone());
@@ -737,7 +754,7 @@ impl BiliGuga {
                 let _ = report_video_progress(&cookie, video.aid, video.cid, position).await;
                 let _ = report_video_heartbeat(&cookie, &video, position, 0).await;
             },
-            |()| Event::Action("history-reported"),
+            |()| Event::HistoryReported,
         );
     }
 
@@ -825,31 +842,34 @@ impl BiliGuga {
 
     // ---- Covers --------------------------------------------------------------------------
 
-    fn request_cover(&mut self, video: &Video) {
-        let url = video.cover.clone();
-        if url.is_empty() {
+    /// Asks for one cover. Returns silently if that bvid is already on its way, so a second
+    /// page asking for the same row does not queue a duplicate download behind the first.
+    fn request_cover(&mut self, bvid: String, url: String) {
+        if url.is_empty() || !self.covers_in_flight.insert(bvid.clone()) {
             return;
         }
-        let cancelled = self.covers.requested.clone();
+        let cancelled = self.covers_cancelled.clone();
         let Some(receiver) = queue_cover_download(url, cancelled) else {
+            self.covers_in_flight.remove(&bvid);
             return;
         };
-        let bvid = video.bvid.clone();
         self.worker().spawn(
             async move { receiver.await.ok().flatten() },
             move |image| match image {
                 Some(image) => Event::Cover(bvid, image),
-                None => Event::Action("cover-missing"),
+                None => Event::CoverFailed(bvid),
             },
         );
     }
 
-    fn attach_cover(&mut self, bvid: &str, pixels: Arc<Rgba8>) {
+    fn attach_cover(&mut self, bvid: String, pixels: Arc<Rgba8>) {
+        self.covers_in_flight.remove(&bvid);
         let Some(cache) = self.images.as_ref() else {
             return;
         };
+        // `Arc<[u8]>` clones here, the bytes do not: the cache becomes the second owner.
         let image = cache.rgba(pixels.width, pixels.height, pixels.pixels.clone());
-        self.cover_images.insert(bvid.to_string(), image);
+        self.cover_images.insert(bvid, image);
     }
 
     fn cover_for(&self, video: &Video) -> Option<&Image> {
@@ -1456,6 +1476,31 @@ fn volume_bar(volume: f64) -> El {
         .child(progress_track((volume / 100.) as f32, 4.0))
 }
 
+/// Which collection the current episode belongs to, and where in it, when it belongs to one.
+/// The title comes from the API and had nowhere to show before this.
+fn collection_marker(app: &BiliGuga) -> El {
+    let Some(collection) = &app.collection else {
+        return el();
+    };
+    let position = app.playing_video.as_ref().and_then(|video| {
+        collection
+            .episodes
+            .iter()
+            .position(|episode| episode.bvid == video.bvid)
+            .map(|index| index + 1)
+    });
+    let label = match position {
+        Some(index) => format!("{} {}/{}", collection.title, index, collection.episodes.len()),
+        None => collection.title.clone(),
+    };
+    text(label)
+        .key(format!("collection-{}", collection.id))
+        .font(type_::SECTION)
+        .color(theme::TEXT_FAINT)
+        .truncate()
+        .max_w(180.0)
+}
+
 fn control_button(label: &'static str, key: &'static str) -> El {
     el()
         .key(key)
@@ -1467,6 +1512,8 @@ fn control_button(label: &'static str, key: &'static str) -> El {
         .child(text(label).font(type_::LABEL).color(theme::TEXT))
 }
 
+/// The player column. The video area's measured size reaches mpv through
+/// `BiliGuga::stage_size` and `poll`, so a 1080p frame is not decoded for a 400 pt column.
 fn render_player(app: &BiliGuga) -> El {
     let Some(video) = &app.playing_video else {
         return col()
@@ -1496,6 +1543,7 @@ fn render_player(app: &BiliGuga) -> El {
     // The stage: the video frame letterboxed on black, or a message until one arrives.
     let stage_size = app.player_viewport_size.unwrap_or((1280, 720));
     let mut stage = col()
+        .key("player-stage")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -1503,6 +1551,17 @@ fn render_player(app: &BiliGuga) -> El {
         .justify_center()
         .fill(Color::BLACK)
         .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
+    // The stage keeps the clip's own shape until a frame says otherwise, so a 4:3 video is
+    // letterboxed instead of being stretched into 16:9.
+    if !app.player_fullscreen {
+        let aspect = app
+            .player
+            .source_size()
+            .filter(|(_, height)| *height > 0)
+            .map(|(width, height)| width as f32 / height as f32)
+            .unwrap_or(16. / 9.);
+        stage = stage.aspect_ratio(aspect);
+    }
     match app.player.presented() {
         Some(pixels) => {
             stage = stage.child(
@@ -1534,96 +1593,97 @@ fn render_player(app: &BiliGuga) -> El {
 
     // The controls, over the stage, while the pointer has been around recently.
     let controls_visible = app.controls_visible();
+    let transport = row()
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .child(
+            control_button(
+                if app.playback == PlaybackState::Playing {
+                    "暂停"
+                } else {
+                    "播放"
+                },
+                "play-pause",
+            )
+            .on_press(|app: &mut BiliGuga| app.toggle_pause()),
+        )
+        .child(
+            text(format!(
+                "{} / {}",
+                format_time(position),
+                format_time(duration)
+            ))
+            .font(type_::LABEL)
+            .color(theme::TEXT_DIM),
+        )
+        .child(el().grow(1.0))
+        .child(collection_marker(app))
+        .child(
+            control_button("画质", "quality")
+                .child(
+                    text(crate::api::quality_label(app.quality))
+                        .font(type_::SECTION)
+                        .color(theme::TEXT_FAINT),
+                )
+                .on_press(|app: &mut BiliGuga| {
+                    app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
+                        None
+                    } else {
+                        Some(PlayerMenu::Quality)
+                    };
+                }),
+        )
+        .child(
+            control_button("全屏", "fullscreen").on_press_tx(
+                |app: &mut BiliGuga, tx: &mut Tx| {
+                    app.player_fullscreen = !app.player_fullscreen;
+                    tx.toggle_full_screen();
+                },
+            ),
+        );
+
+    // Actions on their own row: eleven buttons in one line is wider than the player column at
+    // the default window size, and the rightmost ones were cut off entirely.
+    let actions = row()
+        .w_full()
+        .items_center()
+        .gap(6.0)
+        .child(control_button("点赞", "like").on_press(|app: &mut BiliGuga| app.like_current()))
+        .child(control_button("投币", "coin").on_press(|app: &mut BiliGuga| app.coin_current()))
+        .child(
+            control_button("稍后", "watch-later")
+                .on_press(|app: &mut BiliGuga| app.save_to_watch_later()),
+        )
+        .child(
+            control_button("收藏", "favorite").on_press(|app: &mut BiliGuga| app.save_to_favorites()),
+        )
+        .child(
+            control_button("上集", "prev-episode")
+                .on_press(|app: &mut BiliGuga| app.play_collection_step(false)),
+        )
+        .child(
+            control_button("下集", "next-episode")
+                .on_press(|app: &mut BiliGuga| app.play_collection_step(true)),
+        )
+        .child(el().grow(1.0))
+        .child(volume_bar(app.volume))
+        .child(control_button("倍速", "speed").on_press(|app: &mut BiliGuga| app.cycle_speed()))
+        .child(
+            text(format!("{:.2}x", app.speed))
+                .font(type_::LABEL)
+                .color(theme::TEXT_DIM),
+        );
+
     let controls = col()
         .w_full()
-        .gap(6.0)
+        .gap(4.0)
         .px(12.0)
         .py(8.0)
         .fill(theme::PANEL)
         .child(seek_bar(position, duration))
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .child(
-                    control_button(
-                        if app.playback == PlaybackState::Playing {
-                            "暂停"
-                        } else {
-                            "播放"
-                        },
-                        "play-pause",
-                    )
-                    .on_press(|app: &mut BiliGuga| app.toggle_pause()),
-                )
-                .child(
-                    text(format!(
-                        "{} / {}",
-                        format_time(position),
-                        format_time(duration)
-                    ))
-                    .font(type_::LABEL)
-                    .color(theme::TEXT_DIM),
-                )
-                .child(el().grow(1.0))
-                .child(
-                    control_button("点赞", "like")
-                        .on_press(|app: &mut BiliGuga| app.like_current()),
-                )
-                .child(
-                    control_button("投币", "coin")
-                        .on_press(|app: &mut BiliGuga| app.coin_current()),
-                )
-                .child(
-                    control_button("稍后", "watch-later")
-                        .on_press(|app: &mut BiliGuga| app.save_to_watch_later()),
-                )
-                .child(
-                    control_button("收藏", "favorite")
-                        .on_press(|app: &mut BiliGuga| app.save_to_favorites()),
-                )
-                .child(
-                    control_button("上集", "prev-episode")
-                        .on_press(|app: &mut BiliGuga| app.play_collection_step(false)),
-                )
-                .child(
-                    control_button("下集", "next-episode")
-                        .on_press(|app: &mut BiliGuga| app.play_collection_step(true)),
-                )
-                .child(
-                    control_button("画质", "quality")
-                        .child(
-                            text(crate::api::quality_label(app.quality))
-                                .font(type_::SECTION)
-                                .color(theme::TEXT_FAINT),
-                        )
-                        .on_press(|app: &mut BiliGuga| {
-                            app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
-                                None
-                            } else {
-                                Some(PlayerMenu::Quality)
-                            };
-                        }),
-                )
-                .child(volume_bar(app.volume))
-                .child(
-                    control_button("倍速", "speed")
-                        .on_press(|app: &mut BiliGuga| app.cycle_speed()),
-                )
-                .child(
-                    text(format!("{:.2}x", app.speed))
-                        .font(type_::LABEL)
-                        .color(theme::TEXT_DIM),
-                )
-                .child(
-                    control_button("全屏", "fullscreen")
-                        .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
-                            app.player_fullscreen = !app.player_fullscreen;
-                            tx.toggle_full_screen();
-                        }),
-                ),
-        );
+        .child(transport)
+        .child(actions);
 
     let mut root = col()
         .key("player")
@@ -1679,7 +1739,41 @@ fn render_player(app: &BiliGuga) -> El {
                 .child(text(note.clone()).font(type_::LABEL).color(theme::ACCENT_SOFT)),
         );
     }
-    root.child(render_comments(app, video))
+    root.child(render_detail(app, video))
+        .child(render_comments(app, video))
+}
+
+/// The clip's own numbers: what the detail call fetches. They lived in fields nobody read
+/// until this row existed, so the view count, danmaku count and publish date never showed.
+fn render_detail(app: &BiliGuga, video: &Video) -> El {
+    let mut line = row()
+        .key("player-detail")
+        .w_full()
+        .min_w(0.0)
+        .items_center()
+        .gap(10.0)
+        .px(12.0)
+        .py(6.0)
+        .fill(theme::PANEL)
+        .child(
+            text(&video.title)
+                .font(type_::BODY)
+                .color(theme::TEXT)
+                .truncate(),
+        );
+    for (label, value) in [
+        ("播放", &app.detail_view_count),
+        ("弹幕", &app.detail_danmaku_count),
+        ("点赞", &app.detail_like_count),
+        ("发布于", &app.published_at),
+    ] {
+        line = line.child(
+            text(format!("{label} {value}"))
+                .font(type_::SECTION)
+                .color(theme::TEXT_FAINT),
+        );
+    }
+    line
 }
 
 fn render_comments(app: &BiliGuga, video: &Video) -> El {
@@ -1787,6 +1881,15 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
 }
 
 fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
+    // Reading the stage's size re-runs the view only when that size changes, not when the
+    // element merely moves: exactly what telling mpv where to decode for needs.
+    let stage_size = cx.layout_size("player-stage").map(|[width, height]| {
+        (
+            width.round().max(1.0) as usize,
+            height.round().max(1.0) as usize,
+        )
+    });
+    app.stage_size.set(stage_size);
     let mut root = row().w_full().h_full().fill(theme::BG);
     if app.player_fullscreen {
         return root.child(render_player(app));
@@ -1840,7 +1943,7 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
                         let added = app.videos.len().saturating_sub(old_len);
                         app.home_has_more = page.has_more && (first_page || added > 0);
                         app.trim_home_items();
-                        app.request_missing_covers();
+                        app.new_rows = true;
                     }
                     Err(_) => {
                         // Put the page number back so a retry asks for this page again.
@@ -1855,7 +1958,7 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
                     Ok(videos) => {
                         app.search_results = videos;
                         app.selected = None;
-                        app.request_missing_covers();
+                        app.new_rows = true;
                     }
                     Err(error) => app.playback_error = Some(error),
                 }
@@ -1864,28 +1967,28 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
                 app.dynamic_loading = false;
                 if let Ok(videos) = result {
                     app.dynamic_videos = videos;
-                    app.request_missing_covers();
+                    app.new_rows = true;
                 }
             }
             Event::History(result) => {
                 app.history_loading = false;
                 if let Ok(videos) = result {
                     app.history = videos;
-                    app.request_missing_covers();
+                    app.new_rows = true;
                 }
             }
             Event::WatchLater(result) => {
                 app.watch_later_loading = false;
                 if let Ok(videos) = result {
                     app.watch_later = videos;
-                    app.request_missing_covers();
+                    app.new_rows = true;
                 }
             }
             Event::Favorites(result) => {
                 app.favorites_loading = false;
                 if let Ok(videos) = result {
                     app.favorites = videos;
-                    app.request_missing_covers();
+                    app.new_rows = true;
                 }
             }
             Event::Author(result, generation) => {
@@ -1897,7 +2000,7 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
                     app.author_page = page.page;
                     app.author_has_more = page.has_more;
                     app.author_videos.extend(page.videos);
-                    app.request_missing_covers();
+                    app.new_rows = true;
                 }
             }
             Event::VideoContext(context) => {
@@ -2006,24 +2109,40 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
                     app.load_avatar(face);
                 }
             }
-            Event::Action(_action) => {}
-            Event::PlaybackMessage(message) => {
-                // A failed action is worth showing; a successful one is a short toast.
-                match message {
-                    Some(text) if text.contains("失败") || text.contains("缺少") || text.contains("无效") => {
-                        app.playback_error = Some(text)
-                    }
-                    other => app.action_note = other,
-                }
+            Event::ActionDone(done, result) => {
+                app.action_note = Some(match result {
+                    Ok(()) => done.to_string(),
+                    Err(error) => error,
+                });
             }
-            Event::Cover(bvid, pixels) => app.attach_cover(&bvid, pixels),
+            Event::CoverFailed(bvid) => {
+                app.covers_in_flight.remove(&bvid);
+            }
+            Event::HistoryReported => app.history_report_in_flight = false,
+            Event::Silent => {}
+            Event::Cover(bvid, pixels) => app.attach_cover(bvid, pixels),
         }
+    }
+
+    if std::mem::take(&mut app.new_rows) {
+        app.request_missing_covers();
     }
 
     // Player state. Only while something is playing, and only a changed value counts as a
     // change: the video frames themselves do not need this loop at all, because `Pixels::set`
     // wakes the window on its own. What runs here keeps the seek bar and the clock honest,
     // about ten times a second.
+    if app.playing_video.is_some() {
+        // Telling mpv once per change is what keeps a 1080p decode off a 400 pt column.
+        let measured = app.stage_size.get();
+        if measured != app.player_viewport_size {
+            app.player_viewport_size = measured;
+            if let Some((width, height)) = measured {
+                app.player.set_render_viewport(width, height);
+            }
+        }
+    }
+
     if app.playback != PlaybackState::Idle {
         if app.player.poll_frame() {
             changed = true;
@@ -2178,16 +2297,28 @@ impl BiliGuga {
     /// Asks for the covers the current feed is missing, skipping ones already downloaded or in
     /// flight for that bvid.
     fn request_missing_covers(&mut self) {
-        let missing: Vec<Video> = self
-            .current_videos()
-            .iter()
-            .filter(|video| {
-                !video.cover.is_empty() && !self.cover_images.contains_key(&video.bvid)
-            })
-            .cloned()
-            .collect();
-        for video in missing {
-            self.request_cover(&video);
+        let mut missing: Vec<(String, String)> = Vec::new();
+        for videos in [
+            &self.videos,
+            &self.search_results,
+            &self.dynamic_videos,
+            &self.watch_later,
+            &self.favorites,
+            &self.history,
+            &self.author_videos,
+        ] {
+            for video in videos {
+                if video.cover.is_empty()
+                    || self.cover_images.contains_key(&video.bvid)
+                    || self.covers_in_flight.contains(&video.bvid)
+                {
+                    continue;
+                }
+                missing.push((video.bvid.clone(), video.cover.clone()));
+            }
+        }
+        for (bvid, url) in missing {
+            self.request_cover(bvid, url);
         }
     }
 }
@@ -2307,12 +2438,7 @@ impl BiliGuga {
         self.action_note = Some("正在点赞…".into());
         self.worker().spawn(
             async move { like_video(&cookie, video.aid).await },
-            |result| {
-                Event::PlaybackMessage(Some(match result {
-                    Ok(()) => "已点赞".into(),
-                    Err(error) => error,
-                }))
-            },
+            |result| Event::ActionDone("已点赞", result),
         );
     }
 
@@ -2329,12 +2455,7 @@ impl BiliGuga {
         self.action_note = Some("正在投币…".into());
         self.worker().spawn(
             async move { coin_video(&cookie, video.aid).await },
-            |result| {
-                Event::PlaybackMessage(Some(match result {
-                    Ok(()) => "已投币".into(),
-                    Err(error) => error,
-                }))
-            },
+            |result| Event::ActionDone("已投币", result),
         );
     }
 
@@ -2350,12 +2471,7 @@ impl BiliGuga {
         }
         self.worker().spawn(
             async move { add_to_watch_later(&cookie, video.aid).await },
-            |result| {
-                Event::PlaybackMessage(Some(match result {
-                    Ok(()) => "已加入稍后再看".into(),
-                    Err(error) => error,
-                }))
-            },
+            |result| Event::ActionDone("已加入稍后再看", result),
         );
     }
 
@@ -2370,12 +2486,7 @@ impl BiliGuga {
         let (cookie, mid) = (session.cookie, session.mid);
         self.worker().spawn(
             async move { add_to_favorites(&cookie, mid, video.aid).await },
-            |result| {
-                Event::PlaybackMessage(Some(match result {
-                    Ok(()) => "已收藏".into(),
-                    Err(error) => error,
-                }))
-            },
+            |result| Event::ActionDone("已收藏", result),
         );
     }
 
