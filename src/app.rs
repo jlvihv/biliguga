@@ -2036,13 +2036,13 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     // change: the video frames themselves do not need this loop at all, because `Pixels::set`
     // wakes the window on its own. What runs here keeps the seek bar and the clock honest,
     // about ten times a second.
-    if app.playing_video.is_some() {
-        // Telling mpv once per change is what keeps a 1080p decode off a 400 pt column.
-        if let Some((width, height)) = app.stage_size.get() {
-            // `set_render_viewport` drops a repeat of the size already in force, so this can
-            // run every frame without sending anything twice.
-            app.player.set_render_viewport(width, height);
-        }
+    // The view publishes the stage size it drew at; mpv decodes for it instead of for a fixed
+    // 1920x1080. `set_render_viewport` drops a repeat of the size already in force, so reading
+    // it every frame costs a comparison and sends nothing.
+    if app.playing_video.is_some()
+        && let Some((width, height)) = app.stage_size.get()
+    {
+        app.player.set_render_viewport(width, height);
     }
 
     if app.playback != PlaybackState::Idle {
@@ -2103,8 +2103,9 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
             app.queue_history_report();
         }
         app.sync_power();
-        // Keeps the clock moving while nothing else asks for a frame. An idle window still
-        // draws nothing: this only runs while a video is loaded.
+        // Asks for another frame in 100 ms so the clock and the seek bar keep up, which is what
+        // replaces a repaint per video frame. Returning false on a frame where nothing visible
+        // changed is the point: the video itself is drawn from `Pixels`, not from a new commit.
         tx.wake_after(Duration::from_millis(100));
     }
 
@@ -2126,195 +2127,195 @@ impl BiliGuga {
     fn apply(&mut self, event: Event) {
         let app = self;
         match event {
-        Event::Home(result, generation) => {
-            if generation != app.home_generation || app.active_tab != AppTab::Home {
-                return;
-            }
-            app.home_loading = false;
-            app.loading = false;
-            match result {
-                Ok(page) => {
-                    let first_page = app.videos.is_empty();
-                    let old_len = app.videos.len();
-                    for video in page.videos {
-                        if !app.videos.iter().any(|current| current.bvid == video.bvid) {
-                            app.videos.push(video);
+            Event::Home(result, generation) => {
+                if generation != app.home_generation || app.active_tab != AppTab::Home {
+                    return;
+                }
+                app.home_loading = false;
+                app.loading = false;
+                match result {
+                    Ok(page) => {
+                        let first_page = app.videos.is_empty();
+                        let old_len = app.videos.len();
+                        for video in page.videos {
+                            if !app.videos.iter().any(|current| current.bvid == video.bvid) {
+                                app.videos.push(video);
+                            }
                         }
+                        let added = app.videos.len().saturating_sub(old_len);
+                        app.home_has_more = page.has_more && (first_page || added > 0);
+                        app.trim_home_items();
+                        app.new_rows = true;
                     }
-                    let added = app.videos.len().saturating_sub(old_len);
-                    app.home_has_more = page.has_more && (first_page || added > 0);
-                    app.trim_home_items();
+                    Err(_) => {
+                        // Put the page number back so a retry asks for this page again.
+                        app.home_page = app.home_page.saturating_sub(1);
+                        app.home_has_more = false;
+                    }
+                }
+            }
+            Event::Search(result) => {
+                app.loading = false;
+                match result {
+                    Ok(videos) => {
+                        app.search_results = videos;
+                        app.selected = None;
+                        app.new_rows = true;
+                    }
+                    Err(error) => app.playback_error = Some(error),
+                }
+            }
+            // The four signed-in feeds answer the same way, so they are handled in one arm with
+            // the feed as the only variable.
+            Event::Dynamic(result) => app.land_signed_in(SignedInFeed::Dynamic, result),
+            Event::History(result) => app.land_signed_in(SignedInFeed::History, result),
+            Event::WatchLater(result) => app.land_signed_in(SignedInFeed::WatchLater, result),
+            Event::Favorites(result) => app.land_signed_in(SignedInFeed::Favorites, result),
+            Event::Author(result, generation) => {
+                if generation != app.author_generation {
+                    return;
+                }
+                app.author_loading = false;
+                if let Ok(page) = result {
+                    app.author_page = page.page;
+                    app.author_has_more = page.has_more;
+                    app.author_videos.extend(page.videos);
                     app.new_rows = true;
                 }
-                Err(_) => {
-                    // Put the page number back so a retry asks for this page again.
-                    app.home_page = app.home_page.saturating_sub(1);
-                    app.home_has_more = false;
+            }
+            Event::VideoContext(context) => {
+                // An answer that lands after the viewer moved on would put the previous video's
+                // collection in the next video's menu.
+                let still_current = app
+                    .playing_video
+                    .as_ref()
+                    .is_some_and(|video| video.aid == context.aid || video.aid <= 0);
+                if !still_current {
+                    return;
                 }
-            }
-        }
-        Event::Search(result) => {
-            app.loading = false;
-            match result {
-                Ok(videos) => {
-                    app.search_results = videos;
-                    app.selected = None;
-                    app.new_rows = true;
-                }
-                Err(error) => app.playback_error = Some(error),
-            }
-        }
-        // The four signed-in feeds answer the same way, so they are handled in one arm with
-        // the feed as the only variable.
-        Event::Dynamic(result) => app.land_signed_in(SignedInFeed::Dynamic, result),
-        Event::History(result) => app.land_signed_in(SignedInFeed::History, result),
-        Event::WatchLater(result) => app.land_signed_in(SignedInFeed::WatchLater, result),
-        Event::Favorites(result) => app.land_signed_in(SignedInFeed::Favorites, result),
-        Event::Author(result, generation) => {
-            if generation != app.author_generation {
-                return;
-            }
-            app.author_loading = false;
-            if let Ok(page) = result {
-                app.author_page = page.page;
-                app.author_has_more = page.has_more;
-                app.author_videos.extend(page.videos);
-                app.new_rows = true;
-            }
-        }
-        Event::VideoContext(context) => {
-            // An answer that lands after the viewer moved on would put the previous video's
-            // collection in the next video's menu.
-            let still_current = app
-                .playing_video
-                .as_ref()
-                .is_some_and(|video| video.aid == context.aid || video.aid <= 0);
-            if !still_current {
-                return;
-            }
-            app.detail_view_count = context.view_count;
-            app.detail_danmaku_count = context.danmaku_count;
-            app.detail_like_count = context.like_count;
-            app.published_at = format_publish_date(context.pubdate);
-            app.collection = context.collection;
-            if let Some(video) = app.playing_video.as_mut() {
-                if video.aid == 0 {
-                    video.aid = context.aid;
-                }
-                if video.cid == 0 {
-                    video.cid = context.cid;
-                }
-                // A collection episode carries the collection's owner, which is not always the
-                // uploader of this part; the detail endpoint knows the right one.
-                if !context.uploader.is_empty() {
-                    video.uploader = context.uploader.clone();
-                    video.uploader_mid = context.uploader_mid;
-                }
-            }
-        }
-        Event::PlayUrl(result) => match result {
-            Ok(play) => app.finish_play(play),
-            Err(error) => {
-                app.playback = PlaybackState::Idle;
-                app.playback_error = Some(error);
-            }
-        },
-        Event::Resume(progress) => {
-            app.cloud_resume_progress = progress.filter(|progress| *progress > 3.);
-            app.cloud_resume_applied = app.cloud_resume_progress.is_none();
-        }
-        Event::Comments(result, generation) => {
-            if generation != app.comments_generation {
-                return;
-            }
-            app.comments_loading = false;
-            match result {
-                Ok((page, comments, total, has_more)) => {
-                    if page <= 1 {
-                        app.comments.clear();
+                app.detail_view_count = context.view_count;
+                app.detail_danmaku_count = context.danmaku_count;
+                app.detail_like_count = context.like_count;
+                app.published_at = format_publish_date(context.pubdate);
+                app.collection = context.collection;
+                if let Some(video) = app.playing_video.as_mut() {
+                    if video.aid == 0 {
+                        video.aid = context.aid;
                     }
-                    app.comments.extend(comments);
-                    app.comments_total = total;
-                    app.comments_has_more = has_more;
-                    app.comments_page = page as u32;
-                }
-                Err(error) => app.comments_error = Some(error),
-            }
-        }
-        Event::Avatar(image) => {
-            if let Some(image) = image
-                && let Some(cache) = app.images.as_ref()
-            {
-                app.account_avatar =
-                    Some(cache.rgba(image.width, image.height, image.pixels.clone()));
-            }
-        }
-        Event::QrCode(result, generation) => {
-            if generation != app.login_generation {
-                return;
-            }
-            app.login_loading = false;
-            match result {
-                Ok(data) => {
-                    app.login_key = Some(data.key);
-                    if let Some(cache) = app.images.as_ref() {
-                        app.login_qr = Some(cache.rgba(
-                            data.image.width,
-                            data.image.height,
-                            data.image.pixels.clone(),
-                        ));
+                    if video.cid == 0 {
+                        video.cid = context.cid;
                     }
-                    app.login_status = "请使用哔哩哔哩 App 扫码登录".into();
-                    app.poll_login();
+                    // A collection episode carries the collection's owner, which is not always the
+                    // uploader of this part; the detail endpoint knows the right one.
+                    if !context.uploader.is_empty() {
+                        video.uploader = context.uploader.clone();
+                        video.uploader_mid = context.uploader_mid;
+                    }
                 }
-                Err(error) => app.login_status = error,
             }
-        }
-        Event::QrPoll(result, generation) => {
-            if generation != app.login_generation {
-                return;
-            }
-            match result {
-                Ok(PollResult::Waiting) => app.poll_login(),
-                Ok(PollResult::Scanned) => {
-                    app.login_status = "已扫码，请在手机上确认".into();
-                    app.poll_login();
+            Event::PlayUrl(result) => match result {
+                Ok(play) => app.finish_play(play),
+                Err(error) => {
+                    app.playback = PlaybackState::Idle;
+                    app.playback_error = Some(error);
                 }
-                Ok(PollResult::LoggedIn(session)) => {
+            },
+            Event::Resume(progress) => {
+                app.cloud_resume_progress = progress.filter(|progress| *progress > 3.);
+                app.cloud_resume_applied = app.cloud_resume_progress.is_none();
+            }
+            Event::Comments(result, generation) => {
+                if generation != app.comments_generation {
+                    return;
+                }
+                app.comments_loading = false;
+                match result {
+                    Ok((page, comments, total, has_more)) => {
+                        if page <= 1 {
+                            app.comments.clear();
+                        }
+                        app.comments.extend(comments);
+                        app.comments_total = total;
+                        app.comments_has_more = has_more;
+                        app.comments_page = page as u32;
+                    }
+                    Err(error) => app.comments_error = Some(error),
+                }
+            }
+            Event::Avatar(image) => {
+                if let Some(image) = image
+                    && let Some(cache) = app.images.as_ref()
+                {
+                    app.account_avatar =
+                        Some(cache.rgba(image.width, image.height, image.pixels.clone()));
+                }
+            }
+            Event::QrCode(result, generation) => {
+                if generation != app.login_generation {
+                    return;
+                }
+                app.login_loading = false;
+                match result {
+                    Ok(data) => {
+                        app.login_key = Some(data.key);
+                        if let Some(cache) = app.images.as_ref() {
+                            app.login_qr = Some(cache.rgba(
+                                data.image.width,
+                                data.image.height,
+                                data.image.pixels.clone(),
+                            ));
+                        }
+                        app.login_status = "请使用哔哩哔哩 App 扫码登录".into();
+                        app.poll_login();
+                    }
+                    Err(error) => app.login_status = error,
+                }
+            }
+            Event::QrPoll(result, generation) => {
+                if generation != app.login_generation {
+                    return;
+                }
+                match result {
+                    Ok(PollResult::Waiting) => app.poll_login(),
+                    Ok(PollResult::Scanned) => {
+                        app.login_status = "已扫码，请在手机上确认".into();
+                        app.poll_login();
+                    }
+                    Ok(PollResult::LoggedIn(session)) => {
+                        let _ = login::save_session(&session);
+                        app.session = Some(session);
+                        app.login_status = "登录成功".into();
+                        app.active_tab = AppTab::Home;
+                        app.load_home_page(true);
+                    }
+                    Ok(PollResult::Expired) => {
+                        app.login_status = "二维码已过期，请刷新".into();
+                        app.login_qr = None;
+                    }
+                    Err(error) => app.login_status = error,
+                }
+            }
+            Event::Session(result) => {
+                if let Ok(session) = result {
                     let _ = login::save_session(&session);
+                    let face = session.face.clone();
                     app.session = Some(session);
-                    app.login_status = "登录成功".into();
-                    app.active_tab = AppTab::Home;
-                    app.load_home_page(true);
+                    app.load_signed_in(SignedInFeed::Dynamic);
+                    app.load_avatar(face);
                 }
-                Ok(PollResult::Expired) => {
-                    app.login_status = "二维码已过期，请刷新".into();
-                    app.login_qr = None;
-                }
-                Err(error) => app.login_status = error,
             }
-        }
-        Event::Session(result) => {
-            if let Ok(session) = result {
-                let _ = login::save_session(&session);
-                let face = session.face.clone();
-                app.session = Some(session);
-                app.load_signed_in(SignedInFeed::Dynamic);
-                app.load_avatar(face);
+            Event::ActionDone(done, result) => {
+                app.action_note = Some(match result {
+                    Ok(()) => done.to_string(),
+                    Err(error) => error,
+                });
             }
-        }
-        Event::ActionDone(done, result) => {
-            app.action_note = Some(match result {
-                Ok(()) => done.to_string(),
-                Err(error) => error,
-            });
-        }
-        Event::CoverFailed(bvid) => {
-            app.covers_in_flight.remove(&bvid);
-        }
-        Event::HistoryReported => app.history_report_in_flight = false,
-        Event::Silent => {}
-        Event::Cover(bvid, pixels) => app.attach_cover(bvid, pixels),
+            Event::CoverFailed(bvid) => {
+                app.covers_in_flight.remove(&bvid);
+            }
+            Event::HistoryReported => app.history_report_in_flight = false,
+            Event::Silent => {}
+            Event::Cover(bvid, pixels) => app.attach_cover(bvid, pixels),
         }
     }
 }

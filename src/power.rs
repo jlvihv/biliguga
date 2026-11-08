@@ -1,22 +1,39 @@
 use std::process::{Child, Command, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::{Duration, Instant};
 
 /// Keeps the operating system awake while media is actively playing.
 ///
 /// The inhibitor is scoped to the player and is released when playback pauses,
 /// ends, or the application exits.
+/// How often the helper process is re-checked while playback runs. `set_active` is called
+/// every frame, and `try_wait` is a syscall: checking once a second is plenty to notice a
+/// helper that died.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 pub struct PowerInhibitor {
     active: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     child: Option<Child>,
+    /// When the helper was last checked, so a per-frame call is not a per-frame syscall.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    checked_at: Option<Instant>,
 }
 
-
 impl PowerInhibitor {
+    /// Turns the inhibitor on or off. Safe to call every frame: a repeat of the current state
+    /// only re-checks the child, so `poll` can keep calling it without spawning anything.
+    ///
+    /// The re-check matters because the helper process (`systemd-inhibit`, `caffeinate`) can
+    /// exit on its own — a session ending, a sandbox refusing it — and the next frame notices
+    /// and starts it again while playback is still going.
     pub fn set_active(&mut self, active: bool) {
         if self.active == active {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if active && self.child.is_some() {
+            if active && self.checked_at.is_none_or(|at| at.elapsed() >= RECHECK_INTERVAL) {
+                self.checked_at = Some(Instant::now());
                 self.ensure_child();
             }
             return;
@@ -69,6 +86,7 @@ impl PowerInhibitor {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn start(&mut self) {}
 
+    /// Starts the helper again if the one recorded has exited (or was never started).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn ensure_child(&mut self) {
         let exited = self

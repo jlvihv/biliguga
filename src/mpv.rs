@@ -304,20 +304,23 @@ impl MpvPlayer {
         }
     }
 
-    /// Collects what the worker produced since the last frame. Pixels do not come through
-    /// here: the worker writes them into a `rune::Pixels`, whose `set` wakes the windows that
-    /// draw it, so playback never needs the view to run.
+    /// Collects what the worker produced since the last frame.
+    ///
+    /// Returns whether a *new frame buffer* arrived, which is a reason to repaint. Status
+    /// updates land here too but are not reported: the worker sends one every 100 ms, and
+    /// treating that as "changed" would repaint the window ten times a second for a clock tick.
+    /// Pixels do not come through this path at all: the worker writes them into a
+    /// `rune::Pixels`, whose `set` wakes the windows drawing it.
     pub fn poll_frame(&mut self) -> bool {
-        let mut changed = false;
+        let mut new_buffer = false;
         while let Ok(target) = self.frame_targets.try_recv() {
             self.presented = Some(target);
-            changed = true;
+            new_buffer = true;
         }
         while let Ok(status) = self.statuses.try_recv() {
             self.current_status = status;
-            changed = true;
         }
-        changed
+        new_buffer
     }
 
     /// The buffer the latest frame landed in, for the view to draw. `None` until the worker
