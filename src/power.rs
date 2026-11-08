@@ -32,9 +32,14 @@ impl PowerInhibitor {
     pub fn set_active(&mut self, active: bool) {
         if self.active == active {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if active && self.checked_at.is_none_or(|at| at.elapsed() >= RECHECK_INTERVAL) {
-                self.checked_at = Some(Instant::now());
-                self.ensure_child();
+            {
+                let due = self
+                    .checked_at
+                    .is_none_or(|at| at.elapsed() >= RECHECK_INTERVAL);
+                if active && due {
+                    self.checked_at = Some(Instant::now());
+                    self.ensure_child();
+                }
             }
             return;
         }
@@ -89,12 +94,12 @@ impl PowerInhibitor {
     /// Starts the helper again if the one recorded has exited (or was never started).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn ensure_child(&mut self) {
-        let exited = self
-            .child
-            .as_mut()
-            .map(|child| child.try_wait().map(|status| status.is_some()).unwrap_or(true))
-            .unwrap_or(true);
-        if exited {
+        let running = match self.child.as_mut() {
+            // A child whose status cannot be read has gone away as far as this is concerned.
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        };
+        if !running {
             self.start();
         }
     }

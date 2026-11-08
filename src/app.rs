@@ -16,11 +16,10 @@
 
 use crate::{
     api::{
-        self, PlayQuality, add_to_favorites, add_to_watch_later, coin_video,
-        fetch_author_videos, fetch_comments, fetch_dynamic_feed, fetch_favorites, fetch_history,
-        fetch_last_play_progress, fetch_recommendations, fetch_search_results,
-        download_avatar, fetch_video_context, fetch_watch_later, like_video, format_publish_date,
-        Clock,
+        self, Clock, PlayQuality, add_to_favorites, add_to_watch_later, coin_video,
+        download_avatar, fetch_author_videos, fetch_comments, fetch_dynamic_feed, fetch_favorites,
+        fetch_history, fetch_last_play_progress, fetch_recommendations, fetch_search_results,
+        fetch_video_context, fetch_watch_later, format_publish_date, like_video,
         queue_cover_download, report_video_heartbeat, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
@@ -528,7 +527,9 @@ impl BiliGuga {
 
     /// The uploader's name for the feed heading, empty when no author page is open.
     fn author_name(&self) -> &str {
-        self.author.as_ref().map_or("", |author| author.name.as_str())
+        self.author
+            .as_ref()
+            .map_or("", |author| author.name.as_str())
     }
 
     /// The rows of the feed the feed column is showing. A slice, not a `&Vec`: no caller needs
@@ -776,12 +777,8 @@ impl BiliGuga {
         }
         self.quality_options = result.qualities.clone();
         self.quality = result.actual_quality;
-        self.player.load(
-            result.url,
-            result.audio_url,
-            self.volume,
-            self.speed,
-        );
+        self.player
+            .load(result.url, result.audio_url, self.volume, self.speed);
         self.playback = PlaybackState::Buffering;
         let Some(video) = self.playing_video.clone() else {
             return;
@@ -873,10 +870,7 @@ impl BiliGuga {
         if self.history_report_in_flight {
             return;
         }
-        let (Some(cookie), Some(video)) = (
-            self.cookie(),
-            self.playing_video.clone(),
-        ) else {
+        let (Some(cookie), Some(video)) = (self.cookie(), self.playing_video.clone()) else {
             return;
         };
         if video.aid <= 0 || video.cid <= 0 {
@@ -953,20 +947,18 @@ impl BiliGuga {
             return;
         };
         let generation = self.login_generation;
-        self.worker()
-            .spawn(async move { login::poll_qr_code(&key).await }, move |result| {
-                Event::QrPoll(result, generation)
-            });
+        self.worker().spawn(
+            async move { login::poll_qr_code(&key).await },
+            move |result| Event::QrPoll(result, generation),
+        );
     }
 
     fn load_avatar(&mut self, url: String) {
         if url.is_empty() || self.account_avatar.is_some() {
             return;
         }
-        self.worker().spawn(
-            async move { download_avatar(&url).await },
-            Event::Avatar,
-        );
+        self.worker()
+            .spawn(async move { download_avatar(&url).await }, Event::Avatar);
     }
 
     fn refresh_session(&mut self) {
@@ -1008,14 +1000,11 @@ impl BiliGuga {
         };
         // `Arc<[u8]>` clones here, the bytes do not: the cache becomes the second owner.
         let image = cache.rgba(pixels.width, pixels.height, pixels.pixels.clone());
-        if self.cover_images.len() >= COVER_CACHE_LIMIT && !self.cover_images.contains_key(&bvid)
-        {
+        if self.cover_images.len() >= COVER_CACHE_LIMIT && !self.cover_images.contains_key(&bvid) {
             // Over the limit: drop whatever no feed is showing. If everything is shown, the
             // cap waits for a row to go away rather than evicting a cover in use.
-            let shown: std::collections::HashSet<String> = self
-                .bvids_on_screen()
-                .map(str::to_string)
-                .collect();
+            let shown: std::collections::HashSet<String> =
+                self.bvids_on_screen().map(str::to_string).collect();
             self.cover_images
                 .retain(|key, _| shown.contains(key.as_str()));
         }
@@ -1039,8 +1028,7 @@ fn card_cover(video: &Video, image: Option<&Image>, width: f32, height: f32) -> 
         .fill(theme::cover_placeholder(video.accent));
     if let Some(image) = image {
         frame = frame.child(
-            el()
-                .w_full()
+            el().w_full()
                 .h_full()
                 .radius(6.0)
                 .pixels_fit(image.pixels(), SurfaceFit::Fill),
@@ -1060,7 +1048,11 @@ fn sidebar_icon(icon: SidebarIcon, color: Color) -> El {
         SidebarIcon::Home => {
             shape = shape
                 .stroke(vec![[2.5, 7.5], [8.0, 2.5], [13.5, 7.5]], 1.4, color)
-                .stroke(vec![[4.5, 6.5], [4.5, 13.5], [11.5, 13.5], [11.5, 6.5]], 1.4, color);
+                .stroke(
+                    vec![[4.5, 6.5], [4.5, 13.5], [11.5, 13.5], [11.5, 6.5]],
+                    1.4,
+                    color,
+                );
         }
         SidebarIcon::Dynamic => {
             // A triangle inside a circle: the play mark a feed of videos suggests.
@@ -1094,7 +1086,14 @@ fn sidebar_icon(icon: SidebarIcon, color: Color) -> El {
         }
         SidebarIcon::WatchLater => {
             shape = shape.stroke(
-                vec![[4.0, 2.5], [12.0, 2.5], [12.0, 13.5], [8.0, 10.6], [4.0, 13.5], [4.0, 2.5]],
+                vec![
+                    [4.0, 2.5],
+                    [12.0, 2.5],
+                    [12.0, 13.5],
+                    [8.0, 10.6],
+                    [4.0, 13.5],
+                    [4.0, 2.5],
+                ],
                 1.4,
                 color,
             );
@@ -1102,8 +1101,7 @@ fn sidebar_icon(icon: SidebarIcon, color: Color) -> El {
         SidebarIcon::Favorites => {
             let mut points = Vec::with_capacity(11);
             for step in 0..10 {
-                let angle =
-                    -std::f32::consts::FRAC_PI_2 + step as f32 * std::f32::consts::PI / 5.0;
+                let angle = -std::f32::consts::FRAC_PI_2 + step as f32 * std::f32::consts::PI / 5.0;
                 let radius = if step % 2 == 0 { 6.2 } else { 2.7 };
                 points.push([8.0 + radius * angle.cos(), 8.0 + radius * angle.sin()]);
             }
@@ -1118,7 +1116,13 @@ fn sidebar_icon(icon: SidebarIcon, color: Color) -> El {
                 head.push([8.0 + 2.9 * angle.cos(), 5.4 + 2.9 * angle.sin()]);
             }
             shape = shape.stroke(head, 1.3, color).stroke(
-                vec![[3.2, 14.0], [4.6, 10.4], [8.0, 9.4], [11.4, 10.4], [12.8, 14.0]],
+                vec![
+                    [3.2, 14.0],
+                    [4.6, 10.4],
+                    [8.0, 9.4],
+                    [11.4, 10.4],
+                    [12.8, 14.0],
+                ],
                 1.3,
                 color,
             );
@@ -1167,12 +1171,42 @@ fn render_sidebar(app: &BiliGuga) -> El {
         .py(8.0)
         .gap(4.0)
         .fill(theme::BG)
-        .child(sidebar_item("首页", SidebarIcon::Home, app.active_tab == AppTab::Home, AppTab::Home))
-        .child(sidebar_item("动态", SidebarIcon::Dynamic, app.active_tab == AppTab::Dynamic, AppTab::Dynamic))
-        .child(sidebar_item("历史", SidebarIcon::History, app.active_tab == AppTab::History, AppTab::History))
-        .child(sidebar_item("稍后", SidebarIcon::WatchLater, app.active_tab == AppTab::WatchLater, AppTab::WatchLater))
-        .child(sidebar_item("收藏", SidebarIcon::Favorites, app.active_tab == AppTab::Favorites, AppTab::Favorites))
-        .child(sidebar_item("登录", SidebarIcon::Login, app.active_tab == AppTab::Login, AppTab::Login))
+        .child(sidebar_item(
+            "首页",
+            SidebarIcon::Home,
+            app.active_tab == AppTab::Home,
+            AppTab::Home,
+        ))
+        .child(sidebar_item(
+            "动态",
+            SidebarIcon::Dynamic,
+            app.active_tab == AppTab::Dynamic,
+            AppTab::Dynamic,
+        ))
+        .child(sidebar_item(
+            "历史",
+            SidebarIcon::History,
+            app.active_tab == AppTab::History,
+            AppTab::History,
+        ))
+        .child(sidebar_item(
+            "稍后",
+            SidebarIcon::WatchLater,
+            app.active_tab == AppTab::WatchLater,
+            AppTab::WatchLater,
+        ))
+        .child(sidebar_item(
+            "收藏",
+            SidebarIcon::Favorites,
+            app.active_tab == AppTab::Favorites,
+            AppTab::Favorites,
+        ))
+        .child(sidebar_item(
+            "登录",
+            SidebarIcon::Login,
+            app.active_tab == AppTab::Login,
+            AppTab::Login,
+        ))
 }
 
 /// One row of the feed: a 16:9 cover, the title over two lines, and the uploader and duration.
@@ -1304,8 +1338,7 @@ fn render_search_bar(app: &BiliGuga) -> El {
         .items_center()
         .fill(theme::PANEL)
         .child(
-            el()
-                .key("search-field")
+            el().key("search-field")
                 .grow(1.0)
                 .h(32.0)
                 .radius(6.0)
@@ -1325,8 +1358,7 @@ fn render_search_bar(app: &BiliGuga) -> El {
                 ),
         )
         .child(
-            el()
-                .key("search-button")
+            el().key("search-button")
                 .h(32.0)
                 .px(12.0)
                 .radius(6.0)
@@ -1371,21 +1403,23 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         );
     if app.active_tab == AppTab::Author && app.author_has_more {
         header = header.child(
-            el()
-                .key("author-more")
+            el().key("author-more")
                 .px(8.0)
                 .py(4.0)
                 .radius(4.0)
                 .cursor(rune::Cursor::Pointer)
                 .hover(theme::HOVER)
                 .on_press(|app: &mut BiliGuga| app.load_author_page(false))
-                .child(text("加载更多").font(type_::SECTION).color(theme::ACCENT_SOFT)),
+                .child(
+                    text("加载更多")
+                        .font(type_::SECTION)
+                        .color(theme::ACCENT_SOFT),
+                ),
         );
     }
     if app.active_tab != AppTab::Search {
         header = header.child(
-            el()
-                .key("refresh")
+            el().key("refresh")
                 .px(8.0)
                 .py(4.0)
                 .radius(4.0)
@@ -1476,7 +1510,9 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         .grow(1.0)
         .min_h(0.0)
         .w_full()
-        .scroll(ScrollSpec { stick_bottom: false });
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
     if app.active_tab == AppTab::Home {
         viewport = viewport.on_far_from_bottom(600.0, |app: &mut BiliGuga, far: bool| {
             if far && !app.home_loading && app.home_has_more {
@@ -1503,8 +1539,7 @@ fn render_login(app: &BiliGuga) -> El {
                     .color(theme::TEXT),
             )
             .child(
-                el()
-                    .px(12.0)
+                el().px(12.0)
                     .py(6.0)
                     .radius(6.0)
                     .cursor(rune::Cursor::Pointer)
@@ -1523,8 +1558,7 @@ fn render_login(app: &BiliGuga) -> El {
     }
     if let Some(qr) = &app.login_qr {
         panel = panel.child(
-            el()
-                .w(220.0)
+            el().w(220.0)
                 .h(220.0)
                 .radius(8.0)
                 .pixels_fit(qr.pixels(), SurfaceFit::Fit),
@@ -1537,8 +1571,7 @@ fn render_login(app: &BiliGuga) -> El {
                 .color(theme::TEXT_DIM),
         )
         .child(
-            el()
-                .px(12.0)
+            el().px(12.0)
                 .py(6.0)
                 .radius(6.0)
                 .cursor(rune::Cursor::Pointer)
@@ -1560,8 +1593,7 @@ fn progress_track(fraction: f32, height: f32) -> El {
         .radius(height / 2.0)
         .fill(theme::TRACK)
         .child(
-            el()
-                .h(height)
+            el().h(height)
                 .w_frac(fraction)
                 .radius(height / 2.0)
                 .fill(theme::ACCENT),
@@ -1634,7 +1666,12 @@ fn collection_marker(app: &BiliGuga) -> El {
             .map(|index| index + 1)
     });
     let label = match position {
-        Some(index) => format!("{} {}/{}", collection.title, index, collection.episodes.len()),
+        Some(index) => format!(
+            "{} {}/{}",
+            collection.title,
+            index,
+            collection.episodes.len()
+        ),
         None => collection.title.clone(),
     };
     text(label)
@@ -1646,8 +1683,7 @@ fn collection_marker(app: &BiliGuga) -> El {
 }
 
 fn control_button(label: &'static str, key: &'static str) -> El {
-    el()
-        .key(key)
+    el().key(key)
         .px(8.0)
         .py(4.0)
         .radius(4.0)
@@ -1708,8 +1744,7 @@ fn render_player(app: &BiliGuga) -> El {
     match app.player.presented() {
         Some(pixels) => {
             stage = stage.child(
-                el()
-                    .key("video-frame")
+                el().key("video-frame")
                     .w_full()
                     .h_full()
                     .pixels_fit(&pixels, SurfaceFit::Fit),
@@ -1725,13 +1760,13 @@ fn render_player(app: &BiliGuga) -> El {
                     "点击播放开始观看"
                 }
             });
-            stage = stage.child(
-                text(message).font(type_::BODY).color(if app.playback_error.is_some() {
+            stage = stage.child(text(message).font(type_::BODY).color(
+                if app.playback_error.is_some() {
                     theme::DANGER
                 } else {
                     theme::TEXT_FAINT
-                }),
-            );
+                },
+            ));
         }
     }
     // The controls, over the stage, while the pointer has been around recently.
@@ -1781,14 +1816,12 @@ fn render_player(app: &BiliGuga) -> El {
                     };
                 }),
         )
-        .child(
-            control_button("全屏", "fullscreen").on_press_tx(
-                |app: &mut BiliGuga, tx: &mut Tx| {
-                    app.player_fullscreen = !app.player_fullscreen;
-                    tx.toggle_full_screen();
-                },
-            ),
-        );
+        .child(control_button("全屏", "fullscreen").on_press_tx(
+            |app: &mut BiliGuga, tx: &mut Tx| {
+                app.player_fullscreen = !app.player_fullscreen;
+                tx.toggle_full_screen();
+            },
+        ));
 
     // Actions on their own row: eleven buttons in one line is wider than the player column at
     // the default window size, and the rightmost ones were cut off entirely.
@@ -1803,7 +1836,8 @@ fn render_player(app: &BiliGuga) -> El {
                 .on_press(|app: &mut BiliGuga| app.save_to_watch_later()),
         )
         .child(
-            control_button("收藏", "favorite").on_press(|app: &mut BiliGuga| app.save_to_favorites()),
+            control_button("收藏", "favorite")
+                .on_press(|app: &mut BiliGuga| app.save_to_favorites()),
         )
         .child(
             control_button("上集", "prev-episode")
@@ -1878,8 +1912,11 @@ fn render_player(app: &BiliGuga) -> El {
                             theme::TEXT_FAINT
                         }));
                     if !allowed {
-                        row_el = row_el
-                            .child(text("需要会员").font(type_::SECTION).color(theme::TEXT_FAINT));
+                        row_el = row_el.child(
+                            text("需要会员")
+                                .font(type_::SECTION)
+                                .color(theme::TEXT_FAINT),
+                        );
                     }
                     if selected {
                         row_el = row_el.fill(theme::ACTIVE_ROW);
@@ -1935,11 +1972,7 @@ fn render_detail(app: &BiliGuga, video: &Video) -> El {
                 // Two elements rather than one `format!`: this runs for every commit, and a
                 // label plus its value costs no allocation this way.
                 line = line
-                    .child(
-                        text(label)
-                            .font(type_::SECTION)
-                            .color(theme::TEXT_FAINT),
-                    )
+                    .child(text(label).font(type_::SECTION).color(theme::TEXT_FAINT))
                     .child(text(value).font(type_::SECTION).color(theme::TEXT_FAINT));
             }
         }
@@ -2006,7 +2039,9 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                 .key("comment-list")
                 .w_full()
                 .h(150.0)
-                .scroll(ScrollSpec { stick_bottom: false })
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
                 .children(app.comments.iter().map(|comment| {
                     // A loaded comment never changes, so `memo` keeps its subtree across
                     // commits: loading another page no longer re-builds and re-shapes every
@@ -2047,8 +2082,7 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
         );
         if app.comments_has_more {
             section = section.child(
-                el()
-                    .w_full()
+                el().w_full()
                     .py(4.0)
                     .items_center()
                     .cursor(rune::Cursor::Pointer)
@@ -2079,9 +2113,7 @@ fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     if app.player_fullscreen {
         return root.child(render_player(app));
     }
-    root = root
-        .child(render_sidebar(app))
-        .child(render_feed(app, cx));
+    root = root.child(render_sidebar(app)).child(render_feed(app, cx));
     root.child(render_player(app))
 }
 
@@ -2153,8 +2185,7 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
                 PlaybackState::Playing
             };
             changed = true;
-        } else if status.time_pos.is_finite()
-            && (status.time_pos - app.last_position).abs() >= 0.2
+        } else if status.time_pos.is_finite() && (status.time_pos - app.last_position).abs() >= 0.2
         {
             // The clock and the bar follow the playhead, not every frame of the video.
             app.last_position = status.time_pos;
@@ -2201,7 +2232,6 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     }
     changed
 }
-
 
 impl BiliGuga {
     /// Takes one answer from background work and folds it into the state.
@@ -2513,8 +2543,8 @@ impl BiliGuga {
     }
 }
 
-fn fetch_qr_code_event() -> impl std::future::Future<Output = Result<login::QrCodeData, String>> + Send
-{
+fn fetch_qr_code_event()
+-> impl std::future::Future<Output = Result<login::QrCodeData, String>> + Send {
     login::fetch_qr_code()
 }
 
@@ -2643,10 +2673,7 @@ impl BiliGuga {
     }
 
     fn like_current(&mut self) {
-        let (Some(cookie), Some(video)) = (
-            self.cookie(),
-            self.current_action_target(),
-        ) else {
+        let (Some(cookie), Some(video)) = (self.cookie(), self.current_action_target()) else {
             return;
         };
         if video.aid <= 0 {
@@ -2660,10 +2687,7 @@ impl BiliGuga {
     }
 
     fn coin_current(&mut self) {
-        let (Some(cookie), Some(video)) = (
-            self.cookie(),
-            self.current_action_target(),
-        ) else {
+        let (Some(cookie), Some(video)) = (self.cookie(), self.current_action_target()) else {
             return;
         };
         if video.aid <= 0 {
@@ -2677,10 +2701,7 @@ impl BiliGuga {
     }
 
     fn save_to_watch_later(&mut self) {
-        let (Some(cookie), Some(video)) = (
-            self.cookie(),
-            self.current_action_target(),
-        ) else {
+        let (Some(cookie), Some(video)) = (self.cookie(), self.current_action_target()) else {
             return;
         };
         if video.aid <= 0 {
@@ -2740,7 +2761,8 @@ mod tests {
     /// with a real file and checks pixels actually arrive.
     #[test]
     fn player_frames_reach_the_pixels_handle() {
-        let clip = std::env::var("BILIGUGA_TEST_CLIP").unwrap_or_else(|_| "/tmp/biliguga-test.mp4".into());
+        let clip =
+            std::env::var("BILIGUGA_TEST_CLIP").unwrap_or_else(|_| "/tmp/biliguga-test.mp4".into());
         if !std::path::Path::new(&clip).exists() {
             eprintln!("skipping: no clip at {clip}");
             return;
@@ -2757,7 +2779,10 @@ mod tests {
             })
             .expect("the player never published a frame buffer");
         let (width, height) = target.size();
-        assert!(width > 0 && height > 0, "the frame buffer is {width}x{height}");
+        assert!(
+            width > 0 && height > 0,
+            "the frame buffer is {width}x{height}"
+        );
 
         // A decoded frame must be non-blank: the test clip is colourful.
         let mut non_black = 0usize;
@@ -2765,7 +2790,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             player.poll_frame();
             let (now_width, now_height) = target.size();
-            assert_eq!((now_width, now_height), (width, height), "the size changed mid-check");
+            assert_eq!(
+                (now_width, now_height),
+                (width, height),
+                "the size changed mid-check"
+            );
             let status = player.status();
             if status.time_pos.is_finite() && status.time_pos > 0.2 {
                 non_black += 1;
@@ -2788,14 +2817,20 @@ mod tests {
             events: sender,
             waker: Arc::new(|| {}),
         });
-        assert!(!app.home_loading, "nothing is in flight before the first request");
+        assert!(
+            !app.home_loading,
+            "nothing is in flight before the first request"
+        );
         assert_eq!(app.home_page, 0);
         app.load_home_page(false);
         assert_eq!(app.home_page, 1, "page 1 is recorded when it is asked for");
         assert!(app.home_loading, "and it is in flight now");
         app.home_loading = false;
         app.load_home_page(false);
-        assert_eq!(app.home_page, 2, "the next request asks for page 2, not page 1 again");
+        assert_eq!(
+            app.home_page, 2,
+            "the next request asks for page 2, not page 1 again"
+        );
     }
 
     /// A cover is asked for once per bvid. Every page load used to re-request every cover that
@@ -2854,7 +2889,10 @@ mod tests {
         app.loading = false;
         let mut runtime = Runtime::new(app, view, (1360.0, 820.0), rune::Env::new(true, 1.0));
         runtime.frame(0.0);
-        assert!(runtime.presented("home-grid").is_some(), "the grid did not mount");
+        assert!(
+            runtime.presented("home-grid").is_some(),
+            "the grid did not mount"
+        );
     }
 }
 
@@ -2883,8 +2921,11 @@ mod live_tests {
         .expect("page 2 failed");
         assert!(!second.videos.is_empty(), "page 2 came back empty");
         // Pages must differ, otherwise the feed would loop on the same rows forever.
-        let first_ids: std::collections::HashSet<_> =
-            first.videos.iter().map(|video| video.bvid.clone()).collect();
+        let first_ids: std::collections::HashSet<_> = first
+            .videos
+            .iter()
+            .map(|video| video.bvid.clone())
+            .collect();
         assert!(
             second
                 .videos
@@ -2907,10 +2948,9 @@ mod live_tests {
         let video = page.videos.first().expect("no videos").clone();
         let cover = queue_cover_download(video.cover.clone(), Arc::new(AtomicBool::new(false)))
             .expect("cover worker refused");
-        let image = futures::executor::block_on(network::run(async move {
-            cover.await.ok().flatten()
-        }))
-        .expect("the cover never decoded");
+        let image =
+            futures::executor::block_on(network::run(async move { cover.await.ok().flatten() }))
+                .expect("the cover never decoded");
         assert_eq!((image.width, image.height), (160, 90));
         assert_eq!(image.pixels.len(), 160 * 90 * 4);
         assert!(
@@ -2950,9 +2990,10 @@ mod perf_tests {
         for url in &urls {
             let cover = queue_cover_download(url.clone(), Arc::new(AtomicBool::new(false)))
                 .expect("cover worker refused");
-            let image = futures::executor::block_on(network::run(async move {
-                cover.await.ok().flatten()
-            }));
+            let image =
+                futures::executor::block_on(network::run(
+                    async move { cover.await.ok().flatten() },
+                ));
             assert!(image.is_some(), "a cover failed to decode: {url}");
         }
         eprintln!("{} covers in {:?}", urls.len(), started.elapsed());

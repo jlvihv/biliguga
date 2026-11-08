@@ -194,14 +194,12 @@ pub(crate) fn format_publish_date(timestamp: i64) -> String {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
     let day_of_era = z - era * 146_097;
-    let year_of_era = (day_of_era
-        - day_of_era.div_euclid(1_460)
-        + day_of_era.div_euclid(36_524)
+    let year_of_era = (day_of_era - day_of_era.div_euclid(1_460) + day_of_era.div_euclid(36_524)
         - day_of_era.div_euclid(146_096))
     .div_euclid(365);
     let year = year_of_era + era * 400;
-    let day_of_year = day_of_era
-        - (365 * year_of_era + year_of_era.div_euclid(4) - year_of_era.div_euclid(100));
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era.div_euclid(4) - year_of_era.div_euclid(100));
     let month_part = (5 * day_of_year + 2).div_euclid(153);
     let day = day_of_year - (153 * month_part + 2).div_euclid(5) + 1;
     let month = month_part + if month_part < 10 { 3 } else { -9 };
@@ -355,12 +353,9 @@ fn cover_workers() -> Option<&'static CoverWorkers> {
                             // The shared client keeps its connection pool warm across covers,
                             // so a feed of twenty thumbnails reuses one TLS session per CDN
                             // host instead of shaking hands twenty times.
-                            let image = download_cover_async(
-                                client(),
-                                &request.url,
-                                &request.cancelled,
-                            )
-                            .await;
+                            let image =
+                                download_cover_async(client(), &request.url, &request.cancelled)
+                                    .await;
                             (request.reply, image)
                         })
                         .buffer_unordered(COVER_REQUESTS_PER_WORKER);
@@ -1293,7 +1288,10 @@ fn api_error(response: &Value, operation: &str) -> String {
     if code == -403 {
         invalidate_wbi_keys();
     }
-    format!("{operation}接口返回错误 {code}：{}", text(response.get("message")))
+    format!(
+        "{operation}接口返回错误 {code}：{}",
+        text(response.get("message"))
+    )
 }
 
 fn csrf_from_cookie(cookie: &str) -> Option<String> {
@@ -1878,7 +1876,10 @@ mod tests {
         .expect("dash play url should parse");
 
         assert_eq!(result.url, "https://cdn.example/video_1080p.m4s");
-        assert_eq!(result.audio_url.as_deref(), Some("https://cdn.example/audio.m4s"));
+        assert_eq!(
+            result.audio_url.as_deref(),
+            Some("https://cdn.example/audio.m4s")
+        );
         assert_eq!(result.actual_quality, 80);
         assert_eq!(result.qualities.len(), 4);
         assert_eq!(result.qualities[0].qn, 80);
@@ -2128,7 +2129,9 @@ fn parse_play_url(
             if let Some((id, _, url)) = candidates.iter().find(|(id, _, _)| *id == requested_qn) {
                 video_url = url.clone();
                 actual_quality = *id;
-            } else if let Some((id, _, url)) = candidates.iter().max_by_key(|(id, bw, _)| (*id, *bw)) {
+            } else if let Some((id, _, url)) =
+                candidates.iter().max_by_key(|(id, bw, _)| (*id, *bw))
+            {
                 video_url = url.clone();
                 actual_quality = *id;
             }
@@ -2173,9 +2176,13 @@ fn parse_play_url(
     }
 
     if video_url.is_empty()
-        && let Some(durl) = data.get("durl").and_then(Value::as_array).and_then(|arr| arr.first()) {
-            video_url = text(durl.get("url"));
-        }
+        && let Some(durl) = data
+            .get("durl")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+    {
+        video_url = text(durl.get("url"));
+    }
 
     if video_url.is_empty() {
         return None;
@@ -2220,18 +2227,19 @@ fn parse_play_url(
     }
 
     if let Some(dash) = data.get("dash")
-        && let Some(videos) = dash.get("video").and_then(Value::as_array) {
-            for v in videos {
-                let qn = number(v.get("id")).max(0) as u32;
-                if qn > 0 && !qualities.iter().any(|q| q.qn == qn) {
-                    qualities.push(PlayQuality {
-                        qn,
-                        label: quality_label(qn),
-                        switchable: true,
-                    });
-                }
+        && let Some(videos) = dash.get("video").and_then(Value::as_array)
+    {
+        for v in videos {
+            let qn = number(v.get("id")).max(0) as u32;
+            if qn > 0 && !qualities.iter().any(|q| q.qn == qn) {
+                qualities.push(PlayQuality {
+                    qn,
+                    label: quality_label(qn),
+                    switchable: true,
+                });
             }
         }
+    }
 
     qualities.sort_by_key(|quality| std::cmp::Reverse(quality.qn));
 

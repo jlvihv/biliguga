@@ -280,9 +280,10 @@ pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
 
 pub(crate) fn load_session() -> Option<UserSession> {
     if let Ok(content) = fs::read_to_string(session_path())
-        && let Some(session) = parse_session(&content) {
-            return Some(session);
-        }
+        && let Some(session) = parse_session(&content)
+    {
+        return Some(session);
+    }
 
     let legacy_path = legacy_session_path();
     let session = parse_session(&fs::read_to_string(&legacy_path).ok()?)?;

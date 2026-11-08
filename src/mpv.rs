@@ -113,7 +113,10 @@ enum PlayerCommand {
     SetPause(bool),
     SetVolume(f64),
     SetSpeed(f64),
-    SetRenderViewport { width: usize, height: usize },
+    SetRenderViewport {
+        width: usize,
+        height: usize,
+    },
     SeekPercent(f64),
     SeekSeconds(f64),
     SeekRelative(f64),
@@ -203,13 +206,7 @@ impl MpvPlayer {
         };
         let Ok(handle) = thread::Builder::new()
             .name("biliguga-libmpv".into())
-            .spawn(move || {
-                run_mpv(
-                    parts.command_rx,
-                    parts.status_tx,
-                    parts.target_tx,
-                )
-            })
+            .spawn(move || run_mpv(parts.command_rx, parts.status_tx, parts.target_tx))
         else {
             return;
         };
@@ -371,7 +368,12 @@ fn run_mpv(
             },
         };
         match command {
-            PlayerCommand::Load { url, audio_url, volume, speed } => {
+            PlayerCommand::Load {
+                url,
+                audio_url,
+                volume,
+                speed,
+            } => {
                 match run_mpv_session(
                     url,
                     audio_url,
@@ -509,12 +511,8 @@ fn run_mpv_session(
                     }
                     PlayerCommand::SetRenderViewport { width, height } => {
                         viewport_size = Some((width, height));
-                        let (width, height) = render_size_for_viewport(
-                            source_width,
-                            source_height,
-                            width,
-                            height,
-                        );
+                        let (width, height) =
+                            render_size_for_viewport(source_width, source_height, width, height);
                         if width != render_width || height != render_height {
                             render_width = width;
                             render_height = height;
@@ -547,33 +545,34 @@ fn run_mpv_session(
                 && let (Some(source_width_value), Some(source_height_value)) = (
                     get_int64_property(handle, "video-out-params/w"),
                     get_int64_property(handle, "video-out-params/h"),
-                ) {
-                    source_width = source_width_value.max(1) as usize;
-                    source_height = source_height_value.max(1) as usize;
-                    let (width, height) = viewport_size
-                        .map(|(viewport_width, viewport_height)| {
-                            render_size_for_viewport(
-                                source_width,
-                                source_height,
-                                viewport_width,
-                                viewport_height,
-                            )
-                        })
-                        .unwrap_or((source_width, source_height));
-                    if width != render_width || height != render_height {
-                        render_width = width;
-                        render_height = height;
-                        buffer_len = render_width * render_height * 4;
-                        render_buffer = vec![0_u8; buffer_len];
-                        size = [render_width as c_int, render_height as c_int];
-                        stride = render_width * 4;
-                        target = FramePixels::new();
-                        published = false;
-                    }
-                    debug_log(&format!(
-                        "source={source_width}x{source_height} render-target={render_width}x{render_height}"
-                    ));
+                )
+            {
+                source_width = source_width_value.max(1) as usize;
+                source_height = source_height_value.max(1) as usize;
+                let (width, height) = viewport_size
+                    .map(|(viewport_width, viewport_height)| {
+                        render_size_for_viewport(
+                            source_width,
+                            source_height,
+                            viewport_width,
+                            viewport_height,
+                        )
+                    })
+                    .unwrap_or((source_width, source_height));
+                if width != render_width || height != render_height {
+                    render_width = width;
+                    render_height = height;
+                    buffer_len = render_width * render_height * 4;
+                    render_buffer = vec![0_u8; buffer_len];
+                    size = [render_width as c_int, render_height as c_int];
+                    stride = render_width * 4;
+                    target = FramePixels::new();
+                    published = false;
                 }
+                debug_log(&format!(
+                    "source={source_width}x{source_height} render-target={render_width}x{render_height}"
+                ));
+            }
             if file_loaded && let Some(audio_url) = pending_audio_url.take() {
                 let _ = run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]);
             }
@@ -816,13 +815,20 @@ mod tests {
             set_option(handle, "hwdec", "auto-safe");
             set_option(handle, "cache", "yes");
             set_option(handle, "user-agent", "Mozilla/5.0");
-            set_option(handle, "http-header-fields", "Referer: https://www.bilibili.com/");
+            set_option(
+                handle,
+                "http-header-fields",
+                "Referer: https://www.bilibili.com/",
+            );
             let ret_init = mpv_initialize(handle);
             eprintln!("ret_init = {ret_init}");
             assert!(ret_init >= 0);
 
             // Audio is configured separately; loadfile only receives the video URL.
-            let ret_load = run_mpv_cmd(handle, &["loadfile", "https://example.com/video.mp4", "replace"]);
+            let ret_load = run_mpv_cmd(
+                handle,
+                &["loadfile", "https://example.com/video.mp4", "replace"],
+            );
             eprintln!("ret_load = {ret_load}");
             assert!(ret_load);
 
@@ -832,14 +838,8 @@ mod tests {
 
     #[test]
     fn render_target_follows_player_viewport() {
-        assert_eq!(
-            render_size_for_viewport(3840, 2160, 1280, 720),
-            (1280, 720)
-        );
-        assert_eq!(
-            render_size_for_viewport(1080, 1920, 540, 960),
-            (540, 960)
-        );
+        assert_eq!(render_size_for_viewport(3840, 2160, 1280, 720), (1280, 720));
+        assert_eq!(render_size_for_viewport(1080, 1920, 540, 960), (540, 960));
         assert_eq!(
             render_size_for_viewport(1920, 1080, 3840, 2160),
             (1920, 1080)
@@ -849,17 +849,21 @@ mod tests {
     #[test]
     #[ignore = "requires live Bilibili DASH URLs in environment"]
     fn test_mpv_external_audio_live() {
-        let video_url = std::env::var("BILIGUGA_LIVE_VIDEO_URL")
-            .expect("BILIGUGA_LIVE_VIDEO_URL is required");
-        let audio_url = std::env::var("BILIGUGA_LIVE_AUDIO_URL")
-            .expect("BILIGUGA_LIVE_AUDIO_URL is required");
+        let video_url =
+            std::env::var("BILIGUGA_LIVE_VIDEO_URL").expect("BILIGUGA_LIVE_VIDEO_URL is required");
+        let audio_url =
+            std::env::var("BILIGUGA_LIVE_AUDIO_URL").expect("BILIGUGA_LIVE_AUDIO_URL is required");
 
         unsafe {
             let handle = mpv_create();
             assert!(!handle.is_null());
             set_option(handle, "vo", "null");
             set_option(handle, "user-agent", "Mozilla/5.0");
-            set_option(handle, "http-header-fields", "Referer: https://www.bilibili.com/");
+            set_option(
+                handle,
+                "http-header-fields",
+                "Referer: https://www.bilibili.com/",
+            );
             assert_eq!(mpv_initialize(handle), 0);
             assert!(run_mpv_cmd(handle, &["loadfile", &video_url, "replace"]));
 
@@ -873,10 +877,11 @@ mod tests {
                     assert!(run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]));
                 }
                 if let Some(value) = get_string_property(handle, "audio-codec")
-                    && !value.is_empty() {
-                        codec = Some(value);
-                        break;
-                    }
+                    && !value.is_empty()
+                {
+                    codec = Some(value);
+                    break;
+                }
             }
             eprintln!("live audio codec = {codec:?}");
             assert!(codec.is_some(), "libmpv did not create an audio track");
