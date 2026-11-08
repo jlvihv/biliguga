@@ -131,13 +131,12 @@ pub struct MpvPlayer {
     worker_parts: Mutex<Option<WorkerParts>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     statuses: Receiver<MpvStatus>,
-    /// Text for the UI's status line ("正在缓冲", a decode error), cleared once read.
-    messages: Receiver<Option<String>>,
     /// Each fresh render size's buffer, sent once so the view can draw it. The worker keeps
     /// writing into the one it last sent.
     frame_targets: Receiver<FramePixels>,
     presented: Option<FramePixels>,
-    current_frame_size: Option<(usize, usize)>,
+    /// The source video's own pixel size, for the stage's aspect ratio. Not the render
+    /// target's: that one is the letterboxed decode size the viewport asked for.
     current_source_size: Option<(usize, usize)>,
     current_status: MpvStatus,
 }
@@ -145,7 +144,6 @@ pub struct MpvPlayer {
 struct WorkerParts {
     command_rx: Receiver<PlayerCommand>,
     status_tx: SyncSender<MpvStatus>,
-    message_tx: SyncSender<Option<String>>,
     target_tx: SyncSender<FramePixels>,
 }
 
@@ -153,22 +151,18 @@ impl MpvPlayer {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::sync_channel(2);
-        let (message_tx, message_rx) = mpsc::sync_channel(4);
         let (target_tx, target_rx) = mpsc::sync_channel(2);
         Self {
             commands: command_tx,
             worker_parts: Mutex::new(Some(WorkerParts {
                 command_rx,
                 status_tx,
-                message_tx,
                 target_tx,
             })),
             worker: Mutex::new(None),
             statuses: status_rx,
-            messages: message_rx,
             frame_targets: target_rx,
             presented: None,
-            current_frame_size: None,
             current_source_size: None,
             current_status: MpvStatus::default(),
         }
@@ -195,7 +189,6 @@ impl MpvPlayer {
                 run_mpv(
                     parts.command_rx,
                     parts.status_tx,
-                    parts.message_tx,
                     parts.target_tx,
                 )
             })
@@ -229,7 +222,6 @@ impl MpvPlayer {
         }
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
-        self.current_frame_size = None;
         self.current_source_size = None;
         self.presented = None;
     }
@@ -297,21 +289,10 @@ impl MpvPlayer {
     }
 
     /// The player's own message for the UI, if one arrived (a decode error, a stalled stream).
-    pub fn take_message(&self) -> Option<String> {
-        match self.messages.try_recv() {
-            Ok(message) => message,
-            Err(_) => None,
-        }
-    }
-
     /// The buffer the latest frame landed in, for the view to draw. `None` until the worker
     /// has made one, which happens on the first frame of a new size.
     pub fn presented(&self) -> Option<FramePixels> {
         self.presented.clone()
-    }
-
-    pub fn frame_size(&self) -> Option<(usize, usize)> {
-        self.current_frame_size
     }
 
     pub fn source_size(&self) -> Option<(usize, usize)> {
@@ -344,7 +325,6 @@ impl Drop for MpvPlayer {
 fn run_mpv(
     command_rx: Receiver<PlayerCommand>,
     status_tx: SyncSender<MpvStatus>,
-    message_tx: SyncSender<Option<String>>,
     target_tx: SyncSender<FramePixels>,
 ) {
     let mut next_load = None;
@@ -365,7 +345,6 @@ fn run_mpv(
                     speed,
                     &command_rx,
                     &status_tx,
-                    &message_tx,
                     &target_tx,
                 ) {
                     SessionExit::Idle => {}
@@ -401,7 +380,6 @@ fn run_mpv_session(
     speed: f64,
     command_rx: &Receiver<PlayerCommand>,
     status_tx: &SyncSender<MpvStatus>,
-    _message_tx: &SyncSender<Option<String>>,
     target_tx: &SyncSender<FramePixels>,
 ) -> SessionExit {
     unsafe {
@@ -531,8 +509,8 @@ fn run_mpv_session(
                 (*(event as *const MpvEvent)).event_id
             };
             let file_loaded = event_id == MPV_EVENT_FILE_LOADED;
-            if file_loaded || event_id == MPV_EVENT_VIDEO_RECONFIG {
-                if let (Some(source_width_value), Some(source_height_value)) = (
+            if (file_loaded || event_id == MPV_EVENT_VIDEO_RECONFIG)
+                && let (Some(source_width_value), Some(source_height_value)) = (
                     get_int64_property(handle, "video-out-params/w"),
                     get_int64_property(handle, "video-out-params/h"),
                 ) {
@@ -565,7 +543,6 @@ fn run_mpv_session(
                         );
                     }
                 }
-            }
             if file_loaded && let Some(audio_url) = pending_audio_url.take() {
                 let _ = run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]);
             }
@@ -869,12 +846,11 @@ mod tests {
                 {
                     assert!(run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]));
                 }
-                if let Some(value) = get_string_property(handle, "audio-codec") {
-                    if !value.is_empty() {
+                if let Some(value) = get_string_property(handle, "audio-codec")
+                    && !value.is_empty() {
                         codec = Some(value);
                         break;
                     }
-                }
             }
             eprintln!("live audio codec = {codec:?}");
             assert!(codec.is_some(), "libmpv did not create an audio track");

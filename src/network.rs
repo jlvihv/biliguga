@@ -1,3 +1,4 @@
+#[cfg(test)]
 use futures::channel::oneshot;
 use std::{future::Future, sync::OnceLock};
 use tokio::runtime::{Builder, Runtime};
@@ -23,6 +24,9 @@ where
     runtime().spawn(future);
 }
 
+/// Runs `future` on the network runtime and waits for it. Tests only: the window never blocks
+/// on the network, it gets an `Event` instead.
+#[cfg(test)]
 pub(crate) async fn run<F, T>(future: F) -> T
 where
     F: Future<Output = T> + Send + 'static,

@@ -1,11 +1,18 @@
+use std::sync::Arc;
+
 /// A decoded image as straight-alpha sRGB pixels, rows top first, four bytes each in RGBA
 /// order: what `rune::ImageCache::rgba` and `rune::Pixels::set` both take. Keeping it free of
 /// any UI type is what lets the network and player layers stay framework-agnostic.
+///
+/// The pixels are shared, not owned: a cover used to be copied twice on its way to the
+/// renderer (once out of the video row, once into the image cache), and a 160x90 thumbnail is
+/// 57 KB, so the copies were pure waste. `Arc<[u8]>` also lets `ImageCache::rgba` take the
+/// buffer without cloning it.
 #[derive(Clone, Debug)]
 pub(crate) struct Rgba8 {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) pixels: Vec<u8>,
+    pub(crate) pixels: Arc<[u8]>,
 }
 
 impl Rgba8 {
@@ -14,10 +21,9 @@ impl Rgba8 {
         Self {
             width,
             height,
-            pixels,
+            pixels: pixels.into(),
         }
     }
-
 }
 
 #[derive(Clone, Debug)]

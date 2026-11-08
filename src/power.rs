@@ -4,21 +4,13 @@ use std::process::{Child, Command, Stdio};
 ///
 /// The inhibitor is scoped to the player and is released when playback pauses,
 /// ends, or the application exits.
+#[derive(Default)]
 pub struct PowerInhibitor {
     active: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     child: Option<Child>,
 }
 
-impl Default for PowerInhibitor {
-    fn default() -> Self {
-        Self {
-            active: false,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            child: None,
-        }
-    }
-}
 
 impl PowerInhibitor {
     pub fn set_active(&mut self, active: bool) {

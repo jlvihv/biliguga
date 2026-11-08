@@ -2292,11 +2292,10 @@ fn parse_play_url(
         }
     }
 
-    if video_url.is_empty() {
-        if let Some(durl) = data.get("durl").and_then(Value::as_array).and_then(|arr| arr.first()) {
+    if video_url.is_empty()
+        && let Some(durl) = data.get("durl").and_then(Value::as_array).and_then(|arr| arr.first()) {
             video_url = text(durl.get("url"));
         }
-    }
 
     if video_url.is_empty() {
         return None;
@@ -2340,8 +2339,8 @@ fn parse_play_url(
         }
     }
 
-    if let Some(dash) = data.get("dash") {
-        if let Some(videos) = dash.get("video").and_then(Value::as_array) {
+    if let Some(dash) = data.get("dash")
+        && let Some(videos) = dash.get("video").and_then(Value::as_array) {
             for v in videos {
                 let qn = number(v.get("id")).max(0) as u32;
                 if qn > 0 && !qualities.iter().any(|q| q.qn == qn) {
@@ -2353,9 +2352,8 @@ fn parse_play_url(
                 }
             }
         }
-    }
 
-    qualities.sort_by(|a, b| b.qn.cmp(&a.qn));
+    qualities.sort_by_key(|quality| std::cmp::Reverse(quality.qn));
 
     if qualities.is_empty() && actual_quality > 0 {
         qualities.push(PlayQuality {
