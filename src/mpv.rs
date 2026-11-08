@@ -84,6 +84,21 @@ const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 const DEFAULT_FRAME_WIDTH: usize = 1920;
 const DEFAULT_FRAME_HEIGHT: usize = 1080;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// How long the UI thread waits for the player to acknowledge a stop. Short: it is a courtesy
+/// check, not a guarantee, and the window must not freeze on a stuck decoder.
+const STOP_ACK_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Opt-in diagnostics: set `BILIGUGA_MPV_DEBUG=1` to see what the decode loop is doing.
+fn debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BILIGUGA_MPV_DEBUG").is_some())
+}
+
+fn debug_log(message: &str) {
+    if debug_enabled() {
+        eprintln!("[biliguga-mpv] {message}");
+    }
+}
 
 enum PlayerCommand {
     Load {
@@ -138,6 +153,8 @@ pub struct MpvPlayer {
     /// The source video's own pixel size, for the stage's aspect ratio. Not the render
     /// target's: that one is the letterboxed decode size the viewport asked for.
     current_source_size: Option<(usize, usize)>,
+    /// The viewport the worker is already decoding for, so a still window sends nothing.
+    viewport_sent: Option<(usize, usize)>,
     current_status: MpvStatus,
 }
 
@@ -164,6 +181,7 @@ impl MpvPlayer {
             frame_targets: target_rx,
             presented: None,
             current_source_size: None,
+            viewport_sent: None,
             current_status: MpvStatus::default(),
         }
     }
@@ -205,70 +223,84 @@ impl MpvPlayer {
             .unwrap_or(false)
     }
 
-    pub fn load(&self, url: String, audio_url: Option<String>, volume: f64, speed: f64) {
-        self.start_worker();
-        let _ = self
-            .commands
-            .send(PlayerCommand::Load { url, audio_url, volume, speed });
+    /// Hands `command` to the worker, if there is one.
+    ///
+    /// Every mutator used to take the worker mutex for `worker_started` and then send anyway,
+    /// ignoring a failure, which is both a lock the UI thread does not need and a check that
+    /// cannot prevent anything: the channel already reports a dead worker, and a command sent
+    /// while nothing is loaded is a no-op in the session loop. This sends and forgets, and the
+    /// session loop is what decides whether a command means anything yet.
+    fn send(&self, command: PlayerCommand) {
+        let _ = self.commands.send(command);
     }
 
+    pub fn load(&self, url: String, audio_url: Option<String>, volume: f64, speed: f64) {
+        self.start_worker();
+        self.send(PlayerCommand::Load {
+            url,
+            audio_url,
+            volume,
+            speed,
+        });
+    }
+
+    /// Tears the current stream down and waits briefly for the worker to acknowledge.
+    ///
+    /// The wait is short on purpose: this runs on the UI thread when the viewer changes video,
+    /// and a stalled decode must not freeze the window. The worker answers as soon as it leaves
+    /// its decode loop; if it does not answer in time the frames it still sends are dropped by
+    /// the session boundary anyway, because the next `Load` replaces the session.
     pub fn stop_playback(&mut self) {
         if self.worker_started() {
             let (done_tx, done_rx) = mpsc::sync_channel(0);
-            let _ = self
-                .commands
-                .send(PlayerCommand::StopPlayback { done: done_tx });
-            let _ = done_rx.recv_timeout(Duration::from_millis(500));
+            self.send(PlayerCommand::StopPlayback { done: done_tx });
+            if done_rx.recv_timeout(STOP_ACK_TIMEOUT).is_err() {
+                debug_log("stop_playback: the worker did not acknowledge in time");
+            }
         }
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
         self.current_source_size = None;
+        self.viewport_sent = None;
         self.presented = None;
     }
 
     pub fn set_pause(&self, paused: bool) {
-        if self.worker_started() {
-            let _ = self.commands.send(PlayerCommand::SetPause(paused));
-        }
+        self.send(PlayerCommand::SetPause(paused));
     }
 
     pub fn set_volume(&self, volume: f64) {
-        if self.worker_started() {
-            let _ = self.commands.send(PlayerCommand::SetVolume(volume));
-        }
+        self.send(PlayerCommand::SetVolume(volume));
     }
 
     pub fn set_speed(&self, speed: f64) {
-        if self.worker_started() {
-            let _ = self.commands.send(PlayerCommand::SetSpeed(speed));
-        }
+        self.send(PlayerCommand::SetSpeed(speed));
     }
 
-    pub fn set_render_viewport(&self, width: usize, height: usize) {
-        if width > 0 && height > 0 {
-            let _ = self
-                .commands
-                .send(PlayerCommand::SetRenderViewport { width, height });
+    /// Tells the worker to decode for a viewport of this size.
+    ///
+    /// Repeating the size already in force is dropped here rather than in the caller: a view
+    /// that publishes its measurement every frame would otherwise send a command every frame,
+    /// and each one makes the session reallocate its frame buffer.
+    pub fn set_render_viewport(&mut self, width: usize, height: usize) {
+        if width == 0 || height == 0 || self.viewport_sent == Some((width, height)) {
+            return;
         }
+        self.viewport_sent = Some((width, height));
+        self.send(PlayerCommand::SetRenderViewport { width, height });
     }
 
     pub fn seek_percent(&self, percent: f64) {
-        if self.worker_started() {
-            let _ = self.commands.send(PlayerCommand::SeekPercent(percent));
-        }
+        self.send(PlayerCommand::SeekPercent(percent));
     }
 
     pub fn seek_seconds(&self, seconds: f64) {
-        if self.worker_started() {
-            let _ = self
-                .commands
-                .send(PlayerCommand::SeekSeconds(seconds.max(0.)));
-        }
+        self.send(PlayerCommand::SeekSeconds(seconds.max(0.)));
     }
 
     pub fn seek_relative(&self, seconds: f64) {
-        if self.worker_started() && seconds.is_finite() && seconds != 0. {
-            let _ = self.commands.send(PlayerCommand::SeekRelative(seconds));
+        if seconds.is_finite() && seconds != 0. {
+            self.send(PlayerCommand::SeekRelative(seconds));
         }
     }
 
@@ -288,7 +320,6 @@ impl MpvPlayer {
         changed
     }
 
-    /// The player's own message for the UI, if one arrived (a decode error, a stalled stream).
     /// The buffer the latest frame landed in, for the view to draw. `None` until the worker
     /// has made one, which happens on the first frame of a new size.
     pub fn presented(&self) -> Option<FramePixels> {
@@ -536,12 +567,9 @@ fn run_mpv_session(
                         target = FramePixels::new();
                         published = false;
                     }
-                    if std::env::var_os("BILIGUGA_MPV_DEBUG").is_some() {
-                        eprintln!(
-                            "[biliguga-mpv] source={}x{} render-target={}x{}",
-                            source_width, source_height, render_width, render_height
-                        );
-                    }
+                    debug_log(&format!(
+                        "source={source_width}x{source_height} render-target={render_width}x{render_height}"
+                    ));
                 }
             if file_loaded && let Some(audio_url) = pending_audio_url.take() {
                 let _ = run_mpv_cmd(handle, &["audio-add", &audio_url, "select"]);
@@ -574,14 +602,9 @@ fn run_mpv_session(
                     if !logged_hwdec {
                         let hwdec = get_string_property(handle, "hwdec-current")
                             .unwrap_or_else(|| "<unavailable>".into());
-                        if std::env::var_os("BILIGUGA_MEM_DEBUG").is_some()
-                            || std::env::var_os("BILIGUGA_MPV_DEBUG").is_some()
-                        {
-                            eprintln!(
-                                "[biliguga-mpv] hwdec-current={:?} render-path=software-buffer",
-                                hwdec
-                            );
-                        }
+                        debug_log(&format!(
+                            "hwdec-current={hwdec:?} render-path=software-buffer"
+                        ));
                         logged_hwdec = true;
                     }
                     // `rgb0` leaves its fourth byte unused: fill it so the frame is opaque

@@ -164,6 +164,19 @@ enum AppTab {
     Login,
 }
 
+impl AppTab {
+    /// The signed-in feed this tab shows, if it shows one.
+    fn signed_in(self) -> Option<SignedInFeed> {
+        match self {
+            AppTab::Dynamic => Some(SignedInFeed::Dynamic),
+            AppTab::History => Some(SignedInFeed::History),
+            AppTab::WatchLater => Some(SignedInFeed::WatchLater),
+            AppTab::Favorites => Some(SignedInFeed::Favorites),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlaybackState {
     Idle,
@@ -174,6 +187,56 @@ enum PlaybackState {
 
 /// Which popup the player has open. Only one kind exists: speed cycles in place and the
 /// collection is reached with previous/next, so neither ever needed a menu.
+/// The feeds that need a session. Each one used to own a `load_..` method, a `.._loading` flag
+/// and an `Event` arm holding the same three lines; the enum is the one place they differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignedInFeed {
+    Dynamic,
+    History,
+    WatchLater,
+    Favorites,
+}
+
+impl SignedInFeed {
+    fn videos_mut(self, app: &mut BiliGuga) -> &mut Vec<Video> {
+        match self {
+            SignedInFeed::Dynamic => &mut app.dynamic_videos,
+            SignedInFeed::History => &mut app.history,
+            SignedInFeed::WatchLater => &mut app.watch_later,
+            SignedInFeed::Favorites => &mut app.favorites,
+        }
+    }
+
+    fn loading(self, app: &BiliGuga) -> bool {
+        match self {
+            SignedInFeed::Dynamic => app.dynamic_loading,
+            SignedInFeed::History => app.history_loading,
+            SignedInFeed::WatchLater => app.watch_later_loading,
+            SignedInFeed::Favorites => app.favorites_loading,
+        }
+    }
+
+    fn set_loading(self, app: &mut BiliGuga, value: bool) {
+        match self {
+            SignedInFeed::Dynamic => app.dynamic_loading = value,
+            SignedInFeed::History => app.history_loading = value,
+            SignedInFeed::WatchLater => app.watch_later_loading = value,
+            SignedInFeed::Favorites => app.favorites_loading = value,
+        }
+    }
+
+    /// The event that lands this feed's answer. `Event` has no payload for the feed itself, so
+    /// the arm is picked here rather than at the call site.
+    fn event(self) -> impl FnOnce(Result<Vec<Video>, String>) -> Event + Copy + 'static {
+        match self {
+            SignedInFeed::Dynamic => Event::Dynamic,
+            SignedInFeed::History => Event::History,
+            SignedInFeed::WatchLater => Event::WatchLater,
+            SignedInFeed::Favorites => Event::Favorites,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayerMenu {
     Quality,
@@ -287,11 +350,12 @@ pub(crate) struct BiliGuga {
     controls_until: Option<Instant>,
     player_fullscreen: bool,
     playing_video: Option<Video>,
-    /// The stage size the view last drew at. `view` gets `&self`, so it publishes here and
-    /// `poll` — which owns the command channel to mpv — is what acts on it.
+    /// The stage size the view last drew at.
+    ///
+    /// `view` gets `&self`, so it publishes the measurement here and `poll` — which owns the
+    /// command channel to mpv — is what acts on it. mpv remembers the size it is already
+    /// decoding for, so nothing has to mirror it here.
     stage_size: std::cell::Cell<Option<(usize, usize)>>,
-    /// The stage size mpv was last told to decode for, so a resize asks exactly once.
-    player_viewport_size: Option<(usize, usize)>,
     detail_view_count: String,
     detail_danmaku_count: String,
     detail_like_count: String,
@@ -305,7 +369,6 @@ pub(crate) struct BiliGuga {
     history_report_in_flight: bool,
     // Comments.
     comments: Vec<Comment>,
-    comments_for: String,
     comments_page: u32,
     comments_total: i64,
     comments_has_more: bool,
@@ -396,7 +459,6 @@ impl BiliGuga {
             player_fullscreen: false,
             playing_video: None,
             stage_size: std::cell::Cell::new(None),
-            player_viewport_size: None,
             detail_view_count: "—".into(),
             detail_danmaku_count: "—".into(),
             detail_like_count: "—".into(),
@@ -409,7 +471,6 @@ impl BiliGuga {
             history_report_at: Instant::now(),
             history_report_in_flight: false,
             comments: Vec::new(),
-            comments_for: String::new(),
             comments_page: 0,
             comments_total: 0,
             comments_has_more: false,
@@ -437,6 +498,14 @@ impl BiliGuga {
 impl BiliGuga {
     fn worker(&self) -> &Worker {
         self.worker.as_ref().expect("worker is installed in setup")
+    }
+
+    /// The session cookie for a request that can run logged out.
+    ///
+    /// Seventeen call sites wrote `as_ref().map(|s| s.cookie.clone())` by hand; one accessor
+    /// says the same thing and cannot drift.
+    fn cookie(&self) -> Option<String> {
+        self.session.as_ref().map(|session| session.cookie.clone())
     }
 
     fn current_videos(&self) -> &Vec<Video> {
@@ -482,7 +551,7 @@ impl BiliGuga {
         // would otherwise ask for the same page again, and the feed would never advance.
         self.home_page = page;
         let generation = self.home_generation;
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let cookie = self.cookie();
         self.home_loading = true;
         self.worker().spawn(
             async move { fetch_recommendations(page, cookie.as_deref()).await },
@@ -505,46 +574,39 @@ impl BiliGuga {
         );
     }
 
-    fn load_dynamic(&mut self) {
-        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
-            self.dynamic_videos.clear();
-            return;
-        };
-        self.dynamic_loading = true;
-        self.worker()
-            .spawn(async move { fetch_dynamic_feed(&cookie).await }, Event::Dynamic);
+    /// Folds a signed-in feed's answer into the state. A failure leaves whatever was shown.
+    fn land_signed_in(&mut self, feed: SignedInFeed, result: Result<Vec<Video>, String>) {
+        feed.set_loading(self, false);
+        if let Ok(videos) = result {
+            *feed.videos_mut(self) = videos;
+            self.new_rows = true;
+        }
     }
 
-    fn load_history(&mut self) {
-        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
-            self.history.clear();
-            return;
-        };
-        self.history_loading = true;
-        self.worker()
-            .spawn(async move { fetch_history(&cookie).await }, Event::History);
-    }
-
-    fn load_watch_later(&mut self) {
-        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
-            self.watch_later.clear();
-            return;
-        };
-        self.watch_later_loading = true;
-        self.worker()
-            .spawn(async move { fetch_watch_later(&cookie).await }, Event::WatchLater);
-    }
-
-    fn load_favorites(&mut self) {
+    /// Starts the request for a signed-in feed, or clears it when there is no session.
+    ///
+    /// The four feeds below were four copies of the same six lines with a different field name
+    /// in each: copying one and forgetting to rename a field is exactly the kind of mistake the
+    /// duplication was inviting.
+    fn load_signed_in(&mut self, feed: SignedInFeed) {
         let Some(session) = self.session.as_ref() else {
-            self.favorites.clear();
+            feed.videos_mut(self).clear();
+            feed.set_loading(self, false);
             return;
         };
         let (cookie, mid) = (session.cookie.clone(), session.mid);
-        self.favorites_loading = true;
+        feed.set_loading(self, true);
+        let event = feed.event();
         self.worker().spawn(
-            async move { fetch_favorites(&cookie, mid).await },
-            Event::Favorites,
+            async move {
+                match feed {
+                    SignedInFeed::Dynamic => fetch_dynamic_feed(&cookie).await,
+                    SignedInFeed::History => fetch_history(&cookie).await,
+                    SignedInFeed::WatchLater => fetch_watch_later(&cookie).await,
+                    SignedInFeed::Favorites => fetch_favorites(&cookie, mid).await,
+                }
+            },
+            event,
         );
     }
 
@@ -561,7 +623,7 @@ impl BiliGuga {
         let page = self.author_page + 1;
         let generation = self.author_generation;
         let mid = self.author_mid;
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let cookie = self.cookie();
         self.author_loading = true;
         self.worker().spawn(
             async move { fetch_author_videos(mid, page, cookie.as_deref()).await },
@@ -589,10 +651,10 @@ impl BiliGuga {
         self.selected = None;
         match tab {
             AppTab::Home if self.videos.is_empty() => self.load_home_page(false),
-            AppTab::Dynamic => self.load_dynamic(),
-            AppTab::History => self.load_history(),
-            AppTab::WatchLater => self.load_watch_later(),
-            AppTab::Favorites => self.load_favorites(),
+            AppTab::Dynamic => self.load_signed_in(SignedInFeed::Dynamic),
+            AppTab::History => self.load_signed_in(SignedInFeed::History),
+            AppTab::WatchLater => self.load_signed_in(SignedInFeed::WatchLater),
+            AppTab::Favorites => self.load_signed_in(SignedInFeed::Favorites),
             AppTab::Login => self.start_login(),
             _ => {}
         }
@@ -605,12 +667,12 @@ impl BiliGuga {
         // all belong to the video being replaced. Without this a quality change left the old
         // session decoding until the new one started.
         self.stop_playback();
-        self.player_viewport_size = None;
-        self.playing_video = Some(video.clone());
+        // One clone serves both requests below; the state keeps the original.
+        let requested = video.clone();
+        self.playing_video = Some(video);
         self.playback = PlaybackState::Buffering;
         self.playback_error = None;
         self.comments.clear();
-        self.comments_for.clear();
         self.comments_page = 0;
         self.cloud_resume_applied = false;
         self.pending_seek = None;
@@ -620,10 +682,9 @@ impl BiliGuga {
         self.detail_like_count = "—".into();
         self.published_at = "发布时间未知".into();
 
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let cookie = self.cookie();
         let quality = self.quality;
-        let for_context = video.clone();
-        let for_url = video.clone();
+        let for_context = requested.clone();
         self.worker().spawn(
             async move { fetch_video_context(&for_context, cookie.as_deref()).await },
             move |result| match result {
@@ -631,9 +692,9 @@ impl BiliGuga {
                 Err(_) => Event::Silent,
             },
         );
-        let play_cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let play_cookie = self.cookie();
         self.worker().spawn(
-            async move { resolve_play_url(&for_url, play_cookie.as_deref(), quality).await },
+            async move { resolve_play_url(&requested, play_cookie.as_deref(), quality).await },
             Event::PlayUrl,
         );
         self.load_comments(true);
@@ -662,7 +723,7 @@ impl BiliGuga {
         let Some(video) = self.playing_video.clone() else {
             return;
         };
-        let play_cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let play_cookie = self.cookie();
         self.worker().spawn(
             async move {
                 fetch_last_play_progress(&video, play_cookie.as_deref())
@@ -712,7 +773,7 @@ impl BiliGuga {
         self.quality = quality;
         self.open_menu = None;
         self.playback = PlaybackState::Buffering;
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let cookie = self.cookie();
         self.worker().spawn(
             async move { resolve_play_url(&video, cookie.as_deref(), quality).await },
             Event::PlayUrl,
@@ -750,7 +811,7 @@ impl BiliGuga {
             return;
         }
         let (Some(cookie), Some(video)) = (
-            self.session.as_ref().map(|session| session.cookie.clone()),
+            self.cookie(),
             self.playing_video.clone(),
         ) else {
             return;
@@ -790,7 +851,7 @@ impl BiliGuga {
         }
         let page = self.comments_page + 1;
         let generation = self.comments_generation;
-        let cookie = self.session.as_ref().map(|session| session.cookie.clone());
+        let cookie = self.cookie();
         self.comments_loading = true;
         self.worker().spawn(
             async move {
@@ -846,7 +907,7 @@ impl BiliGuga {
     }
 
     fn refresh_session(&mut self) {
-        let Some(cookie) = self.session.as_ref().map(|session| session.cookie.clone()) else {
+        let Some(cookie) = self.cookie() else {
             return;
         };
         self.worker().spawn(
@@ -1217,14 +1278,15 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         return render_login(app);
     }
     let is_home = app.active_tab == AppTab::Home;
-    let is_loading = match app.active_tab {
-        AppTab::Home => app.loading && app.videos.is_empty(),
-        AppTab::Dynamic => app.dynamic_loading,
-        AppTab::WatchLater => app.watch_later_loading,
-        AppTab::Favorites => app.favorites_loading,
-        AppTab::History => app.history_loading,
-        AppTab::Author => app.author_loading,
-        _ => app.loading,
+    // One question, asked of the tab: which feed is showing, and is it still loading. This was
+    // a five-arm match here plus five more in the loader, all naming the same five fields.
+    let is_loading = match app.active_tab.signed_in() {
+        Some(feed) => feed.loading(app),
+        None => match app.active_tab {
+            AppTab::Home => app.loading && app.videos.is_empty(),
+            AppTab::Author => app.author_loading,
+            _ => app.loading,
+        },
     };
     let videos = app.current_videos();
 
@@ -1556,7 +1618,6 @@ fn render_player(app: &BiliGuga) -> El {
         0.
     };
     // The stage: the video frame letterboxed on black, or a message until one arrives.
-    let stage_size = app.player_viewport_size.unwrap_or((1280, 720));
     let mut stage = col()
         .key("player-stage")
         .w_full()
@@ -1604,8 +1665,6 @@ fn render_player(app: &BiliGuga) -> El {
             );
         }
     }
-    let _ = stage_size;
-
     // The controls, over the stage, while the pointer has been around recently.
     let controls_visible = app.controls_visible();
     let transport = row()
@@ -1951,7 +2010,7 @@ fn setup(app: &mut BiliGuga, waker: Waker) {
         worker.waker = waker;
     }
     // Everything slow starts here, after the first frame: the window opens at once.
-    let cookie = app.session.as_ref().map(|session| session.cookie.clone());
+    let cookie = app.cookie();
     app.load_home_page(false);
     let _ = cookie;
     if app.session.is_some() {
@@ -1979,12 +2038,10 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     // about ten times a second.
     if app.playing_video.is_some() {
         // Telling mpv once per change is what keeps a 1080p decode off a 400 pt column.
-        let measured = app.stage_size.get();
-        if measured != app.player_viewport_size {
-            app.player_viewport_size = measured;
-            if let Some((width, height)) = measured {
-                app.player.set_render_viewport(width, height);
-            }
+        if let Some((width, height)) = app.stage_size.get() {
+            // `set_render_viewport` drops a repeat of the size already in force, so this can
+            // run every frame without sending anything twice.
+            app.player.set_render_viewport(width, height);
         }
     }
 
@@ -2107,34 +2164,12 @@ impl BiliGuga {
                 Err(error) => app.playback_error = Some(error),
             }
         }
-        Event::Dynamic(result) => {
-            app.dynamic_loading = false;
-            if let Ok(videos) = result {
-                app.dynamic_videos = videos;
-                app.new_rows = true;
-            }
-        }
-        Event::History(result) => {
-            app.history_loading = false;
-            if let Ok(videos) = result {
-                app.history = videos;
-                app.new_rows = true;
-            }
-        }
-        Event::WatchLater(result) => {
-            app.watch_later_loading = false;
-            if let Ok(videos) = result {
-                app.watch_later = videos;
-                app.new_rows = true;
-            }
-        }
-        Event::Favorites(result) => {
-            app.favorites_loading = false;
-            if let Ok(videos) = result {
-                app.favorites = videos;
-                app.new_rows = true;
-            }
-        }
+        // The four signed-in feeds answer the same way, so they are handled in one arm with
+        // the feed as the only variable.
+        Event::Dynamic(result) => app.land_signed_in(SignedInFeed::Dynamic, result),
+        Event::History(result) => app.land_signed_in(SignedInFeed::History, result),
+        Event::WatchLater(result) => app.land_signed_in(SignedInFeed::WatchLater, result),
+        Event::Favorites(result) => app.land_signed_in(SignedInFeed::Favorites, result),
         Event::Author(result, generation) => {
             if generation != app.author_generation {
                 return;
@@ -2264,7 +2299,7 @@ impl BiliGuga {
                 let _ = login::save_session(&session);
                 let face = session.face.clone();
                 app.session = Some(session);
-                app.load_dynamic();
+                app.load_signed_in(SignedInFeed::Dynamic);
                 app.load_avatar(face);
             }
         }
@@ -2337,13 +2372,14 @@ impl BiliGuga {
     fn refresh_feed(&mut self) {
         match self.active_tab {
             AppTab::Home => self.load_home_page(true),
-            AppTab::Dynamic => self.load_dynamic(),
-            AppTab::History => self.load_history(),
-            AppTab::WatchLater => self.load_watch_later(),
-            AppTab::Favorites => self.load_favorites(),
             AppTab::Author => self.load_author_page(true),
             AppTab::Search => self.load_search(),
             AppTab::Login => self.start_login(),
+            tab => {
+                if let Some(feed) = tab.signed_in() {
+                    self.load_signed_in(feed);
+                }
+            }
         }
     }
 
@@ -2521,7 +2557,7 @@ impl BiliGuga {
 
     fn like_current(&mut self) {
         let (Some(cookie), Some(video)) = (
-            self.session.as_ref().map(|session| session.cookie.clone()),
+            self.cookie(),
             self.current_action_target(),
         ) else {
             return;
@@ -2538,7 +2574,7 @@ impl BiliGuga {
 
     fn coin_current(&mut self) {
         let (Some(cookie), Some(video)) = (
-            self.session.as_ref().map(|session| session.cookie.clone()),
+            self.cookie(),
             self.current_action_target(),
         ) else {
             return;
@@ -2555,7 +2591,7 @@ impl BiliGuga {
 
     fn save_to_watch_later(&mut self) {
         let (Some(cookie), Some(video)) = (
-            self.session.as_ref().map(|session| session.cookie.clone()),
+            self.cookie(),
             self.current_action_target(),
         ) else {
             return;
@@ -2799,5 +2835,39 @@ mod live_tests {
                 .any(|pixel| pixel[0] > 8 || pixel[1] > 8),
             "the cover decoded to a blank image"
         );
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    /// Ten covers through the shared client should reuse connections: a per-request
+    /// `reqwest::Client` paid a fresh TLS handshake for every one of them.
+    #[test]
+    #[ignore = "needs the network"]
+    fn ten_covers_share_one_client() {
+        let page = futures::executor::block_on(network::run(async {
+            fetch_recommendations(1, None).await
+        }))
+        .expect("recommendations failed");
+        let urls: Vec<String> = page
+            .videos
+            .iter()
+            .filter(|video| !video.cover.is_empty())
+            .take(10)
+            .map(|video| video.cover.clone())
+            .collect();
+        assert!(urls.len() >= 5, "need a few covers to be meaningful");
+        let started = std::time::Instant::now();
+        for url in &urls {
+            let cover = queue_cover_download(url.clone(), Arc::new(AtomicBool::new(false)))
+                .expect("cover worker refused");
+            let image = futures::executor::block_on(network::run(async move {
+                cover.await.ok().flatten()
+            }));
+            assert!(image.is_some(), "a cover failed to decode: {url}");
+        }
+        eprintln!("{} covers in {:?}", urls.len(), started.elapsed());
     }
 }

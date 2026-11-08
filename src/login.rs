@@ -1,9 +1,8 @@
 use image::Luma;
 use qrcode::QrCode;
 use reqwest::header::SET_COOKIE;
-use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc};
 use url::Url;
 
 pub(crate) struct QrCodeData {
@@ -27,39 +26,11 @@ pub(crate) enum PollResult {
     LoggedIn(UserSession),
 }
 
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())
-}
-
-fn with_cookie(request: RequestBuilder, cookie: &str) -> RequestBuilder {
-    if cookie.is_empty() {
-        request
-    } else {
-        request.header("Cookie", cookie)
-    }
-}
-
-fn text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(value)) => value.clone(),
-        Some(value) => value.to_string().trim_matches('"').to_string(),
-        None => String::new(),
-    }
-}
-
-fn number(value: Option<&Value>) -> i64 {
-    value
-        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-        .unwrap_or_default()
-}
-
+// The HTTP client and the JSON helpers live in `api`: this module used to carry byte-identical
+// copies of all four, which meant two connection pools with two sets of timeouts.
+use crate::api::{client, number, text, with_cookie};
 pub(crate) async fn fetch_qr_code() -> Result<QrCodeData, String> {
-    let client = client()?;
+    let client = client();
     let response: Value = client
         .get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
         .header("Referer", "https://www.bilibili.com/")
@@ -102,7 +73,7 @@ pub(crate) async fn fetch_qr_code() -> Result<QrCodeData, String> {
 }
 
 pub(crate) async fn poll_qr_code(key: &str) -> Result<PollResult, String> {
-    let client = client()?;
+    let client = client();
     let response = client
         .get("https://passport.bilibili.com/x/passport-login/web/qrcode/poll")
         .header("Referer", "https://www.bilibili.com/")
@@ -193,12 +164,12 @@ fn cookie_value(cookie: &str, name: &str) -> Option<String> {
 }
 
 pub(crate) async fn fetch_user(cookie: String) -> Result<UserSession, String> {
-    let client = client()?;
+    let client = client();
     let response: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/web-interface/nav")
             .header("Referer", "https://www.bilibili.com/"),
-        &cookie,
+        Some(&cookie),
     )
     .send()
     .await

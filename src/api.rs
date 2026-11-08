@@ -63,7 +63,7 @@ pub(crate) struct RecommendationPage {
     pub(crate) has_more: bool,
 }
 
-fn text(value: Option<&Value>) -> String {
+pub(crate) fn text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(value)) => value.clone(),
         Some(value) => value.to_string().trim_matches('"').to_string(),
@@ -71,7 +71,7 @@ fn text(value: Option<&Value>) -> String {
     }
 }
 
-fn with_cookie(request: RequestBuilder, cookie: Option<&str>) -> RequestBuilder {
+pub(crate) fn with_cookie(request: RequestBuilder, cookie: Option<&str>) -> RequestBuilder {
     if let Some(cookie) = cookie.filter(|cookie| !cookie.is_empty()) {
         request.header("Cookie", cookie)
     } else {
@@ -109,7 +109,7 @@ fn with_action_cookie(request: RequestBuilder, cookie: &str) -> RequestBuilder {
     }
 }
 
-fn number(value: Option<&Value>) -> i64 {
+pub(crate) fn number(value: Option<&Value>) -> i64 {
     value
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
         .unwrap_or_default()
@@ -223,13 +223,40 @@ fn decode_image(bytes: &[u8], width: u32, height: u32) -> Option<Arc<Rgba8>> {
     )))
 }
 
-fn cover_image_client() -> Option<Client> {
-    Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .ok()
+/// The HTTP clients this module uses, built once.
+///
+/// Every request used to build its own `reqwest::Client`, which meant a fresh connection pool
+/// and a fresh TLS session per call: no keep-alive, no connection reuse, and a new TLS handshake
+/// for every cover, every page and every comment page. There are two because a few write
+/// endpoints want a browser user agent, and both are created on first use inside whatever tokio
+/// worker calls them.
+pub(crate) fn client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .user_agent("Mozilla/5.0 biliguga/0.1")
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("failed to build the biliguga HTTP client")
+    })
+}
+
+/// The client for endpoints that want to look like a browser (like, coin): same pool settings,
+/// a different user agent.
+fn browser_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("failed to build the biliguga browser HTTP client")
+    })
 }
 
 async fn download_cover_async(
@@ -280,18 +307,18 @@ fn cover_workers() -> Option<&'static CoverWorkers> {
             for _ in 0..COVER_WORKER_COUNT {
                 let (sender, receiver) = async_mpsc::unbounded::<CoverRequest>();
                 network::detach(async move {
-                    let Some(client) = cover_image_client() else {
-                        return;
-                    };
                     let mut results = receiver
-                        .map(|request| {
-                            let client = client.clone();
-                            async move {
-                                let image =
-                                    download_cover_async(&client, &request.url, &request.cancelled)
-                                        .await;
-                                (request.reply, image)
-                            }
+                        .map(|request| async move {
+                            // The shared client keeps its connection pool warm across covers,
+                            // so a feed of twenty thumbnails reuses one TLS session per CDN
+                            // host instead of shaking hands twenty times.
+                            let image = download_cover_async(
+                                client(),
+                                &request.url,
+                                &request.cancelled,
+                            )
+                            .await;
+                            (request.reply, image)
                         })
                         .buffer_unordered(COVER_REQUESTS_PER_WORKER);
                     while let Some((reply, image)) = results.next().await {
@@ -329,7 +356,7 @@ pub(crate) async fn download_avatar(url: &str) -> Option<Arc<Rgba8>> {
     if url.is_empty() {
         return None;
     }
-    let client = cover_image_client()?;
+    let client = client();
     let request_url = thumbnail_url(url, 160, 160);
     let response = client
         .get(&request_url)
@@ -459,7 +486,45 @@ fn wbi_sign(
     signed
 }
 
+/// The WBI signing keys, cached for a while.
+///
+/// They come from the `nav` endpoint and rotate roughly daily; every page of the feed, every
+/// search and every history call used to fetch them again, so a scroll through three pages
+/// spent three extra round trips on keys that had not changed. One entry, refreshed when it is
+/// older than an hour or when a signed request comes back rejected.
+fn wbi_cache() -> &'static std::sync::Mutex<Option<(String, String, std::time::Instant)>> {
+    static CACHE: OnceLock<std::sync::Mutex<Option<(String, String, std::time::Instant)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cached_wbi_keys() -> Option<(String, String)> {
+    let cache = wbi_cache().lock().ok()?;
+    let (img, sub, at) = cache.as_ref()?;
+    (at.elapsed() < std::time::Duration::from_secs(3600)).then(|| (img.clone(), sub.clone()))
+}
+
+fn store_wbi_keys(img_key: &str, sub_key: &str) {
+    if let Ok(mut cache) = wbi_cache().lock() {
+        *cache = Some((
+            img_key.to_string(),
+            sub_key.to_string(),
+            std::time::Instant::now(),
+        ));
+    }
+}
+
+/// Forgets the cached keys, so the next request fetches fresh ones after a rejection.
+fn invalidate_wbi_keys() {
+    if let Ok(mut cache) = wbi_cache().lock() {
+        *cache = None;
+    }
+}
+
 async fn fetch_wbi_keys(client: &Client, cookie: Option<&str>) -> Result<(String, String), String> {
+    if let Some(keys) = cached_wbi_keys() {
+        return Ok(keys);
+    }
     let nav: Value = with_cookie(
         client.get("https://api.bilibili.com/x/web-interface/nav"),
         cookie,
@@ -474,27 +539,28 @@ async fn fetch_wbi_keys(client: &Client, cookie: Option<&str>) -> Result<(String
         .get("data")
         .and_then(|data| data.get("wbi_img"))
         .ok_or_else(|| "B 站没有返回 WBI 密钥".to_string())?;
-    let img_key = text(wbi_img.get("img_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let sub_key = text(wbi_img.get("sub_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let img_key = media_key(wbi_img.get("img_url"));
+    let sub_key = media_key(wbi_img.get("sub_url"));
     if img_key.is_empty() || sub_key.is_empty() {
-        Err("B 站 WBI 密钥为空".into())
-    } else {
-        Ok((img_key, sub_key))
+        return Err("B 站 WBI 密钥为空".into());
     }
+    store_wbi_keys(&img_key, &sub_key);
+    Ok((img_key, sub_key))
+}
+
+/// The key part of a WBI media URL: its file name without the extension.
+///
+/// This extraction was copy-pasted into five places (the feed, search, the dynamic feed, the
+/// history report and the player detail call), each one eleven lines.
+fn media_key(url: Option<&Value>) -> String {
+    text(url)
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -599,12 +665,7 @@ pub(crate) async fn fetch_video_context(
     video: &Video,
     cookie: Option<&str>,
 ) -> Result<VideoContext, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let query = if video.bvid.is_empty() {
         vec![("aid", video.aid.to_string())]
     } else {
@@ -697,13 +758,8 @@ pub(crate) async fn fetch_author_videos(
         return Err("作者 UID 无效".into());
     }
     const PAGE_SIZE: usize = 30;
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let (img_key, sub_key) = fetch_wbi_keys(&client, cookie).await?;
+    let client = client();
+    let (img_key, sub_key) = fetch_wbi_keys(client, cookie).await?;
     let mut params = BTreeMap::new();
     params.insert("mid".into(), mid.to_string());
     params.insert("ps".into(), PAGE_SIZE.to_string());
@@ -758,45 +814,8 @@ pub(crate) async fn fetch_recommendations(
     page: usize,
     cookie: Option<&str>,
 ) -> Result<RecommendationPage, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let nav: Value = with_cookie(
-        client.get("https://api.bilibili.com/x/web-interface/nav"),
-        cookie,
-    )
-    .send()
-    .await
-    .map_err(|error| format!("获取 WBI 密钥失败：{error}"))?
-    .json()
-    .await
-    .map_err(|error| format!("解析 WBI 密钥失败：{error}"))?;
-    let wbi_img = nav
-        .get("data")
-        .and_then(|data| data.get("wbi_img"))
-        .ok_or_else(|| "B 站没有返回 WBI 密钥".to_string())?;
-    let img_key = text(wbi_img.get("img_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let sub_key = text(wbi_img.get("sub_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if img_key.is_empty() || sub_key.is_empty() {
-        return Err("B 站 WBI 密钥为空".into());
-    }
+    let client = client();
+    let (img_key, sub_key) = fetch_wbi_keys(client, cookie).await?;
 
     let mut params = BTreeMap::new();
     params.insert("version".into(), "1".into());
@@ -820,12 +839,8 @@ pub(crate) async fn fetch_recommendations(
     .json()
     .await
     .map_err(|error| format!("解析推荐流失败：{error}"))?;
-    let code = number(response.get("code"));
-    if code != 0 {
-        return Err(format!(
-            "推荐接口返回错误 {code}：{}",
-            text(response.get("message"))
-        ));
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "推荐"));
     }
     let items = response
         .get("data")
@@ -878,43 +893,8 @@ fn parse_search_result_list(response: &Value) -> Vec<Video> {
 }
 
 pub(crate) async fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let nav: Value = client
-        .get("https://api.bilibili.com/x/web-interface/nav")
-        .send()
-        .await
-        .map_err(|error| format!("获取搜索 WBI 密钥失败：{error}"))?
-        .json()
-        .await
-        .map_err(|error| format!("解析搜索 WBI 密钥失败：{error}"))?;
-    let wbi_img = nav
-        .get("data")
-        .and_then(|data| data.get("wbi_img"))
-        .ok_or_else(|| "B 站没有返回搜索 WBI 密钥".to_string())?;
-    let img_key = text(wbi_img.get("img_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let sub_key = text(wbi_img.get("sub_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if img_key.is_empty() || sub_key.is_empty() {
-        return Err("B 站搜索 WBI 密钥为空".into());
-    }
+    let client = client();
+    let (img_key, sub_key) = fetch_wbi_keys(client, None).await?;
 
     let mut params = BTreeMap::new();
     params.insert("keyword".into(), keyword.into());
@@ -966,10 +946,7 @@ pub(crate) async fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, St
         .await
         .map_err(|error| format!("解析 B 站综合搜索结果失败：{error}"))?;
     if number(fallback_response.get("code")) != 0 {
-        return Err(format!(
-            "搜索接口返回错误 {code}：{}",
-            text(response.get("message"))
-        ));
+        return Err(api_error(&response, "搜索"));
     }
     let videos = parse_search_result_list(&fallback_response);
     if videos.is_empty() {
@@ -1010,12 +987,7 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
 }
 
 pub(crate) async fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let response: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/web-interface/history/cursor")
@@ -1029,12 +1001,8 @@ pub(crate) async fn fetch_history(cookie: &str) -> Result<Vec<Video>, String> {
     .json()
     .await
     .map_err(|error| format!("解析观看历史失败：{error}"))?;
-    let code = number(response.get("code"));
-    if code != 0 {
-        return Err(format!(
-            "观看历史接口返回错误 {code}：{}",
-            text(response.get("message"))
-        ));
+    if number(response.get("code")) != 0 {
+        return Err(api_error(&response, "观看历史"));
     }
     let items = response
         .get("data")
@@ -1058,12 +1026,7 @@ pub(crate) async fn report_video_progress(
         return Err("视频缺少有效的 AV 号或 CID".into());
     }
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let progress = progress.max(0.).floor() as i64;
     let response: Value = with_cookie(
         client
@@ -1101,12 +1064,7 @@ pub(crate) async fn report_video_heartbeat(
         return Err("视频缺少有效的 AV 号或 CID".into());
     }
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let progress = progress.max(0.).floor() as i64;
     let start_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1151,42 +1109,8 @@ pub(crate) async fn fetch_last_play_progress(video: &Video, cookie: Option<&str>
     if video.aid <= 0 || video.cid <= 0 || cookie.is_none() {
         return None;
     }
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let nav: Value = with_cookie(
-        client.get("https://api.bilibili.com/x/web-interface/nav"),
-        cookie,
-    )
-    .send()
-    .await
-    .ok()?
-    .json()
-    .await
-    .ok()?;
-    let wbi_img = nav.get("data")?.get("wbi_img")?;
-    let img_key = text(wbi_img.get("img_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let sub_key = text(wbi_img.get("sub_url"))
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if img_key.is_empty() || sub_key.is_empty() {
-        return None;
-    }
+    let client = client();
+    let (img_key, sub_key) = fetch_wbi_keys(client, cookie).await.ok()?;
     let mut params = BTreeMap::new();
     params.insert("aid".into(), video.aid.to_string());
     params.insert("bvid".into(), video.bvid.clone());
@@ -1281,12 +1205,7 @@ fn parse_dynamic_video(item: &Value, index: usize) -> Option<Video> {
 }
 
 pub(crate) async fn fetch_dynamic_feed(cookie: &str) -> Result<Vec<Video>, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let response: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")
@@ -1325,11 +1244,13 @@ pub(crate) async fn fetch_dynamic_feed(cookie: &str) -> Result<Vec<Video>, Strin
 }
 
 fn api_error(response: &Value, operation: &str) -> String {
-    format!(
-        "{operation}接口返回错误 {}：{}",
-        number(response.get("code")),
-        text(response.get("message"))
-    )
+    let code = number(response.get("code"));
+    // -403 is Bilibili's "bad signature": the WBI keys changed under us. Dropping the cache is
+    // what makes the next attempt fetch new ones instead of failing the same way forever.
+    if code == -403 {
+        invalidate_wbi_keys();
+    }
+    format!("{operation}接口返回错误 {code}：{}", text(response.get("message")))
 }
 
 fn csrf_from_cookie(cookie: &str) -> Option<String> {
@@ -1358,12 +1279,7 @@ fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
 }
 
 pub(crate) async fn fetch_watch_later(cookie: &str) -> Result<Vec<Video>, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let response: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/v2/history/toview")
@@ -1419,12 +1335,7 @@ fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
 }
 
 pub(crate) async fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let folders: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/v3/fav/folder/created/list-all")
@@ -1498,11 +1409,7 @@ pub(crate) async fn fetch_favorites(cookie: &str, mid: i64) -> Result<Vec<Video>
 
 pub(crate) async fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let response: Value = with_cookie(
         client
             .post("https://api.bilibili.com/x/v2/history/toview/add")
@@ -1525,11 +1432,7 @@ pub(crate) async fn add_to_watch_later(cookie: &str, aid: i64) -> Result<(), Str
 
 pub(crate) async fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let folders: Value = with_cookie(
         client
             .get("https://api.bilibili.com/x/v3/fav/folder/created/list-all")
@@ -1591,14 +1494,7 @@ pub(crate) async fn add_to_favorites(cookie: &str, mid: i64, aid: i64) -> Result
 
 pub(crate) async fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
-    let client = Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = browser_client();
     let response: Value = with_action_cookie(
         client
             .post("https://api.bilibili.com/x/web-interface/archive/like")
@@ -1626,14 +1522,7 @@ pub(crate) async fn like_video(cookie: &str, aid: i64) -> Result<(), String> {
 
 pub(crate) async fn coin_video(cookie: &str, aid: i64) -> Result<(), String> {
     let csrf = csrf_from_cookie(cookie).ok_or_else(|| "登录状态缺少 CSRF 凭证".to_string())?;
-    let client = Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = browser_client();
     let response: Value = with_action_cookie(
         client
             .post("https://api.bilibili.com/x/web-interface/coin/add")
@@ -1725,12 +1614,7 @@ pub(crate) async fn fetch_comments(
     cookie: Option<&str>,
     page: u32,
 ) -> Result<CommentPage, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
     let mut aid = video.aid;
     if aid <= 0 {
         if video.bvid.is_empty() {
@@ -2020,12 +1904,7 @@ pub(crate) async fn resolve_play_url(
     cookie: Option<&str>,
     quality: u32,
 ) -> Result<PlayUrlResult, String> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 biliguga/0.1")
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = client();
 
     let mut cid = video.cid;
     let mut aid = video.aid;
@@ -2047,11 +1926,7 @@ pub(crate) async fn resolve_play_url(
         .await
         .map_err(|error| format!("解析视频详情失败：{error}"))?;
         if number(detail.get("code")) != 0 {
-            return Err(format!(
-                "视频详情接口返回错误 {}：{}",
-                number(detail.get("code")),
-                text(detail.get("message"))
-            ));
+            return Err(api_error(&detail, "视频详情"));
         }
         let data = detail.get("data");
         if cid == 0 {
