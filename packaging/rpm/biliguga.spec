@@ -8,8 +8,6 @@ Source0:        biliguga
 Source1:        biliguga.desktop
 
 Requires:       mpv-libs
-Requires:       fontconfig
-Requires:       freetype
 Requires:       libX11
 Requires:       libxkbcommon
 Requires:       libxkbcommon-x11

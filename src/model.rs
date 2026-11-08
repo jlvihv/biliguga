@@ -18,22 +18,6 @@ impl Rgba8 {
         }
     }
 
-    /// A blank image, drawn as a flat colour until its real pixels arrive.
-    pub(crate) fn filled(width: u32, height: u32, [red, green, blue, alpha]: [u8; 4]) -> Self {
-        let mut pixels = vec![0; width as usize * height as usize * 4];
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[red, green, blue, alpha]);
-        }
-        Self {
-            width,
-            height,
-            pixels,
-        }
-    }
-
-    pub(crate) fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
 }
 
 #[derive(Clone, Debug)]

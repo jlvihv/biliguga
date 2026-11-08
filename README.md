@@ -1,6 +1,6 @@
 # 哔哩咕嘎（biliguga）
 
-一个使用 Rust + GPUI + libmpv 实现的 B 站桌面客户端。
+一个使用 Rust + Rune + libmpv 实现的 B 站桌面客户端。
 
 当前版本包含：
 
@@ -18,9 +18,9 @@
 
 | 平台 | 构建依赖 | 运行时依赖 |
 | --- | --- | --- |
-| Linux | Rust、`libmpv-dev`、GPUI 的图形依赖 | `libmpv.so`；支持 X11 和 Wayland 会话 |
+| Linux | Rust 1.99.1、`libmpv-dev`、`libxkbcommon-dev`、`libwayland-dev` | `libmpv.so`、Vulkan 或 OpenGL 驱动；支持 X11 和 Wayland 会话 |
 | Windows | Rust MSVC toolchain、Visual Studio Build Tools、mpv-dev | `libmpv-2.dll` 及其依赖 |
-| macOS | Rust、Homebrew `mpv` | Homebrew mpv 的动态库 |
+| macOS | Rust 1.99.1、Homebrew `mpv` | Homebrew mpv 的动态库 |
 
 ## 本地构建
 
@@ -81,6 +81,19 @@ git push origin v0.1.0
 
 发布包中的播放器动态库可能受各平台发行方式影响；如果系统无法找到 libmpv，请按上面的平台说明安装对应运行库。
 
+## 界面框架
+
+界面使用 [Rune](https://github.com/anomalyco/rune)。它目前尚未发布 crate，所以 `Cargo.toml` 固定了 `dev` 分支的一个 rev；升级时改那一行即可。Rust 工具链版本由 `rust-toolchain.toml` 固定为 Rune 要求的 1.99.1。
+
+相对之前的 GPUI 版本，这次重写换来了几件事：
+
+- **播放不再重跑界面。** mpv 的 worker 线程直接写入一个 `rune::Pixels`，渲染器只上传它并唤醒正在画它的窗口；视频帧不会触发视图重建。
+- **输入框是框架自带的。** 原来那 553 行手写 `Element`（UTF-16 选区、自绘光标、`EntityInputHandler`）被 Rune 的 `text_input` 取代，中文输入法、撤销和剪贴板一并有了。
+- **不再有借用重入崩溃。** 状态就是普通结构体，处理器拿 `&mut`，没有把实体借出去再放回的模型。
+- **图片生命周期交给运行库。** `drop_image`、retired 帧队列、`pending_cover_drops` 那套手工簿记全部删除。
+
+GPUI 版本保留在 `main` 分支上，标签 `gpui-final`。
+
 ## 许可证
 
-本项目使用 MIT 许可证。项目依赖的 GPUI、libmpv、FFmpeg 等组件分别遵循其自身许可证。
+本项目使用 MIT 许可证。项目依赖的 Rune、libmpv、FFmpeg 等组件分别遵循其自身许可证。

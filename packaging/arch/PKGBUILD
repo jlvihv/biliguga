@@ -5,7 +5,7 @@ pkgdesc='哔哩咕嘎 Bilibili desktop client binary'
 arch=('x86_64')
 url='https://github.com/jlvihv/biliguga'
 license=('MIT')
-depends=('mpv' 'fontconfig' 'freetype2' 'libx11' 'libxkbcommon' 'wayland' 'libxcb' 'vulkan-icd-loader')
+depends=('mpv' 'libx11' 'libxkbcommon' 'wayland' 'libxcb' 'vulkan-icd-loader')
 source=(
   "biliguga-linux-x86_64.tar.gz::https://github.com/jlvihv/biliguga/releases/download/v${pkgver}/biliguga-linux-x86_64.tar.gz"
   "biliguga.desktop::https://raw.githubusercontent.com/jlvihv/biliguga/v${pkgver}/packaging/common/biliguga.desktop"
