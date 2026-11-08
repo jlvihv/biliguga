@@ -238,7 +238,43 @@ fn legacy_session_path() -> PathBuf {
     session_path()
 }
 
+/// Reads a session file.
+///
+/// JSON, written by `save_session` below. The file used to be five newline-separated lines,
+/// which broke for any value containing a newline: a username that did leaked its second line
+/// into the `face` field and shifted everything after it, so the session read back with the
+/// wrong avatar and `is_vip` silently false. The line format is still parsed, because a file
+/// written by an older build has to keep working.
 fn parse_session(content: &str) -> Option<UserSession> {
+    // A file that looks like JSON is JSON: falling through to the line parser would take `{}`
+    // for a cookie string, which is how an empty session parsed as a logged-in one.
+    if content.trim_start().starts_with('{') {
+        return parse_session_json(content);
+    }
+    parse_session_lines(content)
+}
+
+fn parse_session_json(content: &str) -> Option<UserSession> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    let cookie = text(value.get("cookie"));
+    if cookie.is_empty() {
+        return None;
+    }
+    Some(UserSession {
+        cookie,
+        mid: number(value.get("mid")),
+        username: text(value.get("username")),
+        face: text(value.get("face")),
+        is_vip: value
+            .get("is_vip")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// The five-line format older builds wrote. Kept only so an existing session survives the
+/// upgrade, and kept out of `save_session` so nothing new is ever written this way.
+fn parse_session_lines(content: &str) -> Option<UserSession> {
     let mut lines = content.lines();
     let cookie = lines.next()?.to_string();
     if cookie.is_empty() {
@@ -264,10 +300,16 @@ pub(crate) fn save_session(session: &UserSession) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("创建登录目录失败：{error}"))?;
     }
-    let content = format!(
-        "{}\n{}\n{}\n{}\n{}\n",
-        session.cookie, session.mid, session.username, session.face, session.is_vip as u8
-    );
+    // JSON, not five newline-separated lines: a value containing a newline used to shift every
+    // field after it, so the session came back with the wrong avatar.
+    let content = serde_json::json!({
+        "cookie": session.cookie,
+        "mid": session.mid,
+        "username": session.username,
+        "face": session.face,
+        "is_vip": session.is_vip,
+    })
+    .to_string();
     fs::write(&path, content).map_err(|error| format!("保存登录状态失败：{error}"))?;
     #[cfg(unix)]
     {
@@ -296,5 +338,59 @@ pub(crate) fn clear_session() {
     let legacy_path = legacy_session_path();
     if legacy_path != session_path() {
         let _ = fs::remove_file(legacy_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UserSession, parse_session};
+
+    fn session(username: &str, face: &str) -> UserSession {
+        UserSession {
+            cookie: "SESSDATA=abc; bili_jct=def".into(),
+            mid: 42,
+            username: username.into(),
+            face: face.into(),
+            is_vip: true,
+        }
+    }
+
+    /// A newline in a value used to shift every field after it, so the session came back with
+    /// the wrong avatar and `is_vip` silently false. JSON makes that impossible.
+    #[test]
+    fn a_username_with_a_newline_round_trips() {
+        let original = session("bad\nuser", "https://example.invalid/face.jpg");
+        let encoded = serde_json::json!({
+            "cookie": original.cookie,
+            "mid": original.mid,
+            "username": original.username,
+            "face": original.face,
+            "is_vip": original.is_vip,
+        })
+        .to_string();
+        let parsed = parse_session(&encoded).expect("should parse");
+        assert_eq!(parsed.username, "bad\nuser");
+        assert_eq!(parsed.face, "https://example.invalid/face.jpg");
+        assert!(parsed.is_vip, "is_vip must survive a newline in the name");
+        assert_eq!(parsed.mid, 42);
+        assert_eq!(parsed.cookie, "SESSDATA=abc; bili_jct=def");
+    }
+
+    /// A file written by a build that predates JSON still loads, so upgrading does not log
+    /// the viewer out.
+    #[test]
+    fn the_old_line_format_still_loads() {
+        let legacy = "SESSDATA=abc\n42\n某用户\nhttps://example.invalid/f.jpg\n1\n";
+        let parsed = parse_session(legacy).expect("legacy session should parse");
+        assert_eq!(parsed.username, "某用户");
+        assert_eq!(parsed.mid, 42);
+        assert!(parsed.is_vip);
+    }
+
+    #[test]
+    fn an_empty_cookie_is_not_a_session() {
+        assert!(parse_session("").is_none());
+        assert!(parse_session("{}").is_none());
+        assert!(parse_session(r#"{"cookie":""}"#).is_none());
     }
 }

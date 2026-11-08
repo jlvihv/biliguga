@@ -749,9 +749,15 @@ unsafe fn get_string_property(handle: *mut MpvHandle, name: &str) -> Option<Stri
     Some(result)
 }
 
+/// Sets an mpv option, ignoring a name or value libmpv cannot take.
+///
+/// `CString::new` fails on an interior NUL, which these literals never contain; returning
+/// instead of unwrapping keeps a typo in a future option from taking the player thread down.
 unsafe fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
-    let name = CString::new(name).unwrap();
-    let value = CString::new(value).unwrap();
+    let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) else {
+        debug_log(&format!("skipped option {name:?}: it contains a NUL"));
+        return;
+    };
     unsafe {
         let _ = mpv_set_option_string(handle, name.as_ptr(), value.as_ptr());
     }

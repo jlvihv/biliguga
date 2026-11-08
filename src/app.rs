@@ -383,6 +383,10 @@ pub(crate) struct BiliGuga {
     /// moved together.
     stats: Option<VideoStats>,
     playback_error: Option<String>,
+    /// Why the last feed request failed. Separate from `playback_error`: a search that fails
+    /// used to write its error there, where only the player column shows it, so the viewer saw
+    /// an empty feed and no reason for it.
+    feed_error: Option<String>,
     cloud_resume_progress: Option<f64>,
     cloud_resume_applied: bool,
     pending_seek: Option<f64>,
@@ -481,6 +485,7 @@ impl BiliGuga {
             stage_size: std::cell::Cell::new(None),
             stats: None,
             playback_error: None,
+            feed_error: None,
             cloud_resume_progress: None,
             cloud_resume_applied: false,
             pending_seek: None,
@@ -606,6 +611,7 @@ impl BiliGuga {
             self.home_has_more = true;
             self.loading = true;
             self.videos.clear();
+            self.feed_error = None;
             self.selected = None;
         }
         let page = self.home_page + 1;
@@ -632,6 +638,7 @@ impl BiliGuga {
         self.active_tab = AppTab::Search;
         self.loading = true;
         self.search_results.clear();
+        self.feed_error = None;
         self.selected = None;
         self.worker().spawn(
             async move { fetch_search_results(&query).await },
@@ -642,9 +649,12 @@ impl BiliGuga {
     /// Folds a signed-in feed's answer into the state. A failure leaves whatever was shown.
     fn land_signed_in(&mut self, feed: SignedInFeed, result: Result<Vec<Video>, String>) {
         feed.set_loading(self, false);
-        if let Ok(videos) = result {
-            *feed.videos_mut(self) = videos;
-            self.new_rows = true;
+        match result {
+            Ok(videos) => {
+                *feed.videos_mut(self) = videos;
+                self.new_rows = true;
+            }
+            Err(error) => self.feed_error = Some(error),
         }
     }
 
@@ -1213,8 +1223,10 @@ fn render_sidebar(app: &BiliGuga) -> El {
 fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
     let selected = app.selected == Some(index);
     let image = app.cover_for(video);
+    // No `.key()`: `virtual_rows` assigns this row's key from its own `key(s, i)` closure and
+    // documents that it overrides whatever the element set. Building one here was a `format!`
+    // per row per commit that was thrown away.
     let mut row_el = row()
-        .key(format!("row-{}", video.bvid))
         .w_full()
         .gap(10.0)
         .padding(8.0)
@@ -1255,8 +1267,8 @@ fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
 /// A two-column card for the home grid.
 fn video_card(app: &BiliGuga, index: usize, video: &Video) -> El {
     let image = app.cover_for(video);
+    // Keyed by `virtual_rows`, as the row above.
     let mut card = col()
-        .key(format!("card-{}", video.bvid))
         .w(GRID_CARD_WIDTH)
         .h(GRID_CARD_HEIGHT)
         .shrink()
@@ -1372,7 +1384,7 @@ fn render_search_bar(app: &BiliGuga) -> El {
         )
 }
 
-fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
+fn render_feed(app: &BiliGuga) -> El {
     if app.active_tab == AppTab::Login {
         return render_login(app);
     }
@@ -1436,6 +1448,12 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
                 .font(type_::BODY)
                 .color(theme::TEXT_FAINT),
         )
+    } else if let Some(error) = &app.feed_error {
+        col()
+            .w_full()
+            .py(32.0)
+            .items_center()
+            .child(text(error).font(type_::BODY).color(theme::DANGER).wrap())
     } else if videos.is_empty() {
         col().w_full().py(32.0).items_center().child(
             text(empty_message(app))
@@ -1502,7 +1520,6 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     if app.active_tab == AppTab::Search {
         root = root.child(render_search_bar(app));
     }
-    let _ = cx;
     // Paging hangs off the viewport: it reports when the reader is far from the bottom, once
     // per crossing rather than per frame, which is what makes this cheap.
     let mut viewport = col()
@@ -1961,23 +1978,19 @@ fn render_detail(app: &BiliGuga, video: &Video) -> El {
                 .color(theme::TEXT)
                 .truncate(),
         );
-    match &app.stats {
-        Some(stats) => {
-            for (label, value) in [
-                ("播放", &stats.view_count),
-                ("弹幕", &stats.danmaku_count),
-                ("点赞", &stats.like_count),
-                ("发布于", &stats.published_at),
-            ] {
-                // Two elements rather than one `format!`: this runs for every commit, and a
-                // label plus its value costs no allocation this way.
-                line = line
-                    .child(text(label).font(type_::SECTION).color(theme::TEXT_FAINT))
-                    .child(text(value).font(type_::SECTION).color(theme::TEXT_FAINT));
-            }
-        }
-        None => {
-            // Nothing has arrived yet: no numbers is honest, a row of dashes is noise.
+    // Nothing has arrived yet: no numbers is honest, where a row of dashes is noise.
+    if let Some(stats) = &app.stats {
+        for (label, value) in [
+            ("播放", &stats.view_count),
+            ("弹幕", &stats.danmaku_count),
+            ("点赞", &stats.like_count),
+            ("发布于", &stats.published_at),
+        ] {
+            // Two elements rather than one `format!`: this runs on every commit, and a label
+            // plus its value costs no allocation this way.
+            line = line
+                .child(text(label).font(type_::SECTION).color(theme::TEXT_FAINT))
+                .child(text(value).font(type_::SECTION).color(theme::TEXT_FAINT));
         }
     }
     line
@@ -2113,7 +2126,7 @@ fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     if app.player_fullscreen {
         return root.child(render_player(app));
     }
-    root = root.child(render_sidebar(app)).child(render_feed(app, cx));
+    root = root.child(render_sidebar(app)).child(render_feed(app));
     root.child(render_player(app))
 }
 
@@ -2261,10 +2274,11 @@ impl BiliGuga {
                         app.trim_home_items();
                         app.new_rows = true;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // Put the page number back so a retry asks for this page again.
                         app.home_page = app.home_page.saturating_sub(1);
                         app.home_has_more = false;
+                        app.feed_error = Some(error);
                     }
                 }
             }
@@ -2276,7 +2290,7 @@ impl BiliGuga {
                         app.selected = None;
                         app.new_rows = true;
                     }
-                    Err(error) => app.playback_error = Some(error),
+                    Err(error) => app.feed_error = Some(error),
                 }
             }
             // The four signed-in feeds answer the same way, so they are handled in one arm with
@@ -2290,11 +2304,14 @@ impl BiliGuga {
                     return;
                 }
                 app.author_loading = false;
-                if let Ok(page) = result {
-                    app.author_page = page.page;
-                    app.author_has_more = page.has_more;
-                    app.author_videos.extend(page.videos);
-                    app.new_rows = true;
+                match result {
+                    Ok(page) => {
+                        app.author_page = page.page;
+                        app.author_has_more = page.has_more;
+                        app.author_videos.extend(page.videos);
+                        app.new_rows = true;
+                    }
+                    Err(error) => app.feed_error = Some(error),
                 }
             }
             Event::VideoContext(context) => {
@@ -2867,6 +2884,20 @@ mod tests {
         app.history_report_in_flight = true;
         app.apply(Event::HistoryReported);
         assert!(!app.history_report_in_flight, "the gate opened again");
+    }
+
+    /// A feed that fails to load says so in the column the viewer is looking at. It used to
+    /// write its error into `playback_error`, which only the player column draws, so the
+    /// viewer saw an empty feed and no reason for it.
+    #[test]
+    fn a_feed_failure_is_reported_in_the_feed() {
+        let mut app = BiliGuga::new();
+        app.apply(Event::Search(Err("网络不给力".into())));
+        assert_eq!(app.feed_error.as_deref(), Some("网络不给力"));
+        assert!(
+            app.playback_error.is_none(),
+            "the player's error is untouched"
+        );
     }
 
     /// An action's result lands as a note, not as a playback error: the two used to share one
