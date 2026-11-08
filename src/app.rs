@@ -3030,3 +3030,273 @@ mod perf_tests {
         eprintln!("{} covers in {:?}", urls.len(), started.elapsed());
     }
 }
+
+#[cfg(test)]
+mod stress {
+    //! Load tests, run with `cargo test --release stress -- --ignored --nocapture`.
+    //!
+    //! These drive the real view over the real `Runtime`: the same code the window runs, with a
+    //! fixed virtual clock, so a number here is a number the app would pay. `#[ignore]` because
+    //! they are slow and because their output is a report, not an assertion about right/wrong —
+    //! the assertions are loose bounds that catch a regression, not a target.
+    use super::*;
+    use crate::metrics::{self, mib};
+    use std::time::Instant;
+
+    fn runtime_with(videos: usize) -> rune::Runtime<BiliGuga> {
+        let mut app = BiliGuga::new();
+        app.videos = demo_videos(videos);
+        app.loading = false;
+        app.home_loading = false;
+        rune::Runtime::new(app, view, (1360.0, 820.0), rune::Env::new(true, 1.0))
+    }
+
+    /// The cost of a commit while the home feed scrolls, which is what the app does most.
+    ///
+    /// `BILIGUGA_STRESS_FRAMES` raises the frame count, for profiling: the default run is far
+    /// too short for a sampler to see anything.
+    #[test]
+    #[ignore = "slow: a load test, run explicitly"]
+    fn scroll_cost_over_a_full_home_feed() {
+        let mut rt = runtime_with(HOME_MAX_ITEMS);
+        rt.frame(0.0);
+        let before = metrics::sample();
+
+        let started = Instant::now();
+        let frames = std::env::var("BILIGUGA_STRESS_FRAMES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(240);
+        for step in 0..frames {
+            // A trackpad-ish delta, with the pointer over the grid.
+            rt.wheel_xy(300.0, 400.0, 0.0, -40.0);
+            rt.frame(step as f64 / 60.0);
+        }
+        let elapsed = started.elapsed();
+        let after = metrics::sample();
+
+        let per_frame = elapsed.as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!(
+            "scroll: {frames} commits over {} rows in {elapsed:?} ({per_frame:.2} ms/frame)",
+            HOME_MAX_ITEMS
+        );
+        if let (Some(before), Some(after)) = (before, after) {
+            eprintln!(
+                "  memory: rss {:.1} -> {:.1} MiB (peak {:.1}), cpu {:.2}s",
+                mib(before.rss),
+                mib(after.rss),
+                mib(after.rss_peak),
+                after.cpu_seconds - before.cpu_seconds,
+            );
+        }
+        // A commit that costs a whole frame budget would be a design problem, not a slow path.
+        assert!(per_frame < 16.0, "a scroll commit took {per_frame:.2} ms");
+    }
+
+    /// Paging in new rows: the append, the trim, and the cover requests that follow.
+    #[test]
+    #[ignore = "slow: a load test, run explicitly"]
+    fn paging_to_the_retention_limit_does_not_grow_memory() {
+        let mut rt = runtime_with(0);
+        rt.frame(0.0);
+        let before = metrics::sample().expect("a sample");
+
+        let mut appended = 0usize;
+        // Paging in a loop: the number that matters is whether RSS keeps climbing once the
+        // feed is at its limit, not how much a fresh process costs. Comparing against the
+        // starting RSS would measure the first pages filling the retention window, which is
+        // work the app is supposed to do.
+        let mut settled = 0.0;
+        for page in 0..40 {
+            // The same shape `Event::Home` produces, without the network.
+            let batch = demo_videos(20);
+            appended += batch.len();
+            rt.state.videos.extend(batch);
+            rt.state.trim_home_items();
+            rt.state.new_rows = true;
+            rt.frame(page as f64 / 60.0);
+            if page == 9 {
+                // Ten pages in, the feed has long been at its retention limit.
+                settled = mib(metrics::sample().expect("a sample").rss);
+            }
+        }
+        let after = metrics::sample().expect("a sample");
+        eprintln!(
+            "paging: appended {appended} rows, kept {}, rss {:.1} -> {:.1} -> {:.1} MiB (settled -> end)",
+            rt.state.videos.len(),
+            mib(before.rss),
+            settled,
+            mib(after.rss),
+        );
+        assert!(
+            rt.state.videos.len() <= HOME_MAX_ITEMS,
+            "the feed grew past its retention limit: {}",
+            rt.state.videos.len()
+        );
+        // Thirty more pages after the feed settled: a leak shows here, a full retention window
+        // does not.
+        let growth = mib(after.rss) - settled;
+        assert!(
+            growth < 8.0,
+            "paging 30 more pages kept another {growth:.1} MiB: the retention limit is not \
+             releasing rows"
+        );
+    }
+
+    /// Covers arriving for rows that have since scrolled out of the feed. This is the shape of
+    /// the leak the earlier pass found: the image cache held every thumbnail ever decoded.
+    #[test]
+    #[ignore = "slow: a load test, run explicitly"]
+    fn covers_for_evicted_rows_are_released() {
+        let mut rt = runtime_with(0);
+        rt.state.images = Some(ImageCache::new(std::sync::Arc::new(|| {}) as rune::Waker));
+
+        // Twelve rounds of twenty rows, each round over the retention limit, each cover a real
+        // 160x90 buffer handed to the cache the way `attach_cover` does. RSS is read once the
+        // cache has settled rather than at the start: the first rounds fill it, which is the
+        // work the app is meant to do, and a leak shows in the rounds after that.
+        let mut settled = 0.0;
+        for round in 0..12 {
+            rt.state.videos.extend(demo_videos(20));
+            rt.state.trim_home_items();
+            for video in rt.state.videos.clone() {
+                let pixels = Rgba8::new(160, 90, vec![round as u8; 160 * 90 * 4]);
+                rt.state
+                    .attach_cover(video.bvid.clone(), std::sync::Arc::new(pixels));
+            }
+            rt.frame(round as f64 / 60.0);
+            if round == 5 {
+                settled = mib(metrics::sample().expect("a sample").rss);
+            }
+        }
+        let after = metrics::sample().expect("a sample");
+        eprintln!(
+            "covers: {} held for {} rows, rss settled {:.1} -> {:.1} MiB",
+            rt.state.cover_images.len(),
+            rt.state.videos.len(),
+            settled,
+            mib(after.rss),
+        );
+        assert!(
+            rt.state.cover_images.len() <= COVER_CACHE_LIMIT,
+            "the cover cache passed its limit: {}",
+            rt.state.cover_images.len()
+        );
+        // The six rounds after it settled must not keep the memory of six more cover sets.
+        let growth = mib(after.rss) - settled;
+        assert!(
+            growth < 8.0,
+            "covers for evicted rows kept another {growth:.1} MiB"
+        );
+    }
+
+    /// Comment rows through `memo`, which is where a page of 200 comments is rebuilt or reused.
+    #[test]
+    #[ignore = "slow: a load test, run explicitly"]
+    fn many_comment_rows_are_memoised() {
+        let mut rt = runtime_with(4);
+        rt.state.playing_video = Some(demo_video(0));
+        rt.state.comments = (0..200)
+            .map(|index| Comment {
+                rpid: index as i64,
+                username: format!("用户{index}"),
+                message: "这个镜头调色太舒服了，请问用的是什么预设？".into(),
+                like: 100,
+                time: "3 小时前".into(),
+            })
+            .collect();
+        rt.frame(0.0);
+
+        let started = Instant::now();
+        let frames = 60;
+        for step in 0..frames {
+            // A commit with no change to the comments: `memo` should reuse all 200 subtrees.
+            rt.state.new_rows = false;
+            rt.frame(step as f64 / 60.0);
+        }
+        let per_frame = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("comments: {frames} idle commits over 200 rows, {per_frame:.2} ms/frame");
+        assert!(per_frame < 16.0, "an idle commit took {per_frame:.2} ms");
+    }
+
+    /// A commit that rebuilds the whole tree rather than reusing `memo`d rows: what a state
+    /// change on the comments does, and the worst case for a long list.
+    #[test]
+    #[ignore = "slow: a load test, run explicitly"]
+    fn a_changed_comment_rebuilds_the_list() {
+        let mut rt = runtime_with(4);
+        rt.state.playing_video = Some(demo_video(0));
+        rt.state.comments = (0..200)
+            .map(|index| Comment {
+                rpid: index as i64,
+                username: format!("用户{index}"),
+                message: "这个镜头调色太舒服了".into(),
+                like: 100,
+                time: "3 小时前".into(),
+            })
+            .collect();
+        rt.frame(0.0);
+
+        let started = Instant::now();
+        let frames = 60;
+        for step in 0..frames {
+            // One new comment per commit: every row shifts and one is added.
+            rt.state.comments.push(Comment {
+                rpid: 1000 + step as i64,
+                username: "新用户".into(),
+                message: "刚看到这里".into(),
+                like: 0,
+                time: "刚刚".into(),
+            });
+            rt.frame(step as f64 / 60.0);
+        }
+        let per_frame = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("comments-append: {frames} commits, {per_frame:.2} ms/frame");
+        assert!(
+            per_frame < 16.0,
+            "a growing list took {per_frame:.2} ms per commit"
+        );
+    }
+
+    /// The player's steady state: frames land from mpv and the window repaints without the view
+    /// running. This is where a video client spends its time, so it is the number that matters.
+    #[test]
+    #[ignore = "slow: a load test, run explicitly"]
+    fn video_frames_do_not_rerun_the_view() {
+        let mut rt = runtime_with(12);
+        rt.state.playing_video = Some(demo_video(0));
+        let pixels = rune::Pixels::new();
+        pixels.set(1920, 1080, vec![0u8; 1920 * 1080 * 4]);
+        rt.state.player = mpv::MpvPlayer::new();
+        rt.frame(0.0);
+
+        // One buffer, rewritten in place: an 8 MiB `vec![]` per frame would measure the
+        // allocator, not the app, and that is what the first version of this test did.
+        let mut frame_buffer = vec![0u8; 1920 * 1080 * 4];
+        let before = metrics::sample().expect("a sample");
+        let started = Instant::now();
+        let frames = 300;
+        for step in 0..frames {
+            frame_buffer[0] = step as u8;
+            pixels.set(1920, 1080, std::mem::take(&mut frame_buffer));
+            frame_buffer = vec![0u8; 1920 * 1080 * 4];
+            rt.frame(step as f64 / 60.0);
+        }
+        let elapsed = started.elapsed();
+        let after = metrics::sample().expect("a sample");
+        let per_frame = elapsed.as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!(
+            "video: {frames} frame updates + commits in {elapsed:?} ({per_frame:.2} ms/frame)"
+        );
+        eprintln!(
+            "  cpu {:.2}s, rss {:.1} -> {:.1} MiB (peak {:.1})",
+            after.cpu_seconds - before.cpu_seconds,
+            mib(before.rss),
+            mib(after.rss),
+            mib(after.rss_peak),
+        );
+        // The upload itself is the renderer's cost and is not measured here (headless draws
+        // nothing); this bounds the app-side work per frame.
+        assert!(per_frame < 16.0, "a frame landed in {per_frame:.2} ms");
+    }
+}
