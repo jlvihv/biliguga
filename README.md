@@ -94,6 +94,8 @@ git push origin v0.1.0
 
 GPUI 版本保留在 `main` 分支上，标签 `gpui-final`。
 
+已知问题：Rune 内置的 Parley 没开 `complex-scripts`，所以中文按字断行而不是按词，启动时 stderr 会打印几行 `ICU4X data error: No segmentation model for complex script: Chinese/Japanese`。这只影响断行的美观，不影响功能；上游修好后会自动消失。
+
 ## 许可证
 
 本项目使用 MIT 许可证。项目依赖的 Rune、libmpv、FFmpeg 等组件分别遵循其自身许可证。
