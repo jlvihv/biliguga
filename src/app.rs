@@ -879,35 +879,114 @@ fn card_cover(video: &Video, image: Option<&Image>, width: f32, height: f32) -> 
     frame
 }
 
-fn sidebar_item(label: &'static str, glyph: &'static str, active: bool, tab: AppTab) -> El {
-    let mut item = col()
+/// An icon drawn from lines rather than taken from the text font.
+///
+/// A house, a play mark, a clock, a bookmark, a star and a person all exist in whatever font
+/// happens to be installed, at different widths and weights and sometimes missing entirely;
+/// a column of mismatched shapes is exactly what a sidebar looks like when it borrows glyphs.
+fn sidebar_icon(icon: SidebarIcon, color: Color) -> El {
+    let mut shape = rune::Shape::new().view_box(16.0, 16.0);
+    match icon {
+        SidebarIcon::Home => {
+            shape = shape
+                .stroke(vec![[2.5, 7.5], [8.0, 2.5], [13.5, 7.5]], 1.4, color)
+                .stroke(vec![[4.5, 6.5], [4.5, 13.5], [11.5, 13.5], [11.5, 6.5]], 1.4, color);
+        }
+        SidebarIcon::Dynamic => {
+            // A triangle inside a circle: the play mark a feed of videos suggests.
+            let mut circle = Vec::with_capacity(25);
+            for step in 0..=24 {
+                let angle = step as f32 * std::f32::consts::TAU / 24.0;
+                circle.push([8.0 + 6.3 * angle.cos(), 8.0 + 6.3 * angle.sin()]);
+            }
+            shape = shape
+                .stroke(circle, 1.3, color)
+                .fill(vec![[6.6, 5.4], [10.8, 8.0], [6.6, 10.6]], color);
+        }
+        SidebarIcon::History => {
+            shape = shape
+                .stroke(
+                    vec![
+                        [13.0, 8.0],
+                        [11.0, 10.8],
+                        [8.0, 12.6],
+                        [5.0, 10.8],
+                        [3.0, 8.0],
+                        [5.0, 5.2],
+                        [8.0, 3.4],
+                        [11.0, 5.2],
+                        [13.0, 8.0],
+                    ],
+                    1.4,
+                    color,
+                )
+                .stroke(vec![[8.0, 5.2], [8.0, 8.3], [10.2, 9.4]], 1.3, color);
+        }
+        SidebarIcon::WatchLater => {
+            shape = shape.stroke(
+                vec![[4.0, 2.5], [12.0, 2.5], [12.0, 13.5], [8.0, 10.6], [4.0, 13.5], [4.0, 2.5]],
+                1.4,
+                color,
+            );
+        }
+        SidebarIcon::Favorites => {
+            let mut points = Vec::with_capacity(11);
+            for step in 0..10 {
+                let angle =
+                    -std::f32::consts::FRAC_PI_2 + step as f32 * std::f32::consts::PI / 5.0;
+                let radius = if step % 2 == 0 { 6.2 } else { 2.7 };
+                points.push([8.0 + radius * angle.cos(), 8.0 + radius * angle.sin()]);
+            }
+            points.push(points[0]);
+            shape = shape.stroke(points, 1.3, color);
+        }
+        SidebarIcon::Login => {
+            // A person: a head and shoulders, so it cannot be read as the feed's mark.
+            let mut head = Vec::with_capacity(17);
+            for step in 0..=16 {
+                let angle = step as f32 * std::f32::consts::TAU / 16.0;
+                head.push([8.0 + 2.9 * angle.cos(), 5.4 + 2.9 * angle.sin()]);
+            }
+            shape = shape.stroke(head, 1.3, color).stroke(
+                vec![[3.2, 14.0], [4.6, 10.4], [8.0, 9.4], [11.4, 10.4], [12.8, 14.0]],
+                1.3,
+                color,
+            );
+        }
+    }
+    // The canvas *is* the icon: as a child of a sized wrapper it would lay out at zero width
+    // and only its first stroke would draw.
+    rune::canvas(shape).size(16.0, 16.0).shrink()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarIcon {
+    Home,
+    Dynamic,
+    History,
+    WatchLater,
+    Favorites,
+    Login,
+}
+
+fn sidebar_item(label: &'static str, icon: SidebarIcon, active: bool, tab: AppTab) -> El {
+    let (fill, glyph, caption) = if active {
+        (theme::ACTIVE_ROW, theme::ACCENT_SOFT, theme::ACCENT_SOFT)
+    } else {
+        (Color::TRANSPARENT, theme::TEXT_DIM, theme::TEXT_FAINT)
+    };
+    col()
         .w(SIDEBAR_WIDTH)
         .h(52.0)
         .items_center()
         .justify_center()
-        .gap(2.0)
+        .gap(3.0)
         .cursor(rune::Cursor::Pointer)
+        .fill(fill)
         .hover(theme::HOVER)
-        .on_press(move |app: &mut BiliGuga| app.show_tab(tab));
-    if active {
-        item = item
-            .fill(theme::ACTIVE_ROW)
-            .child(text(glyph).font(type_::TITLE).color(theme::TEXT))
-            .child(
-                text(label)
-                    .font(type_::SECTION)
-                    .color(theme::ACCENT_SOFT),
-            );
-    } else {
-        item = item
-            .child(text(glyph).font(type_::TITLE).color(theme::TEXT_DIM))
-            .child(
-                text(label)
-                    .font(type_::SECTION)
-                    .color(theme::TEXT_FAINT),
-            );
-    }
-    item
+        .on_press(move |app: &mut BiliGuga| app.show_tab(tab))
+        .child(sidebar_icon(icon, glyph))
+        .child(text(label).font(type_::SECTION).color(caption))
 }
 
 fn render_sidebar(app: &BiliGuga) -> El {
@@ -918,19 +997,12 @@ fn render_sidebar(app: &BiliGuga) -> El {
         .py(8.0)
         .gap(4.0)
         .fill(theme::BG)
-        .child(sidebar_item("首页", "⌂", app.active_tab == AppTab::Home, AppTab::Home))
-        .child(sidebar_item("动态", "◈", app.active_tab == AppTab::Dynamic, AppTab::Dynamic))
-        .child(sidebar_item("历史", "◷", app.active_tab == AppTab::History, AppTab::History))
-        .child(sidebar_item("稍后", "▤", app.active_tab == AppTab::WatchLater, AppTab::WatchLater))
-        .child(sidebar_item("收藏", "★", app.active_tab == AppTab::Favorites, AppTab::Favorites))
-        .child(
-            sidebar_item(
-                "登录",
-                "◎",
-                app.active_tab == AppTab::Login,
-                AppTab::Login,
-            ),
-        )
+        .child(sidebar_item("首页", SidebarIcon::Home, app.active_tab == AppTab::Home, AppTab::Home))
+        .child(sidebar_item("动态", SidebarIcon::Dynamic, app.active_tab == AppTab::Dynamic, AppTab::Dynamic))
+        .child(sidebar_item("历史", SidebarIcon::History, app.active_tab == AppTab::History, AppTab::History))
+        .child(sidebar_item("稍后", SidebarIcon::WatchLater, app.active_tab == AppTab::WatchLater, AppTab::WatchLater))
+        .child(sidebar_item("收藏", SidebarIcon::Favorites, app.active_tab == AppTab::Favorites, AppTab::Favorites))
+        .child(sidebar_item("登录", SidebarIcon::Login, app.active_tab == AppTab::Login, AppTab::Login))
 }
 
 /// One row of the feed: a 16:9 cover, the title over two lines, and the uploader and duration.
