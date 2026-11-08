@@ -36,7 +36,7 @@ use rune::{
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -172,11 +172,11 @@ enum PlaybackState {
     Paused,
 }
 
+/// Which popup the player has open. Only one kind exists: speed cycles in place and the
+/// collection is reached with previous/next, so neither ever needed a menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayerMenu {
-    Speed,
     Quality,
-    Collection,
 }
 
 /// One answer from background work, drained by `poll` at the top of a frame.
@@ -601,6 +601,11 @@ impl BiliGuga {
     // ---- Playback ------------------------------------------------------------------------
 
     fn play_video(&mut self, video: Video) {
+        // Release the previous stream first: its decoder, its audio track and its frame buffer
+        // all belong to the video being replaced. Without this a quality change left the old
+        // session decoding until the new one started.
+        self.stop_playback();
+        self.player_viewport_size = None;
         self.playing_video = Some(video.clone());
         self.playback = PlaybackState::Buffering;
         self.playback_error = None;
@@ -635,6 +640,16 @@ impl BiliGuga {
     }
 
     fn finish_play(&mut self, result: api::PlayUrlResult) {
+        // The play URL call resolved the ids it needed; keep them on the video so the history
+        // report and the detail call stop resolving them again.
+        if let Some(video) = self.playing_video.as_mut() {
+            if video.aid <= 0 {
+                video.aid = result.aid;
+            }
+            if video.cid <= 0 {
+                video.cid = result.cid;
+            }
+        }
         self.quality_options = result.qualities.clone();
         self.quality = result.actual_quality;
         self.player.load(
@@ -1705,19 +1720,35 @@ fn render_player(app: &BiliGuga) -> El {
                     let selected = option.qn == app.quality;
                     let quality = option.qn;
                     let label = option.label.clone();
+                    // `switchable` says whether the account may play this quality at all (4K
+                    // without a membership is listed but refused), so the menu says so rather
+                    // than letting the click fail with a server error.
+                    let allowed = option.switchable;
                     let mut row_el = row()
                         .w_full()
+                        .items_center()
+                        .gap(6.0)
                         .px(6.0)
                         .py(3.0)
                         .radius(4.0)
                         .cursor(rune::Cursor::Pointer)
                         .hover(theme::HOVER)
-                        .on_press(move |app: &mut BiliGuga| app.select_quality(quality))
-                        .child(
-                            text(label)
-                                .font(type_::LABEL)
-                                .color(if selected { theme::ACCENT_SOFT } else { theme::TEXT_DIM }),
-                        );
+                        .on_press(move |app: &mut BiliGuga| {
+                            if allowed {
+                                app.select_quality(quality)
+                            }
+                        })
+                        .child(text(label).font(type_::LABEL).color(if selected {
+                            theme::ACCENT_SOFT
+                        } else if allowed {
+                            theme::TEXT_DIM
+                        } else {
+                            theme::TEXT_FAINT
+                        }));
+                    if !allowed {
+                        row_el = row_el
+                            .child(text("需要会员").font(type_::SECTION).color(theme::TEXT_FAINT));
+                    }
                     if selected {
                         row_el = row_el.fill(theme::ACTIVE_ROW);
                     }
@@ -1834,30 +1865,41 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                 .h(150.0)
                 .scroll(ScrollSpec { stick_bottom: false })
                 .children(app.comments.iter().map(|comment| {
-                    col()
-                        .w_full()
-                        .gap(1.0)
-                        .padding(4.0)
-                        .child(
-                            row()
-                                .gap(6.0)
-                                .child(
-                                    text(comment.username.clone())
-                                        .font(type_::LABEL)
-                                        .color(theme::ACCENT_SOFT),
-                                )
-                                .child(
-                                    text(comment.time.clone())
-                                        .font(type_::SECTION)
-                                        .color(theme::TEXT_FAINT),
-                                ),
-                        )
-                        .child(
-                            text(comment.message.clone())
-                                .font(type_::LABEL)
-                                .color(theme::TEXT_DIM)
-                                .wrap(),
-                        )
+                    // A loaded comment never changes, so `memo` keeps its subtree across
+                    // commits: loading another page no longer re-builds and re-shapes every
+                    // comment already on screen, which is the expensive half of a list.
+                    rune::memo(format!("comment-{}", comment.rpid), comment.rpid, || {
+                        col()
+                            .w_full()
+                            .gap(1.0)
+                            .padding(4.0)
+                            .child(
+                                row()
+                                    .gap(6.0)
+                                    .child(
+                                        text(&comment.username)
+                                            .font(type_::LABEL)
+                                            .color(theme::ACCENT_SOFT),
+                                    )
+                                    .child(
+                                        text(&comment.time)
+                                            .font(type_::SECTION)
+                                            .color(theme::TEXT_FAINT),
+                                    )
+                                    .child(el().grow(1.0))
+                                    .child(
+                                        text(comment.like.to_string())
+                                            .font(type_::SECTION)
+                                            .color(theme::TEXT_FAINT),
+                                    ),
+                            )
+                            .child(
+                                text(&comment.message)
+                                    .font(type_::LABEL)
+                                    .color(theme::TEXT_DIM)
+                                    .wrap(),
+                            )
+                    })
                 })),
         );
         if app.comments_has_more {
@@ -1924,204 +1966,7 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
 
     while let Ok(event) = app.events.try_recv() {
         changed = true;
-        match event {
-            Event::Home(result, generation) => {
-                if generation != app.home_generation || app.active_tab != AppTab::Home {
-                    continue;
-                }
-                app.home_loading = false;
-                app.loading = false;
-                match result {
-                    Ok(page) => {
-                        let first_page = app.videos.is_empty();
-                        let old_len = app.videos.len();
-                        for video in page.videos {
-                            if !app.videos.iter().any(|current| current.bvid == video.bvid) {
-                                app.videos.push(video);
-                            }
-                        }
-                        let added = app.videos.len().saturating_sub(old_len);
-                        app.home_has_more = page.has_more && (first_page || added > 0);
-                        app.trim_home_items();
-                        app.new_rows = true;
-                    }
-                    Err(_) => {
-                        // Put the page number back so a retry asks for this page again.
-                        app.home_page = app.home_page.saturating_sub(1);
-                        app.home_has_more = false;
-                    }
-                }
-            }
-            Event::Search(result) => {
-                app.loading = false;
-                match result {
-                    Ok(videos) => {
-                        app.search_results = videos;
-                        app.selected = None;
-                        app.new_rows = true;
-                    }
-                    Err(error) => app.playback_error = Some(error),
-                }
-            }
-            Event::Dynamic(result) => {
-                app.dynamic_loading = false;
-                if let Ok(videos) = result {
-                    app.dynamic_videos = videos;
-                    app.new_rows = true;
-                }
-            }
-            Event::History(result) => {
-                app.history_loading = false;
-                if let Ok(videos) = result {
-                    app.history = videos;
-                    app.new_rows = true;
-                }
-            }
-            Event::WatchLater(result) => {
-                app.watch_later_loading = false;
-                if let Ok(videos) = result {
-                    app.watch_later = videos;
-                    app.new_rows = true;
-                }
-            }
-            Event::Favorites(result) => {
-                app.favorites_loading = false;
-                if let Ok(videos) = result {
-                    app.favorites = videos;
-                    app.new_rows = true;
-                }
-            }
-            Event::Author(result, generation) => {
-                if generation != app.author_generation {
-                    continue;
-                }
-                app.author_loading = false;
-                if let Ok(page) = result {
-                    app.author_page = page.page;
-                    app.author_has_more = page.has_more;
-                    app.author_videos.extend(page.videos);
-                    app.new_rows = true;
-                }
-            }
-            Event::VideoContext(context) => {
-                app.detail_view_count = context.view_count;
-                app.detail_danmaku_count = context.danmaku_count;
-                app.detail_like_count = context.like_count;
-                app.published_at = format_publish_date(context.pubdate);
-                app.collection = context.collection;
-                if let Some(video) = app.playing_video.as_mut() {
-                    if video.aid == 0 {
-                        video.aid = context.aid;
-                    }
-                    if video.cid == 0 {
-                        video.cid = context.cid;
-                    }
-                }
-            }
-            Event::PlayUrl(result) => match result {
-                Ok(play) => app.finish_play(play),
-                Err(error) => {
-                    app.playback = PlaybackState::Idle;
-                    app.playback_error = Some(error);
-                }
-            },
-            Event::Resume(progress) => {
-                app.cloud_resume_progress = progress.filter(|progress| *progress > 3.);
-                app.cloud_resume_applied = app.cloud_resume_progress.is_none();
-            }
-            Event::Comments(result, generation) => {
-                if generation != app.comments_generation {
-                    continue;
-                }
-                app.comments_loading = false;
-                match result {
-                    Ok((page, comments, total, has_more)) => {
-                        if page <= 1 {
-                            app.comments.clear();
-                        }
-                        app.comments.extend(comments);
-                        app.comments_total = total;
-                        app.comments_has_more = has_more;
-                        app.comments_page = page as u32;
-                    }
-                    Err(error) => app.comments_error = Some(error),
-                }
-            }
-            Event::Avatar(image) => {
-                if let Some(image) = image
-                    && let Some(cache) = app.images.as_ref()
-                {
-                    app.account_avatar =
-                        Some(cache.rgba(image.width, image.height, image.pixels.clone()));
-                }
-            }
-            Event::QrCode(result, generation) => {
-                if generation != app.login_generation {
-                    continue;
-                }
-                app.login_loading = false;
-                match result {
-                    Ok(data) => {
-                        app.login_key = Some(data.key);
-                        if let Some(cache) = app.images.as_ref() {
-                            app.login_qr = Some(cache.rgba(
-                                data.image.width,
-                                data.image.height,
-                                data.image.pixels.clone(),
-                            ));
-                        }
-                        app.login_status = "请使用哔哩哔哩 App 扫码登录".into();
-                        app.poll_login();
-                    }
-                    Err(error) => app.login_status = error,
-                }
-            }
-            Event::QrPoll(result, generation) => {
-                if generation != app.login_generation {
-                    continue;
-                }
-                match result {
-                    Ok(PollResult::Waiting) => app.poll_login(),
-                    Ok(PollResult::Scanned) => {
-                        app.login_status = "已扫码，请在手机上确认".into();
-                        app.poll_login();
-                    }
-                    Ok(PollResult::LoggedIn(session)) => {
-                        let _ = login::save_session(&session);
-                        app.session = Some(session);
-                        app.login_status = "登录成功".into();
-                        app.active_tab = AppTab::Home;
-                        app.load_home_page(true);
-                    }
-                    Ok(PollResult::Expired) => {
-                        app.login_status = "二维码已过期，请刷新".into();
-                        app.login_qr = None;
-                    }
-                    Err(error) => app.login_status = error,
-                }
-            }
-            Event::Session(result) => {
-                if let Ok(session) = result {
-                    let _ = login::save_session(&session);
-                    let face = session.face.clone();
-                    app.session = Some(session);
-                    app.load_dynamic();
-                    app.load_avatar(face);
-                }
-            }
-            Event::ActionDone(done, result) => {
-                app.action_note = Some(match result {
-                    Ok(()) => done.to_string(),
-                    Err(error) => error,
-                });
-            }
-            Event::CoverFailed(bvid) => {
-                app.covers_in_flight.remove(&bvid);
-            }
-            Event::HistoryReported => app.history_report_in_flight = false,
-            Event::Silent => {}
-            Event::Cover(bvid, pixels) => app.attach_cover(bvid, pixels),
-        }
+        app.apply(event);
     }
 
     if std::mem::take(&mut app.new_rows) {
@@ -2158,8 +2003,7 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
             && status.time_pos >= duration - 0.25
             && app.playback != PlaybackState::Buffering;
         if reaching_end {
-            app.playback = PlaybackState::Idle;
-            app.pending_pause = None;
+            app.stop_playback();
             changed = true;
         } else if app.playback == PlaybackState::Buffering && status.time_pos.is_finite() {
             app.playback = if status.paused {
@@ -2214,6 +2058,230 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     changed
+}
+
+
+impl BiliGuga {
+    /// Takes one answer from background work and folds it into the state.
+    ///
+    /// This was the body of `poll`'s drain loop, which made every case reachable only
+    /// through a frame. It is a plain method so a test can drive one event.
+    fn apply(&mut self, event: Event) {
+        let app = self;
+        match event {
+        Event::Home(result, generation) => {
+            if generation != app.home_generation || app.active_tab != AppTab::Home {
+                return;
+            }
+            app.home_loading = false;
+            app.loading = false;
+            match result {
+                Ok(page) => {
+                    let first_page = app.videos.is_empty();
+                    let old_len = app.videos.len();
+                    for video in page.videos {
+                        if !app.videos.iter().any(|current| current.bvid == video.bvid) {
+                            app.videos.push(video);
+                        }
+                    }
+                    let added = app.videos.len().saturating_sub(old_len);
+                    app.home_has_more = page.has_more && (first_page || added > 0);
+                    app.trim_home_items();
+                    app.new_rows = true;
+                }
+                Err(_) => {
+                    // Put the page number back so a retry asks for this page again.
+                    app.home_page = app.home_page.saturating_sub(1);
+                    app.home_has_more = false;
+                }
+            }
+        }
+        Event::Search(result) => {
+            app.loading = false;
+            match result {
+                Ok(videos) => {
+                    app.search_results = videos;
+                    app.selected = None;
+                    app.new_rows = true;
+                }
+                Err(error) => app.playback_error = Some(error),
+            }
+        }
+        Event::Dynamic(result) => {
+            app.dynamic_loading = false;
+            if let Ok(videos) = result {
+                app.dynamic_videos = videos;
+                app.new_rows = true;
+            }
+        }
+        Event::History(result) => {
+            app.history_loading = false;
+            if let Ok(videos) = result {
+                app.history = videos;
+                app.new_rows = true;
+            }
+        }
+        Event::WatchLater(result) => {
+            app.watch_later_loading = false;
+            if let Ok(videos) = result {
+                app.watch_later = videos;
+                app.new_rows = true;
+            }
+        }
+        Event::Favorites(result) => {
+            app.favorites_loading = false;
+            if let Ok(videos) = result {
+                app.favorites = videos;
+                app.new_rows = true;
+            }
+        }
+        Event::Author(result, generation) => {
+            if generation != app.author_generation {
+                return;
+            }
+            app.author_loading = false;
+            if let Ok(page) = result {
+                app.author_page = page.page;
+                app.author_has_more = page.has_more;
+                app.author_videos.extend(page.videos);
+                app.new_rows = true;
+            }
+        }
+        Event::VideoContext(context) => {
+            // An answer that lands after the viewer moved on would put the previous video's
+            // collection in the next video's menu.
+            let still_current = app
+                .playing_video
+                .as_ref()
+                .is_some_and(|video| video.aid == context.aid || video.aid <= 0);
+            if !still_current {
+                return;
+            }
+            app.detail_view_count = context.view_count;
+            app.detail_danmaku_count = context.danmaku_count;
+            app.detail_like_count = context.like_count;
+            app.published_at = format_publish_date(context.pubdate);
+            app.collection = context.collection;
+            if let Some(video) = app.playing_video.as_mut() {
+                if video.aid == 0 {
+                    video.aid = context.aid;
+                }
+                if video.cid == 0 {
+                    video.cid = context.cid;
+                }
+                // A collection episode carries the collection's owner, which is not always the
+                // uploader of this part; the detail endpoint knows the right one.
+                if !context.uploader.is_empty() {
+                    video.uploader = context.uploader.clone();
+                    video.uploader_mid = context.uploader_mid;
+                }
+            }
+        }
+        Event::PlayUrl(result) => match result {
+            Ok(play) => app.finish_play(play),
+            Err(error) => {
+                app.playback = PlaybackState::Idle;
+                app.playback_error = Some(error);
+            }
+        },
+        Event::Resume(progress) => {
+            app.cloud_resume_progress = progress.filter(|progress| *progress > 3.);
+            app.cloud_resume_applied = app.cloud_resume_progress.is_none();
+        }
+        Event::Comments(result, generation) => {
+            if generation != app.comments_generation {
+                return;
+            }
+            app.comments_loading = false;
+            match result {
+                Ok((page, comments, total, has_more)) => {
+                    if page <= 1 {
+                        app.comments.clear();
+                    }
+                    app.comments.extend(comments);
+                    app.comments_total = total;
+                    app.comments_has_more = has_more;
+                    app.comments_page = page as u32;
+                }
+                Err(error) => app.comments_error = Some(error),
+            }
+        }
+        Event::Avatar(image) => {
+            if let Some(image) = image
+                && let Some(cache) = app.images.as_ref()
+            {
+                app.account_avatar =
+                    Some(cache.rgba(image.width, image.height, image.pixels.clone()));
+            }
+        }
+        Event::QrCode(result, generation) => {
+            if generation != app.login_generation {
+                return;
+            }
+            app.login_loading = false;
+            match result {
+                Ok(data) => {
+                    app.login_key = Some(data.key);
+                    if let Some(cache) = app.images.as_ref() {
+                        app.login_qr = Some(cache.rgba(
+                            data.image.width,
+                            data.image.height,
+                            data.image.pixels.clone(),
+                        ));
+                    }
+                    app.login_status = "请使用哔哩哔哩 App 扫码登录".into();
+                    app.poll_login();
+                }
+                Err(error) => app.login_status = error,
+            }
+        }
+        Event::QrPoll(result, generation) => {
+            if generation != app.login_generation {
+                return;
+            }
+            match result {
+                Ok(PollResult::Waiting) => app.poll_login(),
+                Ok(PollResult::Scanned) => {
+                    app.login_status = "已扫码，请在手机上确认".into();
+                    app.poll_login();
+                }
+                Ok(PollResult::LoggedIn(session)) => {
+                    let _ = login::save_session(&session);
+                    app.session = Some(session);
+                    app.login_status = "登录成功".into();
+                    app.active_tab = AppTab::Home;
+                    app.load_home_page(true);
+                }
+                Ok(PollResult::Expired) => {
+                    app.login_status = "二维码已过期，请刷新".into();
+                    app.login_qr = None;
+                }
+                Err(error) => app.login_status = error,
+            }
+        }
+        Event::Session(result) => {
+            if let Ok(session) = result {
+                let _ = login::save_session(&session);
+                let face = session.face.clone();
+                app.session = Some(session);
+                app.load_dynamic();
+                app.load_avatar(face);
+            }
+        }
+        Event::ActionDone(done, result) => {
+            app.action_note = Some(match result {
+                Ok(()) => done.to_string(),
+                Err(error) => error,
+            });
+        }
+        Event::CoverFailed(bvid) => {
+            app.covers_in_flight.remove(&bvid);
+        }
+        Event::HistoryReported => app.history_report_in_flight = false,
+        Event::Silent => {}
+        Event::Cover(bvid, pixels) => app.attach_cover(bvid, pixels),
+        }
+    }
 }
 
 fn on_key(app: &mut BiliGuga, event: &KeyEvent, tx: &mut Tx) -> bool {
@@ -2330,83 +2398,109 @@ fn fetch_qr_code_event() -> impl std::future::Future<Output = Result<login::QrCo
 
 /// Builds a feed of placeholder videos, so `--snap feed` can check the layout without a
 /// network round trip. Only reachable from a named scene.
+/// Demo rows that carry a cover URL, for the tests that exercise the cover queue.
+/// Placeholder rows so `--snap` can check the layout without a network round trip. Only
+/// reachable from a named scene, never from the running app.
+const DEMO_TITLES: [&str; 8] = [
+    "【4K】这可能是今年最好看的旅行短片，一次看遍北海道",
+    "用 Rust 从零写一个窗口管理器｜第一期：到底难在哪",
+    "深夜食堂：一个人也要好好吃饭",
+    "钢琴改编《千本樱》，手指快到看不清",
+    "拆解一台二十年前的随身听，里面比想象中复杂",
+    "3 小时讲透线性代数，看完你就懂了",
+    "在海拔 5000 米看星空，是什么体验",
+    "手工复原宋代点茶，全过程",
+];
+const DEMO_UPLOADERS: [&str; 8] = [
+    "影视飓风",
+    "Rust 语言中文社区",
+    "曼食慢语",
+    "指尖琴键",
+    "硬件茶谈",
+    "3Blue1Brown",
+    "星球研究所",
+    "南翔不爱吃饭",
+];
+const DEMO_ACCENTS: [u32; 6] = [0x3e4654, 0x39455a, 0x4b4240, 0x4c4255, 0x354c4a, 0x46503d];
+
+fn demo_video(index: usize) -> Video {
+    Video {
+        bvid: format!("BV1demo{index:04}"),
+        aid: 1000 + index as i64,
+        cid: 2000 + index as i64,
+        title: DEMO_TITLES[index % DEMO_TITLES.len()].to_string(),
+        uploader: DEMO_UPLOADERS[index % DEMO_UPLOADERS.len()].to_string(),
+        uploader_mid: 100 + index as i64,
+        duration: format!("{:02}:{:02}", 3 + index % 40, index * 7 % 60),
+        cover: String::new(),
+        accent: DEMO_ACCENTS[index % DEMO_ACCENTS.len()],
+    }
+}
+
 fn demo_videos(count: usize) -> Vec<Video> {
-    let titles = [
-        "【4K】这可能是今年最好看的旅行短片，一次看遍北海道",
-        "用 Rust 从零写一个窗口管理器｜第一期：到底难在哪",
-        "深夜食堂：一个人也要好好吃饭",
-        "钢琴改编《千本樱》，手指快到看不清",
-        "拆解一台二十年前的随身听，里面比想象中复杂",
-        "3 小时讲透线性代数，看完你就懂了",
-        "在海拔 5000 米看星空，是什么体验",
-        "手工复原宋代点茶，全过程",
-    ];
-    let uploaders = [
-        "影视飓风",
-        "Rust 语言中文社区",
-        "曼食慢语",
-        "指尖琴键",
-        "硬件茶谈",
-        "3Blue1Brown",
-        "星球研究所",
-        "南翔不爱吃饭",
-    ];
+    (0..count).map(demo_video).collect()
+}
+
+/// Demo rows that carry a cover URL, for the tests that exercise the cover queue.
+#[cfg(test)]
+fn demo_video_with_covers(count: usize) -> Vec<Video> {
     (0..count)
-        .map(|index| Video {
-            bvid: format!("BV1demo{index:04}"),
-            aid: 1000 + index as i64,
-            cid: 2000 + index as i64,
-            title: titles[index % titles.len()].to_string(),
-            uploader: uploaders[index % uploaders.len()].to_string(),
-            uploader_mid: 100 + index as i64,
-            duration: format!("{:02}:{:02}", 3 + index % 40, index * 7 % 60),
-            cover: String::new(),
-            accent: [
-                0x3e4654, 0x39455a, 0x4b4240, 0x4c4255, 0x354c4a, 0x46503d,
-            ][index % 6],
+        .map(|index| {
+            let mut video = demo_video(index);
+            video.cover = format!("https://example.invalid/{index}.jpg");
+            video
         })
         .collect()
 }
 
 /// Named states for `--snap`: each seeds the app so a headless run shows a real screen.
-fn scenes() -> &'static [(&'static str, fn(&mut BiliGuga))] {
-    fn feed(app: &mut BiliGuga) {
-        app.videos = demo_videos(12);
-        app.loading = false;
-        app.home_loading = false;
-    }
-    fn player(app: &mut BiliGuga) {
-        app.videos = demo_videos(12);
-        app.loading = false;
-        app.home_loading = false;
-        app.playing_video = Some(demo_videos(1).remove(0));
-        app.playback = PlaybackState::Buffering;
-        app.show_controls();
-        app.detail_view_count = "128.4万".into();
-        app.detail_danmaku_count = "1.2万".into();
-        app.detail_like_count = "9.8万".into();
-        app.comments = (0..6)
-            .map(|index| Comment {
-                rpid: index as i64,
-                username: format!("用户{}", index + 1),
-                message: "这个镜头调色太舒服了，请问用的是什么预设？".into(),
-                like: 128 - index as i64,
-                time: "3 小时前".into(),
-            })
-            .collect();
-        app.comments_total = 6;
-    }
-    fn search(app: &mut BiliGuga) {
-        app.videos = demo_videos(12);
-        app.loading = false;
-        app.home_loading = false;
-        app.active_tab = AppTab::Search;
-        app.search_results = demo_videos(8);
-        app.search_query = "旅行短片".into();
-        app.search_edit = TextEdit::new("旅行短片");
-    }
-    static SCENES: OnceLock<Vec<(&'static str, fn(&mut BiliGuga))>> = OnceLock::new();
-    SCENES.get_or_init(|| vec![("feed", feed as fn(&mut BiliGuga)), ("player", player), ("search", search)])
+///
+/// A `const` table, not a lazily built `Vec`: Rune asks for `&'static [..]` once at startup, so
+/// a `OnceLock` around it bought an allocation and an indirection and nothing else.
+type Scene = (&'static str, fn(&mut BiliGuga));
+const SCENES: &[Scene] = &[
+    ("feed", seed_feed),
+    ("player", seed_player),
+    ("search", seed_search),
+];
+
+fn seed_loaded(app: &mut BiliGuga) {
+    app.videos = demo_videos(12);
+    app.loading = false;
+    app.home_loading = false;
+}
+
+fn seed_feed(app: &mut BiliGuga) {
+    seed_loaded(app);
+}
+
+fn seed_player(app: &mut BiliGuga) {
+    seed_loaded(app);
+    app.playing_video = Some(demo_video(0));
+    app.playback = PlaybackState::Buffering;
+    app.show_controls();
+    app.detail_view_count = "128.4万".into();
+    app.detail_danmaku_count = "1.2万".into();
+    app.detail_like_count = "9.8万".into();
+    app.published_at = "2026-11-02 18:20".into();
+    app.comments = (0..6)
+        .map(|index| Comment {
+            rpid: index as i64,
+            username: format!("用户{}", index + 1),
+            message: "这个镜头调色太舒服了，请问用的是什么预设？".into(),
+            like: 128 - index as i64,
+            time: "3 小时前".into(),
+        })
+        .collect();
+    app.comments_total = 6;
+}
+
+fn seed_search(app: &mut BiliGuga) {
+    seed_loaded(app);
+    app.active_tab = AppTab::Search;
+    app.search_results = demo_videos(8);
+    app.search_query = "旅行短片".into();
+    app.search_edit = TextEdit::new("旅行短片");
 }
 
 pub(crate) fn launch() {
@@ -2414,7 +2508,7 @@ pub(crate) fn launch() {
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
-        scenes: scenes(),
+        scenes: SCENES,
         ..AppSpec::new("哔哩咕嘎", (1360.0, 820.0), BiliGuga::new, view)
     });
 }
@@ -2560,6 +2654,75 @@ mod tests {
         assert!(non_black > 0, "the player never reported a playhead");
     }
 
+    /// Paging records the page when the request goes out. Recording it only when the answer
+    /// landed let two requests in flight both ask for page 1; and the first call in `setup`
+    /// was turned away by a guard that started closed, so the feed never loaded at all.
+    #[test]
+    fn requesting_a_home_page_advances_the_number_immediately() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        assert!(!app.home_loading, "nothing is in flight before the first request");
+        assert_eq!(app.home_page, 0);
+        app.load_home_page(false);
+        assert_eq!(app.home_page, 1, "page 1 is recorded when it is asked for");
+        assert!(app.home_loading, "and it is in flight now");
+        app.home_loading = false;
+        app.load_home_page(false);
+        assert_eq!(app.home_page, 2, "the next request asks for page 2, not page 1 again");
+    }
+
+    /// A cover is asked for once per bvid. Every page load used to re-request every cover that
+    /// was still missing, so the same download could be queued many times over.
+    #[test]
+    fn a_cover_is_only_requested_once_while_in_flight() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_video_with_covers(3);
+        app.request_missing_covers();
+        assert_eq!(app.covers_in_flight.len(), 3, "one per row");
+        app.request_missing_covers();
+        assert_eq!(app.covers_in_flight.len(), 3, "no duplicates");
+    }
+
+    /// A cover that failed has to free its bvid, or that row never gets one.
+    #[test]
+    fn a_failed_cover_can_be_asked_for_again() {
+        let mut app = BiliGuga::new();
+        app.covers_in_flight.insert("BV1demo0000".into());
+        app.apply(Event::CoverFailed("BV1demo0000".into()));
+        assert!(app.covers_in_flight.is_empty(), "the bvid is free again");
+    }
+
+    /// The history report's in-flight gate has to open again, or history is uploaded exactly
+    /// once per video and never again.
+    #[test]
+    fn a_finished_history_report_lets_the_next_one_run() {
+        let mut app = BiliGuga::new();
+        app.history_report_in_flight = true;
+        app.apply(Event::HistoryReported);
+        assert!(!app.history_report_in_flight, "the gate opened again");
+    }
+
+    /// An action's result lands as a note, not as a playback error: the two used to share one
+    /// field, guessed apart by looking for the word 失败 inside the message.
+    #[test]
+    fn an_action_result_is_a_note_not_a_playback_error() {
+        let mut app = BiliGuga::new();
+        app.apply(Event::ActionDone("已点赞", Ok(())));
+        assert_eq!(app.action_note.as_deref(), Some("已点赞"));
+        assert!(app.playback_error.is_none());
+        app.apply(Event::ActionDone("已投币", Err("未登录".into())));
+        assert_eq!(app.action_note.as_deref(), Some("未登录"));
+    }
+
     /// The feed lays out from a plain state, which is what `--snap` shows too.
     #[test]
     fn the_view_builds_from_a_seeded_feed() {
@@ -2628,7 +2791,12 @@ mod live_tests {
         assert_eq!((image.width, image.height), (160, 90));
         assert_eq!(image.pixels.len(), 160 * 90 * 4);
         assert!(
-            image.pixels.chunks_exact(4).any(|pixel| pixel[0] > 8 || pixel[1] > 8),
+            image
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] > 8 || pixel[1] > 8),
             "the cover decoded to a blank image"
         );
     }
