@@ -71,6 +71,15 @@ pub(crate) fn text(value: Option<&Value>) -> String {
     }
 }
 
+/// The text of a JSON string field, borrowed. `None` for anything that is not a string.
+///
+/// `text()` returns an owned `String` and is what most of the parsers want, but the ones that
+/// only pass the value on to another function (a cleaner, a URL fixer) would allocate a
+/// `String` just to borrow it for one call. This is that borrow.
+fn str_of(value: Option<&Value>) -> &str {
+    value.and_then(Value::as_str).unwrap_or("")
+}
+
 pub(crate) fn with_cookie(request: RequestBuilder, cookie: Option<&str>) -> RequestBuilder {
     if let Some(cookie) = cookie.filter(|cookie| !cookie.is_empty()) {
         request.header("Cookie", cookie)
@@ -125,12 +134,16 @@ fn compact_number(value: i64) -> String {
     }
 }
 
+/// A clip's length as `mm:ss`, from a JSON seconds count.
+///
+/// Same shape as [`Clock`], and it now goes through it: this used to be a second copy of the
+/// same `format!("{:02}:{:02}")`, which is where the two could drift apart.
 fn duration(value: Option<&Value>) -> String {
     let seconds = number(value);
     if seconds <= 0 {
         return "--:--".into();
     }
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    Clock::new(seconds as f64).as_str().to_string()
 }
 
 /// A clock reading, written into a fixed buffer.
@@ -409,11 +422,17 @@ pub(crate) async fn download_avatar(url: &str) -> Option<Arc<Rgba8>> {
     decode_image(&bytes, 160, 160)
 }
 
+/// A BV id, or `None` for a row that has none.
+///
+/// Eight parsers wrote the same "read it, bail if it is empty" pair; the id is also the only
+/// field every one of them requires, since it is what a row is keyed and played by.
+fn bvid_of(value: Option<&Value>) -> Option<String> {
+    let bvid = text(value);
+    (!bvid.is_empty()).then_some(bvid)
+}
+
 fn parse_video(item: &Value, index: usize) -> Option<Video> {
-    let bvid = text(item.get("bvid"));
-    if bvid.is_empty() {
-        return None;
-    }
+    let bvid = bvid_of(item.get("bvid"))?;
     // 推荐接口使用 `id` 表示 AV 号，详情/其它接口通常使用 `aid`。
     // 两者都兼容，否则推荐流中的视频无法上报观看记录和续播进度。
     let aid = number(item.get("aid"));
@@ -431,45 +450,66 @@ fn parse_video(item: &Value, index: usize) -> Option<Video> {
     })
 }
 
-fn clean_search_text(value: String) -> String {
+/// Strips the `<em class="keyword">` markup Bilibili wraps search hits in, and unescapes the
+/// entities it leaves behind.
+///
+/// Bypassing the tags and decoding the entity happen in one pass into one buffer. The old
+/// version built the stripped text and then ran `str::replace` five times, and `replace`
+/// allocates a fresh `String` each call: seven allocations for a title, twice per search hit,
+/// which is 280 allocations for one page of twenty results.
+fn clean_search_text(value: &str) -> String {
     let mut plain = String::with_capacity(value.len());
     let mut in_tag = false;
-    for ch in value.chars() {
+    let mut rest = value;
+    while let Some(ch) = rest.chars().next() {
+        rest = &rest[ch.len_utf8()..];
         match ch {
             '<' => in_tag = true,
             '>' => in_tag = false,
-            _ if !in_tag => plain.push(ch),
-            _ => {}
+            _ if in_tag => {}
+            '&' => {
+                // The five entities Bilibili uses in search text. Anything else is taken
+                // literally, including a bare `&` that starts no known entity.
+                let entity_len = ["&amp;", "&quot;", "&#39;", "&lt;", "&gt;"]
+                    .iter()
+                    .find(|entity| rest.starts_with(&entity[1..]))
+                    .map(|entity| entity.len() - 1);
+                match entity_len {
+                    Some(len) => {
+                        // `rest` starts after the `&`, so these are the tails of the entities.
+                        plain.push(match &rest[..len] {
+                            "amp;" => '&',
+                            "quot;" => '"',
+                            "#39;" => '\'',
+                            "lt;" => '<',
+                            _ => '>',
+                        });
+                        rest = &rest[len..];
+                    }
+                    None => plain.push('&'),
+                }
+            }
+            _ => plain.push(ch),
         }
     }
     plain
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
 }
 
 fn parse_search_video(item: &Value, index: usize) -> Option<Video> {
-    let mut bvid = text(item.get("bvid"));
-    if bvid.is_empty() {
-        bvid = text(item.get("arcurl"))
-            .split('/')
-            .next_back()
-            .unwrap_or("")
-            .to_string();
-    }
-    if bvid.is_empty() {
-        return None;
-    }
-    let title = clean_search_text(text(item.get("title")));
-    let duration = clean_search_text(text(item.get("duration")));
+    // Search results often carry the id only inside the page URL.
+    let bvid = bvid_of(item.get("bvid")).or_else(|| {
+        let from_url = text(item.get("arcurl"));
+        let id = from_url.split('/').next_back().unwrap_or("");
+        (!id.is_empty()).then(|| id.to_string())
+    })?;
+    let title = clean_search_text(str_of(item.get("title")));
+    let duration = clean_search_text(str_of(item.get("duration")));
     Some(Video {
         bvid,
         aid: number(item.get("aid")),
         cid: 0,
         title,
-        uploader: clean_search_text(text(item.get("author"))),
+        uploader: clean_search_text(str_of(item.get("author"))),
         uploader_mid: number(item.get("mid")),
         duration: if duration.is_empty() {
             "--:--".into()
@@ -649,21 +689,16 @@ fn parse_collection(season: &Value, owner_mid: i64, owner_name: &str) -> Option<
             };
             for (index, episode) in section_episodes.iter().enumerate() {
                 let arc = episode.get("arc").unwrap_or(&Value::Null);
-                let bvid = text(episode.get("bvid"));
-                let bvid = if bvid.is_empty() {
-                    text(arc.get("bvid"))
-                } else {
-                    bvid
-                };
-                if bvid.is_empty() {
+                let Some(bvid) = bvid_of(episode.get("bvid")).or_else(|| bvid_of(arc.get("bvid")))
+                else {
                     continue;
-                }
+                };
                 let aid = number(episode.get("aid")).max(number(arc.get("aid")));
                 let cid = number(episode.get("cid"));
                 let episode_title = {
-                    let title = clean_search_text(text(episode.get("title")));
+                    let title = clean_search_text(str_of(episode.get("title")));
                     if title.is_empty() {
-                        clean_search_text(text(arc.get("title")))
+                        clean_search_text(str_of(arc.get("title")))
                     } else {
                         title
                     }
@@ -764,11 +799,8 @@ pub(crate) struct AuthorVideoPage {
 }
 
 fn parse_author_video(item: &Value, index: usize, mid: i64) -> Option<Video> {
-    let bvid = text(item.get("bvid"));
-    if bvid.is_empty() {
-        return None;
-    }
-    let title = clean_search_text(text(item.get("title")));
+    let bvid = bvid_of(item.get("bvid"))?;
+    let title = clean_search_text(str_of(item.get("title")));
     let duration_text = text(item.get("length"));
     Some(Video {
         bvid,
@@ -984,7 +1016,9 @@ pub(crate) async fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, St
         .await
         .map_err(|error| format!("解析 B 站综合搜索结果失败：{error}"))?;
     if number(fallback_response.get("code")) != 0 {
-        return Err(api_error(&response, "搜索"));
+        // `fallback_response`, not `response`: the first one succeeded, which is why this
+        // fallback ran at all, so reporting its code described the wrong answer.
+        return Err(api_error(&fallback_response, "综合搜索"));
     }
     let videos = parse_search_result_list(&fallback_response);
     if videos.is_empty() {
@@ -996,10 +1030,7 @@ pub(crate) async fn fetch_search_results(keyword: &str) -> Result<Vec<Video>, St
 
 fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
     let history = item.get("history")?;
-    let bvid = text(history.get("bvid"));
-    if bvid.is_empty() {
-        return None;
-    }
+    let bvid = bvid_of(history.get("bvid"))?;
     let cover = {
         let cover = text(item.get("cover"));
         if cover.is_empty() {
@@ -1015,7 +1046,7 @@ fn parse_history_video(item: &Value, index: usize) -> Option<Video> {
             .max(number(history.get("oid")))
             .max(number(item.get("aid"))),
         cid: number(history.get("cid")),
-        title: clean_search_text(text(item.get("title"))),
+        title: clean_search_text(str_of(item.get("title"))),
         uploader: text(item.get("author_name")),
         uploader_mid: number(item.get("author_mid")),
         duration: duration(item.get("duration")),
@@ -1183,15 +1214,12 @@ pub(crate) async fn fetch_last_play_progress(video: &Video, cookie: Option<&str>
 }
 
 fn parse_dynamic_archive(archive: &Value) -> Option<Video> {
-    let bvid = text(archive.get("bvid"));
-    if bvid.is_empty() {
-        return None;
-    }
+    let bvid = bvid_of(archive.get("bvid"))?;
     Some(Video {
         bvid,
         aid: text(archive.get("aid")).parse().unwrap_or_default(),
         cid: 0,
-        title: clean_search_text(text(archive.get("title"))),
+        title: clean_search_text(str_of(archive.get("title"))),
         uploader: String::new(),
         uploader_mid: 0,
         duration: {
@@ -1302,15 +1330,12 @@ fn csrf_from_cookie(cookie: &str) -> Option<String> {
 }
 
 fn parse_watch_later_video(item: &Value, index: usize) -> Option<Video> {
-    let bvid = text(item.get("bvid"));
-    if bvid.is_empty() {
-        return None;
-    }
+    let bvid = bvid_of(item.get("bvid"))?;
     Some(Video {
         bvid,
         aid: number(item.get("aid")),
         cid: number(item.get("cid")),
-        title: clean_search_text(text(item.get("title"))),
+        title: clean_search_text(str_of(item.get("title"))),
         uploader: text(item.get("owner").and_then(|owner| owner.get("name"))),
         uploader_mid: number(item.get("owner").and_then(|owner| owner.get("mid"))),
         duration: duration(item.get("duration")),
@@ -1349,24 +1374,14 @@ pub(crate) async fn fetch_watch_later(cookie: &str) -> Result<Vec<Video>, String
 }
 
 fn parse_favorite_video(item: &Value, index: usize) -> Option<Video> {
-    let bvid = {
-        let bvid = text(item.get("bvid"));
-        if bvid.is_empty() {
-            text(item.get("bv_id"))
-        } else {
-            bvid
-        }
-    };
-    if bvid.is_empty() {
-        return None;
-    }
+    let bvid = bvid_of(item.get("bvid")).or_else(|| bvid_of(item.get("bv_id")))?;
     let ugc = item.get("ugc");
     let upper = item.get("upper");
     Some(Video {
         bvid,
         aid: number(item.get("id")),
         cid: number(ugc.and_then(|ugc| ugc.get("first_cid"))),
-        title: clean_search_text(text(item.get("title"))),
+        title: clean_search_text(str_of(item.get("title"))),
         uploader: text(upper.and_then(|upper| upper.get("name"))),
         uploader_mid: number(upper.and_then(|upper| upper.get("mid"))),
         duration: duration(item.get("duration")),
@@ -1634,7 +1649,7 @@ fn parse_comment(item: &Value) -> Option<Comment> {
     if rpid <= 0 {
         return None;
     }
-    let message = clean_search_text(text(
+    let message = clean_search_text(str_of(
         item.get("content")
             .and_then(|content| content.get("message")),
     ));
@@ -2280,6 +2295,46 @@ pub(crate) fn quality_label(qn: u32) -> String {
 }
 
 #[cfg(test)]
+mod clean_text_tests {
+    use super::clean_search_text;
+
+    #[test]
+    fn search_markup_is_stripped_and_entities_decoded() {
+        assert_eq!(
+            clean_search_text(r#"<em class="keyword">Rust</em> 入门"#),
+            "Rust 入门"
+        );
+        assert_eq!(clean_search_text("a &amp; b"), "a & b");
+        assert_eq!(clean_search_text("&quot;quoted&quot;"), "\"quoted\"");
+        assert_eq!(clean_search_text("it&#39;s"), "it's");
+        assert_eq!(clean_search_text("&lt;tag&gt;"), "<tag>");
+    }
+
+    /// A bare `&` is not an entity and must survive, as must an entity the list does not
+    /// cover: the old `replace`-based version left both alone and this must not regress.
+    #[test]
+    fn a_bare_ampersand_survives() {
+        assert_eq!(clean_search_text("R&D"), "R&D");
+        assert_eq!(clean_search_text("100 &euro;"), "100 &euro;");
+        assert_eq!(clean_search_text("a & b"), "a & b");
+    }
+
+    /// Text with nothing to do comes back unchanged, which is the common case.
+    #[test]
+    fn plain_text_is_unchanged() {
+        let plain = "【4K】这可能是今年最好看的旅行短片，一次看遍北海道";
+        assert_eq!(clean_search_text(plain), plain);
+    }
+
+    /// A truncated entity at the end must not panic on a slice.
+    #[test]
+    fn a_truncated_entity_does_not_panic() {
+        assert_eq!(clean_search_text("&am"), "&am");
+        assert_eq!(clean_search_text("&"), "&");
+    }
+}
+
+#[cfg(test)]
 mod clock_tests {
     use super::Clock;
 
@@ -2300,5 +2355,29 @@ mod clock_tests {
     #[test]
     fn the_clock_clamps_minutes_to_two_digits() {
         assert_eq!(Clock::new(6.0 * 3600.0).as_str(), "99:00");
+    }
+}
+
+#[cfg(test)]
+mod live_parse_tests {
+    /// The search parser against real hits, which carry `<em>` markup and entities the
+    /// fixtures do not.
+    #[test]
+    #[ignore = "needs the network"]
+    fn live_search_titles_are_clean() {
+        let videos = futures::executor::block_on(crate::network::run(async {
+            super::fetch_search_results("Rust 编程").await
+        }))
+        .expect("search failed");
+        assert!(!videos.is_empty(), "no results");
+        for video in &videos {
+            assert!(!video.bvid.is_empty(), "a hit has no bvid");
+            assert!(
+                !video.title.contains('<') && !video.title.contains("&amp;"),
+                "markup survived the cleaner: {:?}",
+                video.title
+            );
+        }
+        eprintln!("first hit: {:?}", videos[0].title);
     }
 }
