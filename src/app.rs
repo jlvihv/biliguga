@@ -105,52 +105,48 @@ fn save_player_settings(volume: f64, speed: f64) {
     let _ = fs::write(path, value.to_string());
 }
 
-/// The app's colours, in Rune's linear-sRGB `Color`. They mirror the old GPUI theme so the
-/// look carries over: near-black slate with an indigo accent.
+/// The app's colours, in Rune's linear-sRGB `Color`.
+///
+/// These used to be functions calling `oklch(..)` on every access, so the OKLCH to linear-sRGB
+/// conversion ran thousands of times a frame (each `theme::HOVER` in each row) and produced the
+/// same numbers every time. They are the same colours, precomputed; the comment on each is the
+/// `oklch(l c h)` it came from, so a designer can still edit the triple and rerun the conversion.
 mod theme {
-    use rune::{Color, oklch};
+    use rune::Color;
 
-    pub(super) fn bg() -> Color {
-        oklch(0.185, 0.02, 265.0)
-    }
-    pub(super) fn panel() -> Color {
-        oklch(0.215, 0.022, 265.0)
-    }
-    pub(super) fn feed() -> Color {
-        oklch(0.205, 0.021, 265.0)
-    }
-    pub(super) fn border() -> Color {
-        oklch(0.30, 0.022, 265.0)
-    }
-    pub(super) fn text() -> Color {
-        oklch(0.94, 0.004, 265.0)
-    }
-    pub(super) fn text_dim() -> Color {
-        oklch(0.72, 0.012, 265.0)
-    }
-    pub(super) fn text_faint() -> Color {
-        oklch(0.58, 0.014, 265.0)
-    }
-    pub(super) fn accent() -> Color {
-        oklch(0.62, 0.19, 285.0)
-    }
-    pub(super) fn accent_soft() -> Color {
-        oklch(0.72, 0.15, 285.0)
-    }
-    pub(super) fn hover() -> Color {
-        oklch(0.245, 0.024, 265.0)
-    }
-    pub(super) fn active_row() -> Color {
-        oklch(0.28, 0.05, 280.0)
-    }
-    pub(super) fn danger() -> Color {
-        oklch(0.66, 0.16, 25.0)
-    }
-    pub(super) fn track() -> Color {
-        oklch(0.42, 0.02, 265.0)
+    const fn c(r: f32, g: f32, b: f32) -> Color {
+        Color { r, g, b, a: 1.0 }
     }
 
-    /// The placeholder colour a cover shows before its pixels arrive.
+    /// oklch(0.185 0.02 265)
+    pub(super) const BG: Color = c(0.004_503_9, 0.006_317_4, 0.011_431_3);
+    /// oklch(0.215 0.022 265)
+    pub(super) const PANEL: Color = c(0.007_211_4, 0.009_929_4, 0.017_459_9);
+    /// oklch(0.205 0.021 265)
+    pub(super) const FEED: Color = c(0.006_248_8, 0.008_607_1, 0.015_143_3);
+    /// oklch(0.30 0.022 265)
+    pub(super) const BORDER: Color = c(0.021_578_9, 0.027_099_4, 0.041_115);
+    /// oklch(0.94 0.004 265)
+    pub(super) const TEXT: Color = c(0.820_442, 0.831_242, 0.853_617);
+    /// oklch(0.72 0.012 265)
+    pub(super) const TEXT_DIM: Color = c(0.355_543, 0.374_257, 0.414_456);
+    /// oklch(0.58 0.014 265)
+    pub(super) const TEXT_FAINT: Color = c(0.181_774, 0.195_807, 0.226_616);
+    /// oklch(0.62 0.19 285)
+    pub(super) const ACCENT: Color = c(0.209_745, 0.156_45, 0.884_517);
+    /// oklch(0.72 0.15 285)
+    pub(super) const ACCENT_SOFT: Color = c(0.332_29, 0.300_493, 0.990_357);
+    /// oklch(0.245 0.024 265)
+    pub(super) const HOVER: Color = c(0.010_830_8, 0.014_706_3, 0.025_302_4);
+    /// oklch(0.28 0.05 280)
+    pub(super) const ACTIVE_ROW: Color = c(0.017_726_2, 0.019_160_6, 0.052_899_6);
+    /// oklch(0.66 0.16 25)
+    pub(super) const DANGER: Color = c(0.771_293, 0.127_848, 0.113_027);
+    /// oklch(0.42 0.02 265)
+    pub(super) const TRACK: Color = c(0.064_254_2, 0.074_446_4, 0.098_420_2);
+
+    /// The placeholder a cover shows before its pixels arrive: the row's own accent, which
+    /// `api` assigns per position so a feed of half-loaded covers still looks intentional.
     pub(super) fn cover_placeholder(accent: u32) -> Color {
         rune::color::hex(&format!("#{accent:06x}")).unwrap_or(Color::BLACK)
     }
@@ -891,24 +887,24 @@ fn sidebar_item(label: &'static str, glyph: &'static str, active: bool, tab: App
         .justify_center()
         .gap(2.0)
         .cursor(rune::Cursor::Pointer)
-        .hover(theme::hover())
+        .hover(theme::HOVER)
         .on_press(move |app: &mut BiliGuga| app.show_tab(tab));
     if active {
         item = item
-            .fill(theme::active_row())
-            .child(text(glyph).font(type_::TITLE).color(theme::text()))
+            .fill(theme::ACTIVE_ROW)
+            .child(text(glyph).font(type_::TITLE).color(theme::TEXT))
             .child(
                 text(label)
                     .font(type_::SECTION)
-                    .color(theme::accent_soft()),
+                    .color(theme::ACCENT_SOFT),
             );
     } else {
         item = item
-            .child(text(glyph).font(type_::TITLE).color(theme::text_dim()))
+            .child(text(glyph).font(type_::TITLE).color(theme::TEXT_DIM))
             .child(
                 text(label)
                     .font(type_::SECTION)
-                    .color(theme::text_faint()),
+                    .color(theme::TEXT_FAINT),
             );
     }
     item
@@ -921,7 +917,7 @@ fn render_sidebar(app: &BiliGuga) -> El {
         .items_center()
         .py(8.0)
         .gap(4.0)
-        .fill(theme::bg())
+        .fill(theme::BG)
         .child(sidebar_item("首页", "⌂", app.active_tab == AppTab::Home, AppTab::Home))
         .child(sidebar_item("动态", "◈", app.active_tab == AppTab::Dynamic, AppTab::Dynamic))
         .child(sidebar_item("历史", "◷", app.active_tab == AppTab::History, AppTab::History))
@@ -948,7 +944,7 @@ fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
         .padding(8.0)
         .radius(8.0)
         .cursor(rune::Cursor::Pointer)
-        .hover(theme::hover())
+        .hover(theme::HOVER)
         .on_press(move |app: &mut BiliGuga| app.select(index))
         .child(card_cover(video, image, 132.0, 74.0))
         .child(
@@ -959,23 +955,23 @@ fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
                 .child(
                     text(video.title.clone())
                         .font(type_::BODY)
-                        .color(theme::text())
+                        .color(theme::TEXT)
                         .max_lines(2),
                 )
                 .child(
                     text(video.uploader.clone())
                         .font(type_::LABEL)
-                        .color(theme::text_faint())
+                        .color(theme::TEXT_FAINT)
                         .truncate(),
                 )
                 .child(
                     text(video.duration.clone())
                         .font(type_::LABEL)
-                        .color(theme::text_faint()),
+                        .color(theme::TEXT_FAINT),
                 ),
         );
     if selected {
-        row_el = row_el.fill(theme::active_row());
+        row_el = row_el.fill(theme::ACTIVE_ROW);
     }
     row_el
 }
@@ -992,23 +988,23 @@ fn video_card(app: &BiliGuga, index: usize, video: &Video) -> El {
         .padding(4.0)
         .radius(8.0)
         .cursor(rune::Cursor::Pointer)
-        .hover(theme::hover())
+        .hover(theme::HOVER)
         .on_press(move |app: &mut BiliGuga| app.select(index))
         .child(card_cover(video, image, GRID_CARD_WIDTH - 8.0, 106.0))
         .child(
             text(video.title.clone())
                 .font(type_::LABEL)
-                .color(theme::text())
+                .color(theme::TEXT)
                 .max_lines(2),
         )
         .child(
             text(video.uploader.clone())
                 .font(type_::SECTION)
-                .color(theme::text_faint())
+                .color(theme::TEXT_FAINT)
                 .truncate(),
         );
     if app.selected == Some(index) {
-        card = card.fill(theme::active_row());
+        card = card.fill(theme::ACTIVE_ROW);
     }
     card
 }
@@ -1062,15 +1058,15 @@ fn render_search_bar(app: &BiliGuga) -> El {
         .px(12.0)
         .py(8.0)
         .items_center()
-        .fill(theme::panel())
+        .fill(theme::PANEL)
         .child(
             el()
                 .key("search-field")
                 .grow(1.0)
                 .h(32.0)
                 .radius(6.0)
-                .fill(theme::bg())
-                .border(1.0, theme::border())
+                .fill(theme::BG)
+                .border(1.0, theme::BORDER)
                 .px(8.0)
                 .items_center()
                 .child(
@@ -1078,8 +1074,8 @@ fn render_search_bar(app: &BiliGuga) -> El {
                         .key("search-input")
                         .w_full()
                         .single_line()
-                        .placeholder("搜索视频", theme::text_faint())
-                        .color(theme::text())
+                        .placeholder("搜索视频", theme::TEXT_FAINT)
+                        .color(theme::TEXT)
                         .on_edit(|app: &mut BiliGuga| &mut app.search_edit)
                         .on_input_change(|app: &mut BiliGuga, _: &mut Tx| {
                             app.search_query = app.search_edit.text.clone();
@@ -1099,8 +1095,8 @@ fn render_search_bar(app: &BiliGuga) -> El {
                 .items_center()
                 .justify_center()
                 .cursor(rune::Cursor::Pointer)
-                .fill(theme::accent())
-                .hover(theme::accent_soft())
+                .fill(theme::ACCENT)
+                .hover(theme::ACCENT_SOFT)
                 .on_press(|app: &mut BiliGuga| {
                     app.search_query = app.search_edit.text.clone();
                     app.load_search();
@@ -1131,11 +1127,11 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         .py(12.0)
         .items_center()
         .justify_between()
-        .fill(theme::panel())
+        .fill(theme::PANEL)
         .child(
             text(feed_title(app.active_tab, &app.author_name))
                 .font(type_::TITLE)
-                .color(theme::text()),
+                .color(theme::TEXT),
         );
     if app.active_tab == AppTab::Author && app.author_has_more {
         header = header.child(
@@ -1145,9 +1141,9 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
                 .py(4.0)
                 .radius(4.0)
                 .cursor(rune::Cursor::Pointer)
-                .hover(theme::hover())
+                .hover(theme::HOVER)
                 .on_press(|app: &mut BiliGuga| app.load_author_page(false))
-                .child(text("加载更多").font(type_::SECTION).color(theme::accent_soft())),
+                .child(text("加载更多").font(type_::SECTION).color(theme::ACCENT_SOFT)),
         );
     }
     if app.active_tab != AppTab::Search {
@@ -1158,9 +1154,9 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
                 .py(4.0)
                 .radius(4.0)
                 .cursor(rune::Cursor::Pointer)
-                .hover(theme::hover())
+                .hover(theme::HOVER)
                 .on_press(|app: &mut BiliGuga| app.refresh_feed())
-                .child(text("刷新").font(type_::SECTION).color(theme::accent_soft())),
+                .child(text("刷新").font(type_::SECTION).color(theme::ACCENT_SOFT)),
         );
     }
 
@@ -1168,13 +1164,13 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         col().w_full().py(32.0).items_center().gap(6.0).child(
             text(loading_message(app.active_tab))
                 .font(type_::BODY)
-                .color(theme::text_faint()),
+                .color(theme::TEXT_FAINT),
         )
     } else if videos.is_empty() {
         col().w_full().py(32.0).items_center().child(
             text(empty_message(app))
                 .font(type_::BODY)
-                .color(theme::text_faint()),
+                .color(theme::TEXT_FAINT),
         )
     } else if is_home {
         col()
@@ -1231,7 +1227,7 @@ fn render_feed(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         .w(FEED_WIDTH)
         .h_full()
         .shrink()
-        .fill(theme::feed())
+        .fill(theme::FEED)
         .child(header);
     if app.active_tab == AppTab::Search {
         root = root.child(render_search_bar(app));
@@ -1262,13 +1258,13 @@ fn render_login(app: &BiliGuga) -> El {
         .padding(20.0)
         .gap(12.0)
         .items_center()
-        .fill(theme::feed());
+        .fill(theme::FEED);
     if let Some(session) = &app.session {
         panel = panel
             .child(
                 text(format!("已登录：{}", session.username))
                     .font(type_::TITLE)
-                    .color(theme::text()),
+                    .color(theme::TEXT),
             )
             .child(
                 el()
@@ -1276,8 +1272,8 @@ fn render_login(app: &BiliGuga) -> El {
                     .py(6.0)
                     .radius(6.0)
                     .cursor(rune::Cursor::Pointer)
-                    .fill(theme::panel())
-                    .hover(theme::hover())
+                    .fill(theme::PANEL)
+                    .hover(theme::HOVER)
                     .on_press(|app: &mut BiliGuga| {
                         login::clear_session();
                         app.session = None;
@@ -1285,7 +1281,7 @@ fn render_login(app: &BiliGuga) -> El {
                         app.login_status = "使用哔哩哔哩 App 扫码登录".into();
                         app.active_tab = AppTab::Home;
                     })
-                    .child(text("退出登录").font(type_::LABEL).color(theme::danger())),
+                    .child(text("退出登录").font(type_::LABEL).color(theme::DANGER)),
             );
         return panel;
     }
@@ -1302,7 +1298,7 @@ fn render_login(app: &BiliGuga) -> El {
         .child(
             text(app.login_status.clone())
                 .font(type_::BODY)
-                .color(theme::text_dim()),
+                .color(theme::TEXT_DIM),
         )
         .child(
             el()
@@ -1310,8 +1306,8 @@ fn render_login(app: &BiliGuga) -> El {
                 .py(6.0)
                 .radius(6.0)
                 .cursor(rune::Cursor::Pointer)
-                .fill(theme::accent())
-                .hover(theme::accent_soft())
+                .fill(theme::ACCENT)
+                .hover(theme::ACCENT_SOFT)
                 .on_press(|app: &mut BiliGuga| app.start_login())
                 .child(text("刷新二维码").font(type_::LABEL).color(Color::WHITE)),
         );
@@ -1326,13 +1322,13 @@ fn progress_track(fraction: f32, height: f32) -> El {
         .w_full()
         .h(height)
         .radius(height / 2.0)
-        .fill(theme::track())
+        .fill(theme::TRACK)
         .child(
             el()
                 .h(height)
                 .w_frac(fraction)
                 .radius(height / 2.0)
-                .fill(theme::accent()),
+                .fill(theme::ACCENT),
         )
 }
 
@@ -1395,8 +1391,8 @@ fn control_button(label: &'static str, key: &'static str) -> El {
         .py(4.0)
         .radius(4.0)
         .cursor(rune::Cursor::Pointer)
-        .hover(theme::hover())
-        .child(text(label).font(type_::LABEL).color(theme::text()))
+        .hover(theme::HOVER)
+        .child(text(label).font(type_::LABEL).color(theme::TEXT))
 }
 
 fn render_player(app: &BiliGuga) -> El {
@@ -1406,11 +1402,11 @@ fn render_player(app: &BiliGuga) -> El {
             .h_full()
             .items_center()
             .justify_center()
-            .fill(theme::panel())
+            .fill(theme::PANEL)
             .child(
                 text("暂无正在播放的视频")
                     .font(type_::BODY)
-                    .color(theme::text_faint()),
+                    .color(theme::TEXT_FAINT),
             );
     };
 
@@ -1455,9 +1451,9 @@ fn render_player(app: &BiliGuga) -> El {
             });
             stage = stage.child(
                 text(message).font(type_::BODY).color(if app.playback_error.is_some() {
-                    theme::danger()
+                    theme::DANGER
                 } else {
-                    theme::text_faint()
+                    theme::TEXT_FAINT
                 }),
             );
         }
@@ -1471,7 +1467,7 @@ fn render_player(app: &BiliGuga) -> El {
         .gap(6.0)
         .px(12.0)
         .py(8.0)
-        .fill(theme::panel())
+        .fill(theme::PANEL)
         .child(seek_bar(position, duration))
         .child(
             row()
@@ -1496,7 +1492,7 @@ fn render_player(app: &BiliGuga) -> El {
                         format_time(duration)
                     ))
                     .font(type_::LABEL)
-                    .color(theme::text_dim()),
+                    .color(theme::TEXT_DIM),
                 )
                 .child(el().grow(1.0))
                 .child(
@@ -1528,7 +1524,7 @@ fn render_player(app: &BiliGuga) -> El {
                         .child(
                             text(crate::api::quality_label(app.quality))
                                 .font(type_::SECTION)
-                                .color(theme::text_faint()),
+                                .color(theme::TEXT_FAINT),
                         )
                         .on_press(|app: &mut BiliGuga| {
                             app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
@@ -1546,7 +1542,7 @@ fn render_player(app: &BiliGuga) -> El {
                 .child(
                     text(format!("{:.2}x", app.speed))
                         .font(type_::LABEL)
-                        .color(theme::text_dim()),
+                        .color(theme::TEXT_DIM),
                 )
                 .child(
                     control_button("全屏", "fullscreen")
@@ -1562,7 +1558,7 @@ fn render_player(app: &BiliGuga) -> El {
         .grow(1.0)
         .min_h(0.0)
         .h_full()
-        .fill(theme::panel())
+        .fill(theme::PANEL)
         .child(stage);
     if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
         root = root.child(
@@ -1572,7 +1568,7 @@ fn render_player(app: &BiliGuga) -> El {
                 .gap(1.0)
                 .px(12.0)
                 .py(4.0)
-                .fill(theme::panel())
+                .fill(theme::PANEL)
                 .children(app.quality_options.iter().map(|option| {
                     let selected = option.qn == app.quality;
                     let quality = option.qn;
@@ -1583,15 +1579,15 @@ fn render_player(app: &BiliGuga) -> El {
                         .py(3.0)
                         .radius(4.0)
                         .cursor(rune::Cursor::Pointer)
-                        .hover(theme::hover())
+                        .hover(theme::HOVER)
                         .on_press(move |app: &mut BiliGuga| app.select_quality(quality))
                         .child(
                             text(label)
                                 .font(type_::LABEL)
-                                .color(if selected { theme::accent_soft() } else { theme::text_dim() }),
+                                .color(if selected { theme::ACCENT_SOFT } else { theme::TEXT_DIM }),
                         );
                     if selected {
-                        row_el = row_el.fill(theme::active_row());
+                        row_el = row_el.fill(theme::ACTIVE_ROW);
                     }
                     row_el
                 })),
@@ -1607,8 +1603,8 @@ fn render_player(app: &BiliGuga) -> El {
                 .w_full()
                 .px(12.0)
                 .py(4.0)
-                .fill(theme::panel())
-                .child(text(note.clone()).font(type_::LABEL).color(theme::accent_soft())),
+                .fill(theme::PANEL)
+                .child(text(note.clone()).font(type_::LABEL).color(theme::ACCENT_SOFT)),
         );
     }
     root.child(render_comments(app, video))
@@ -1622,7 +1618,7 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
         .gap(4.0)
         .px(12.0)
         .py(8.0)
-        .fill(theme::panel())
+        .fill(theme::PANEL)
         .child(
             row()
                 .w_full()
@@ -1631,14 +1627,14 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                 .child(
                     text(format!("评论 {}", app.comments_total.max(0)))
                         .font(type_::LABEL)
-                        .color(theme::text_dim()),
+                        .color(theme::TEXT_DIM),
                 )
                 .child(
                     text(video.uploader.clone())
                         .font(type_::LABEL)
-                        .color(theme::accent_soft())
+                        .color(theme::ACCENT_SOFT)
                         .cursor(rune::Cursor::Pointer)
-                        .hover(theme::hover())
+                        .hover(theme::HOVER)
                         .on_press(move |app: &mut BiliGuga| {
                             let (mid, name) = match &app.playing_video {
                                 Some(video) => (video.uploader_mid, video.uploader.clone()),
@@ -1652,15 +1648,15 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
         section = section.child(
             text("正在加载评论…")
                 .font(type_::LABEL)
-                .color(theme::text_faint()),
+                .color(theme::TEXT_FAINT),
         );
     } else if let Some(error) = &app.comments_error {
-        section = section.child(text(error.clone()).font(type_::LABEL).color(theme::danger()));
+        section = section.child(text(error.clone()).font(type_::LABEL).color(theme::DANGER));
     } else if app.comments.is_empty() {
         section = section.child(
             text("还没有评论")
                 .font(type_::LABEL)
-                .color(theme::text_faint()),
+                .color(theme::TEXT_FAINT),
         );
     } else {
         // A scroll viewport needs a bounded height: inside an auto-height column `.grow()`
@@ -1682,18 +1678,18 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                                 .child(
                                     text(comment.username.clone())
                                         .font(type_::LABEL)
-                                        .color(theme::accent_soft()),
+                                        .color(theme::ACCENT_SOFT),
                                 )
                                 .child(
                                     text(comment.time.clone())
                                         .font(type_::SECTION)
-                                        .color(theme::text_faint()),
+                                        .color(theme::TEXT_FAINT),
                                 ),
                         )
                         .child(
                             text(comment.message.clone())
                                 .font(type_::LABEL)
-                                .color(theme::text_dim())
+                                .color(theme::TEXT_DIM)
                                 .wrap(),
                         )
                 })),
@@ -1705,12 +1701,12 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
                     .py(4.0)
                     .items_center()
                     .cursor(rune::Cursor::Pointer)
-                    .hover(theme::hover())
+                    .hover(theme::HOVER)
                     .on_press(|app: &mut BiliGuga| app.load_comments(false))
                     .child(
                         text("加载更多评论")
                             .font(type_::SECTION)
-                            .color(theme::accent_soft()),
+                            .color(theme::ACCENT_SOFT),
                     ),
             );
         }
@@ -1719,7 +1715,7 @@ fn render_comments(app: &BiliGuga, video: &Video) -> El {
 }
 
 fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
-    let mut root = row().w_full().h_full().fill(theme::bg());
+    let mut root = row().w_full().h_full().fill(theme::BG);
     if app.player_fullscreen {
         return root.child(render_player(app));
     }
@@ -2015,10 +2011,6 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
             app.queue_history_report();
         }
         app.sync_power();
-        if let Some(message) = app.player.take_message() {
-            app.playback_error = Some(message);
-            changed = true;
-        }
         // Keeps the clock moving while nothing else asks for a frame. An idle window still
         // draws nothing: this only runs while a video is loaded.
         tx.wake_after(Duration::from_millis(100));
