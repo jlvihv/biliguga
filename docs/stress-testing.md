@@ -77,7 +77,7 @@ after free rss = 2 MiB
 
 # 线程账
 
-用户问「为什么这么多线程，能不能压到 10 个以内」。实测下来的答案：**不能**，因为 48 个线程里有 40 个来自两个改不动的第三方库。
+用户问「为什么这么多线程，能不能压到 10 个以内」。实测下来的答案：**10 个以内不能**，但 libmpv 那部分能从 36 压到 32，其中解码线程从 4 个压到 0。
 
 ## 实测构成（48 线程，播放中）
 
@@ -95,6 +95,20 @@ after free rss = 2 MiB
 | `biliguga-net` ×3 | 3 | 自己的 tokio 运行时 | 已是最低（2 worker + 1 blocking） |
 | `biliguga` ×2 | 2 | 主线程 + Rune |
 
+## 削掉了什么（实测对比）
+
+用真实 1080p H.264 文件、真实 `MpvPlayer::load()`，等帧真正流起来之后数线程：
+
+| 配置 | 总线程 | `av:` 解码线程 |
+|---|---|---|
+| mpv 全部默认 | 28 | **16**（一核一个） |
+| `vd-lavc-threads=2` 单独 | 36 | **4** |
+| `vd-lavc-threads=2` + `hwdec-threads=1` | **32** | **0** |
+
+第一个反直觉的发现：**`hwdec=auto-safe` 会让 `vd-lavc-threads` 失效**。硬件解码走自己的线程池，默认 4 个，完全不看软解线程数。所以只设 `vd-lavc-threads` 什么也省不下，必须同时设 `hwdec-threads`。
+
+`hwdec-threads=1` 之后解码在调用线程上完成，`av:` 归零——播放仍然正常（有测试守着，`BILIGUGA_TEST_CLIP` 指到本地文件就能跑）。
+
 ## 关键发现：`load-scripts=no` 不起作用
 
 mpv 的 7 个内置 Lua 脚本（console、stats、context_menu、positioning、select、commands、ytdl_hook）各占一个线程。但**这个构建的 libmpv 关不掉它们**：
@@ -109,7 +123,19 @@ scripts=""          → 10 threads, 7 lua
 ## 小结
 
 - **应用自己的线程：4 个**（主线程 + 2 网络 + 1 mpv 调度）。这部分已经不能再省。
-- **下限约 20 个**：libmpv 初始化即 8 个 + Rune 的 4 个图片线程 + 自己的 4 个 + 主线程。
+- **下限约 20 个**：libmpv 初始化即 7 个 lua 线程（编进 libmpv 二进制，`load-scripts`、`scripts`、`no-config` 全部无效，用 `mpv_get_property_string(h, "script-list")` 和独立的 `mpv_create` 程序都验证过）+ Rune 的 4 个图片线程（`DECODERS` 硬编码）+ 自己的 4 个 + 主线程。
 - **10 个以内的唯一办法是不用 libmpv**：改用系统解码器（GStreamer/VA-API 直接接），那是另一个量级的工程，而且会失去 mpv 的格式兼容性和 seek 精度。
+
+## 复现方法
+
+```bash
+# 造一个 1080p 素材
+ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=30:duration=8 \
+       -pix_fmt yuv420p -c:v libx264 -preset ultrafast /tmp/t1080.mp4
+
+# 真实播放器 + 线程统计，断言 av <= 2
+BILIGUGA_TEST_CLIP=/tmp/t1080.mp4 \
+  cargo test --release player_threads -- --ignored --nocapture
+```
 
 为了这点，我把 `ytdl=no` 和 `vd-lavc-threads=2` 加上了（各少 1 和 2 个线程），`load-scripts=no` 也保留了——在关得掉的 libmpv 构建上它是有效的，只是这台机器上无效。`set_option` 现在会记录被拒绝的选项，不再静默失败。

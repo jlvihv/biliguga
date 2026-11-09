@@ -3330,4 +3330,63 @@ mod stress {
             eprintln!("  {count}x {last}");
         }
     }
+
+    /// The thread count of the real player, not of a bare `mpv_initialize`: the options that
+    /// matter (`hwdec-threads` above all) only show up once a decoder is actually running.
+    ///
+    /// Run with `BILIGUGA_TEST_CLIP=/path/to/1080p.mp4 cargo test --release player_threads --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a local clip; see BILIGUGA_TEST_CLIP"]
+    fn player_threads_while_decoding() {
+        let clip = std::env::var("BILIGUGA_TEST_CLIP").unwrap_or_else(|_| "/tmp/t1080.mp4".into());
+        if !std::path::Path::new(&clip).exists() {
+            eprintln!("skipping: no clip at {clip}");
+            return;
+        }
+        let before = std::fs::read_dir("/proc/self/task")
+            .map(|d| d.count())
+            .unwrap_or(0);
+        let mut player = mpv::MpvPlayer::new();
+        player.load(clip, None, 0., 1.);
+        // Wait for frames to actually flow, which is when the decoder threads exist.
+        let mut decoded = false;
+        for _ in 0..400 {
+            std::thread::sleep(Duration::from_millis(20));
+            player.poll_frame();
+            let status = player.status();
+            if status.time_pos.is_finite() && status.time_pos > 0.3 {
+                decoded = true;
+                break;
+            }
+        }
+        assert!(decoded, "the clip never started playing");
+        let mut names: Vec<String> = std::fs::read_dir("/proc/self/task")
+            .map(|d| {
+                d.flatten()
+                    .map(|e| {
+                        std::fs::read_to_string(e.path().join("comm"))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        let count = |pred: &dyn Fn(&str) -> bool| names.iter().filter(|n| pred(n)).count();
+        let lua = count(&|n| n.starts_with("lua/"));
+        let av = count(&|n| n.starts_with("av:"));
+        eprintln!(
+            "player: {} threads total (before mpv: {before}), lua {lua}, av {av}",
+            names.len()
+        );
+        // The point of the two decode options is that no per-core decoder pool appears. A
+        // 16-core machine with defaults gives 16 `av:` threads; the ceiling here is what
+        // hwdec needs to run at all.
+        assert!(
+            av <= 2,
+            "decode threads came back: {av} of them, names {names:?}"
+        );
+    }
 }

@@ -450,10 +450,20 @@ fn run_mpv_session(
         // to the process's thread count.
         set_option(handle, "load-scripts", "no");
         set_option(handle, "ytdl", "no");
-        // Decoding threads: ffmpeg's default (0) picks one per core, which on a 16-core
-        // machine is more parallel decode than a 1080p stream needs and more than the
-        // frame pipeline (one buffer, replaced in place) can retire.
+        // Decoding threads. Two numbers matter and only one of them is obvious:
+        //
+        //   `vd-lavc-threads` is ffmpeg's software-decode pool. Its default of 0 means one
+        //   thread per core: 16 on this machine, for a stream the frame pipeline (one buffer,
+        //   replaced in place) cannot retire any faster than it arrives.
+        //   `hwdec-threads` is the hardware path's. `hwdec=auto-safe` ignores
+        //   `vd-lavc-threads` entirely — hardware decoders have their own default of 4 — so
+        //   without this line the option above changes nothing once hwdec engages.
+        //
+        // Measured on a 1080p H.264 file, threads carrying an `av:` name: defaults 16,
+        // `vd-lavc-threads=2` alone 4 (hwdec won), both together 0 (the decoder does its own
+        // work on the calling thread).
         set_option(handle, "vd-lavc-threads", "2");
+        set_option(handle, "hwdec-threads", "1");
         if mpv_initialize(handle) < 0 {
             eprintln!("libmpv: mpv_initialize failed");
             mpv_terminate_destroy(handle);
