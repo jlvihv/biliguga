@@ -2138,6 +2138,25 @@ fn setup(app: &mut BiliGuga, waker: Waker) {
     if let Some(worker) = app.worker.as_mut() {
         worker.waker = waker;
     }
+    // A local file plays instead of the feed, for measuring the real window without a network
+    // account: `BILIGUGA_BENCH_CLIP=/path/to/clip.mp4`. Not a feature, a harness.
+    if let Some(clip) = std::env::var_os("BILIGUGA_BENCH_CLIP") {
+        let clip = clip.to_string_lossy().into_owned();
+        app.playing_video = Some(Video {
+            bvid: "BVbench".into(),
+            aid: 0,
+            cid: 0,
+            title: "本地压测片段".into(),
+            uploader: "bench".into(),
+            uploader_mid: 0,
+            duration: "--:--".into(),
+            cover: String::new(),
+            accent: 0x3e4654,
+        });
+        app.playback = PlaybackState::Buffering;
+        app.player.load(clip, None, 0., 1.);
+        return;
+    }
     // Everything slow starts here, after the first frame: the window opens at once.
     let cookie = app.cookie();
     app.load_home_page(false);
@@ -3388,5 +3407,77 @@ mod stress {
             av <= 2,
             "decode threads came back: {av} of them, names {names:?}"
         );
+    }
+    /// What one rendered frame of a playing video costs the app side, in the headless runtime:
+    /// the `Pixels` update plus the commit and paint that the wake triggers.
+    #[test]
+    #[ignore = "benchmark"]
+    fn playing_frame_cost() {
+        let mut rt = runtime_with(12);
+        rt.state.playing_video = Some(demo_video(0));
+        let pixels = rune::Pixels::new();
+        pixels.set(1920, 1080, vec![0u8; 1920 * 1080 * 4]);
+        rt.frame(0.0);
+
+        let mut buffer = vec![0u8; 1920 * 1080 * 4];
+        let frames: usize = std::env::var("BILIGUGA_STRESS_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        // Warm up: the first frames shape text and build atlases.
+        for step in 0..30 {
+            buffer[0] = step as u8;
+            pixels.set(1920, 1080, std::mem::take(&mut buffer));
+            buffer = vec![0u8; 1920 * 1080 * 4];
+            rt.frame(step as f64 / 60.0);
+        }
+        let before = metrics::sample().expect("sample");
+        let started = Instant::now();
+        for step in 0..frames {
+            buffer[0] = step as u8;
+            pixels.set(1920, 1080, std::mem::take(&mut buffer));
+            buffer = vec![0u8; 1920 * 1080 * 4];
+            rt.frame(step as f64 / 60.0);
+        }
+        let elapsed = started.elapsed();
+        let after = metrics::sample().expect("sample");
+        let per = elapsed.as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!(
+            "playing frame: {per:.3} ms/frame, cpu {:.3}s for {frames} frames",
+            after.cpu_seconds - before.cpu_seconds
+        );
+        // The 8 MiB buffer this test rebuilds every frame is the test's cost, not the app's;
+        // it is here so `set` gets a fresh Vec like the worker's recycled buffers do.
+    }
+    /// How much of a playing frame's cost is the clock tick rather than the frame itself:
+    /// the same loop with `poll`'s playhead check effectively disabled by a huge step.
+    #[test]
+    #[ignore = "benchmark"]
+    fn playing_frame_without_the_clock() {
+        let mut rt = runtime_with(12);
+        rt.state.playing_video = Some(demo_video(0));
+        let pixels = rune::Pixels::new();
+        pixels.set(1920, 1080, vec![0u8; 1920 * 1080 * 4]);
+        rt.frame(0.0);
+        let mut buffer = vec![0u8; 1920 * 1080 * 4];
+        for step in 0..30 {
+            buffer[0] = step as u8;
+            pixels.set(1920, 1080, std::mem::take(&mut buffer));
+            buffer = vec![0u8; 1920 * 1080 * 4];
+            rt.frame(step as f64 / 60.0);
+        }
+        let started = Instant::now();
+        let frames = 300;
+        for step in 0..frames {
+            // A frame landing is the only thing that should matter: no `changed = true` from
+            // the app's own poll path, so `build` only runs when `Pixels` wakes it.
+            rt.state.last_position = f64::NEG_INFINITY;
+            buffer[0] = step as u8;
+            pixels.set(1920, 1080, std::mem::take(&mut buffer));
+            buffer = vec![0u8; 1920 * 1080 * 4];
+            rt.frame(step as f64 / 60.0);
+        }
+        let per = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        eprintln!("frame only (no clock tick): {per:.3} ms/frame");
     }
 }

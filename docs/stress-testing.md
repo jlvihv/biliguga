@@ -139,3 +139,54 @@ BILIGUGA_TEST_CLIP=/tmp/t1080.mp4 \
 ```
 
 为了这点，我把 `ytdl=no` 和 `vd-lavc-threads=2` 加上了（各少 1 和 2 个线程），`load-scripts=no` 也保留了——在关得掉的 libmpv 构建上它是有效的，只是这台机器上无效。`set_option` 现在会记录被拒绝的选项，不再静默失败。
+
+# 播放时的 CPU
+
+用户提到「播放状态 0.4%，竞品 0.3%」。用真实窗口实测，**我们是 0.165–0.183%**，比两个数字都低。下面是测量方法和拆解。
+
+## 怎么测的
+
+```bash
+# 造一个 3 分钟 1080p 素材（避免循环与结尾处理干扰）
+ffmpeg -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=180" \
+       -f lavfi -i "sine=frequency=440:duration=180" \
+       -pix_fmt yuv420p -c:v libx264 -preset ultrafast -c:a aac -shortest /tmp/bench180.mp4
+
+# 用本地片段起真实窗口（BILIGUGA_BENCH_CLIP 是测量入口，不是功能）
+WAYLAND_DISPLAY=wayland-1 BILIGUGA_BENCH_CLIP=/tmp/bench180.mp4 ./target/release/biliguga &
+
+# 读 /proc/PID/stat 的 utime+stime，10 秒窗口
+```
+
+`/proc/PID/stat` 的 tick 是 100Hz，所以 `tick / 10 = 百分比`（单核）。
+
+## 结果
+
+静置（无视频）：**0.000%**，Rune 的静止窗口不画帧。
+
+播放中，多次独立运行：**0.165%、0.174%、0.172%、0.181%、0.183%**。
+
+10 秒窗口 181 tick 的归属：
+
+| 线程 | tick | 占整进程 |
+|---|---|---|
+| `biliguga-libmpv`（mpv 渲染循环 + 软渲染） | 37 | 20% |
+| **`biliguga`（我们的 UI 主线程）** | **23** | **13%** |
+| `worker` ×8（ffmpeg 解码） | ~110 | 61% |
+| `core`/`demux`/`vo` | ~11 | 6% |
+
+**我们自己的 UI 只占 0.023%。八成以上是 ffmpeg 在解码**——这部分任何用 libmpv 的客户端都一样。
+
+## 试过但没收益的
+
+1. **把时钟更新改成不等重建。** `poll` 里每 0.2 秒推进播放头时会 `changed = true`，触发一次提交。我怀疑这是主要开销，实测禁用后 **0.183% vs 0.181%**——没有差异。Rune 的 diff 只重建变化的子树，那点工作可以忽略。
+2. **`vd-lavc-threads` 2 → 1**：0.172% vs 0.181%，在噪声内。线程少了，单线程解码时间变长，总量守恒。
+3. **live 绑定驱动进度条**：写了一半发现没有收益，且实现绕（需要视图把轨道宽度写回状态），已完整回退，没有留下半成品。
+
+## 结论
+
+**没有输。** 0.17% 比 0.3% 低，而且差距不在我们能控制的地方——UI 只占 0.023%，剩下的全是 ffmpeg。
+
+需要考虑的是测量口径可能不同：竞品的 0.3% 如果是「在线播放 + 弹幕渲染」的数字，而我们是本地文件无弹幕，那就不可比。真要对比，得在同等条件下测。
+
+真要继续压 CPU，唯一有效的方向是**降低解码负载**，比如选更低的画质，或者用硬解且避免 `hwdec` 的 copy 路径（当前是 `vulkan-copy`，有一次 GPU→CPU 拷贝）。那是画质/兼容性的取舍，不是代码问题。
