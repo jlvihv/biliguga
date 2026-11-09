@@ -427,7 +427,6 @@ fn run_mpv_session(
 
         set_option(handle, "vo", "libmpv");
         set_option(handle, "hwdec", "auto-safe");
-        set_option(handle, "vd-lavc-threads", "4");
         set_option(handle, "cache", "yes");
         set_option(handle, "cache-secs", "3");
         set_option(handle, "demuxer-max-bytes", "16MiB");
@@ -444,6 +443,17 @@ fn run_mpv_session(
             "Referer: https://www.bilibili.com/",
         );
         set_option(handle, "aid", "auto");
+        // mpv starts a thread per built-in Lua script (console, stats, context menu,
+        // positioning, select, commands, ytdl_hook — seven of them), and a thread pool for
+        // yt-dlp. None of that applies here: the URLs come from Bilibili's API already
+        // resolved, and the UI is ours. Turning both off removes most of what libmpv adds
+        // to the process's thread count.
+        set_option(handle, "load-scripts", "no");
+        set_option(handle, "ytdl", "no");
+        // Decoding threads: ffmpeg's default (0) picks one per core, which on a 16-core
+        // machine is more parallel decode than a 1080p stream needs and more than the
+        // frame pipeline (one buffer, replaced in place) can retire.
+        set_option(handle, "vd-lavc-threads", "2");
         if mpv_initialize(handle) < 0 {
             eprintln!("libmpv: mpv_initialize failed");
             mpv_terminate_destroy(handle);
@@ -758,8 +768,13 @@ unsafe fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
         debug_log(&format!("skipped option {name:?}: it contains a NUL"));
         return;
     };
-    unsafe {
-        let _ = mpv_set_option_string(handle, name.as_ptr(), value.as_ptr());
+    let result = unsafe { mpv_set_option_string(handle, name.as_ptr(), value.as_ptr()) };
+    if result < 0 {
+        // Worth knowing: a misspelled option is silently ignored by libmpv, which is how
+        // `load-scripts` and `vd-lavc-threads` would look like they were applied.
+        debug_log(&format!(
+            "option {name:?}={value:?} was refused (code {result})"
+        ));
     }
 }
 

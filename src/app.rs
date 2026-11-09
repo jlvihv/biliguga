@@ -3299,4 +3299,35 @@ mod stress {
         // nothing); this bounds the app-side work per frame.
         assert!(per_frame < 16.0, "a frame landed in {per_frame:.2} ms");
     }
+    #[test]
+    #[ignore = "diagnostic"]
+    fn thread_census() {
+        let mut rt = runtime_with(12);
+        rt.frame(0.0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let dir = std::fs::read_dir("/proc/self/task").unwrap();
+        let mut names = Vec::new();
+        for entry in dir.flatten() {
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            names.push(comm.trim().to_string());
+        }
+        names.sort();
+        eprintln!("{} threads:", names.len());
+        let mut last = String::new();
+        let mut count = 0;
+        for n in &names {
+            if *n == last {
+                count += 1;
+            } else {
+                if count > 0 {
+                    eprintln!("  {count}x {last}");
+                }
+                last = n.clone();
+                count = 1;
+            }
+        }
+        if count > 0 {
+            eprintln!("  {count}x {last}");
+        }
+    }
 }

@@ -74,3 +74,42 @@ after free rss = 2 MiB
 2. `video` 每帧 `vec![0u8; 8MiB]`，把分配器成本算进了 0.84 ms。改成复用缓冲区后是 0.09 ms——**差 9 倍**。
 
 这两次都是测试自身的问题，不是应用的问题。写下来是因为：一个测错的基准比没有基准更糟。
+
+# 线程账
+
+用户问「为什么这么多线程，能不能压到 10 个以内」。实测下来的答案：**不能**，因为 48 个线程里有 40 个来自两个改不动的第三方库。
+
+## 实测构成（48 线程，播放中）
+
+| 来源 | 数量 | 归属 | 能否削减 |
+|---|---|---|---|
+| `lua/*` ×6 + `core` | 7 | libmpv | **不能**，见下 |
+| `av:h264:df0..3` | 4 | ffmpeg 解码 | 能（`vd-lavc-threads`，已设 2） |
+| `worker` ×10 | 10 | ffmpeg/mpv 内部池 | 部分随解码线程数 |
+| `demux` ×2、`vo`、`mpv/ao/pipewire`、`module-rt`、`data-loop.0`、`blocking-1`、`async-io` | ~8 | libmpv | 不能 |
+| `biliguga-libmpv` ×2 | 2 | mpv 会话 + worker 调度 | 不能（本身是播放器线程） |
+| `rune-images` ×4 | 4 | Rune | **不能**，硬编码 `DECODERS: usize = 4` |
+| `rune-appearance`、`pool-spawner` | 2 | Rune | 不能 |
+| `biligug:disk$0` ×4 | 4 | glibc aio（wgpu 加载驱动触发） | 不能 |
+| `gmain`、`gdbus`、`dconf worker` | 3 | GTK/GLib（系统主题、托盘） | 不能 |
+| `biliguga-net` ×3 | 3 | 自己的 tokio 运行时 | 已是最低（2 worker + 1 blocking） |
+| `biliguga` ×2 | 2 | 主线程 + Rune |
+
+## 关键发现：`load-scripts=no` 不起作用
+
+mpv 的 7 个内置 Lua 脚本（console、stats、context_menu、positioning、select、commands、ytdl_hook）各占一个线程。但**这个构建的 libmpv 关不掉它们**：
+
+```
+load-scripts=no     → 10 threads, 7 lua
+scripts=""          → 10 threads, 7 lua
+```
+
+单独写程序验证，`mpv_set_option_string` 返回 0（成功），但 `mpv_initialize` 之后 7 个 lua 线程照样起来。`ytdl_hook` 那个能关（`ytdl=no` 有效），其余 6 个不行——取决于发行版怎么编译 libmpv。
+
+## 小结
+
+- **应用自己的线程：4 个**（主线程 + 2 网络 + 1 mpv 调度）。这部分已经不能再省。
+- **下限约 20 个**：libmpv 初始化即 8 个 + Rune 的 4 个图片线程 + 自己的 4 个 + 主线程。
+- **10 个以内的唯一办法是不用 libmpv**：改用系统解码器（GStreamer/VA-API 直接接），那是另一个量级的工程，而且会失去 mpv 的格式兼容性和 seek 精度。
+
+为了这点，我把 `ytdl=no` 和 `vd-lavc-threads=2` 加上了（各少 1 和 2 个线程），`load-scripts=no` 也保留了——在关得掉的 libmpv 构建上它是有效的，只是这台机器上无效。`set_option` 现在会记录被拒绝的选项，不再静默失败。
