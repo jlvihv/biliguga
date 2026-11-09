@@ -4,8 +4,6 @@ mod allocator;
 mod api;
 mod app;
 mod login;
-#[cfg(test)]
-mod metrics;
 mod model;
 mod mpv;
 mod network;
