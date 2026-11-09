@@ -483,6 +483,16 @@ pub(crate) struct BiliGuga {
     /// end of a page pushed this past the end, and the next page's growth let the viewport land
     /// at that stale value: the feed jumped to wherever they had scrolled *past*.
     scroll_pos: std::rc::Rc<std::cell::Cell<Option<(f32, f32)>>>,
+    /// Whether a page has already been asked for while the reader has been inside the paging
+    /// runway. Being near the end is not enough to ask on its own: at [`HOME_MAX_ITEMS`] the
+    /// feed is at its retention limit, and the page that lands at the end adds rows below while
+    /// `trim_home_items` drops as many above, so the content comes back exactly as tall as it
+    /// was, at the same offset, with the reader still at the bottom. A stateless check called
+    /// every frame therefore asked for a page every frame — the feed loaded forever, and what it
+    /// loaded never showed, because the layout it was judged from never changed. Set on asking
+    /// and cleared once the reader is clear of the runway again, so a reader who leaves and
+    /// comes back asks again, and one who simply sits at the bottom asks once.
+    asked_within_runway: bool,
     /// The browse pane's height, measured in `view`, so paging knows how much of the feed is
     /// on screen without guessing from a row count.
     pane_height: std::cell::Cell<f32>,
@@ -586,6 +596,7 @@ impl BiliGuga {
             stage_box: std::cell::Cell::new((320.0, 180.0)),
             feed_pane_width: std::cell::Cell::new(FEED_PANE_MAX),
             scroll_pos: std::rc::Rc::new(std::cell::Cell::new(None)),
+            asked_within_runway: false,
             pane_height: std::cell::Cell::new(700.0),
         }
     }
@@ -683,6 +694,9 @@ impl BiliGuga {
             self.home_generation = self.home_generation.wrapping_add(1);
             self.home_page = 0;
             self.home_has_more = true;
+            // The feed is about to be emptied, so nothing was asked for it: a refresh must be
+            // able to page from the top again.
+            self.asked_within_runway = false;
             self.loading = true;
             self.videos.clear();
             self.feed_error = None;
@@ -727,8 +741,19 @@ impl BiliGuga {
         // so "no room left below" is the same answer as "the reader is at the end".
         let runway = (self.pane_height.get() * PAGE_RUNWAY).max(1.0);
         if max - offset > runway {
+            // Clear of the end: the next approach is news again. A page that lands below the
+            // retention limit moves the end away from the reader and clears this by itself.
+            self.asked_within_runway = false;
             return false;
         }
+        // One page per approach, not one per frame. See `asked_within_runway`: with the feed
+        // trimmed back to its retention limit a landing page leaves both the offset and the
+        // end where they were, so the same reading that asked once would ask again next frame,
+        // forever, and the feed would never draw what it had already loaded.
+        if self.asked_within_runway {
+            return false;
+        }
+        self.asked_within_runway = true;
         self.load_home_page(false);
         true
     }
@@ -2020,7 +2045,20 @@ fn render_feed(app: &BiliGuga) -> El {
             .virtual_rows(
                 rows,
                 (width * 9.0 / 16.0 + 78.0).round(),
-                |_app: &BiliGuga, row_index| format!("grid-row-{row_index}").into(),
+                // Keyed by the first video of the row, not by its index. An index stays the same
+                // when a page lands and the oldest rows are trimmed off the top, so every row
+                // kept its key while showing a different video: layout saw no change at all, the
+                // reader was silently swapped onto other videos, and — since the trimmed rows
+                // and the new ones cancel out — the content never got taller either. A content
+                // key makes a landing a real change: rows keep their identity, the reader's row
+                // stays where it is, and what is below them is what arrived.
+                |app: &BiliGuga, row_index| {
+                    app.current_videos()
+                        .get(row_index * app.card_columns.get())
+                        .map(|video| format!("grid-row-{}", video.bvid))
+                        .unwrap_or_else(|| format!("grid-row-{row_index}"))
+                        .into()
+                },
                 move |app: &BiliGuga, row_index| {
                     let videos = app.current_videos();
                     let mut line = row().w_full().gap(CARD_GAP);
@@ -4164,6 +4202,113 @@ mod tests {
         assert_eq!(app.scroll_pos.get(), None, "nothing is known yet");
         assert!(!app.page_home_if_near_end(), "so nothing is asked for");
         assert!(!app.home_loading);
+    }
+
+    /// Sitting at the bottom of a full feed loads a page, not a page per frame.
+    ///
+    /// This is the shape the retention limit makes: `HOME_MAX_ITEMS` rows loaded, the reader at
+    /// the end, and a landing page that adds twenty rows below while `trim_home_items` drops
+    /// twenty above. The content comes back exactly as tall as it was, at the same offset, so a
+    /// stateless "am I near the end?" asked by `poll` every frame answered yes every frame and
+    /// the feed loaded forever, never drawing any of it. The standing the ask was made at is
+    /// what ends that: an ask needs the reader, or the content, to have moved since.
+    #[test]
+    fn a_reader_sitting_at_the_bottom_of_a_full_feed_asks_once() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(HOME_MAX_ITEMS);
+        app.loading = false;
+        app.home_loading = false;
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        let (offset, max) = (4000.0, 4713.0);
+        app.scroll_pos.set(Some((offset, max)));
+        assert!(app.page_home_if_near_end(), "at the end, it asks");
+        assert!(app.home_loading);
+
+        // The page lands and the trim drops as many rows as it brought: same height, same end,
+        // same offset. Every one of these frames is what `poll` does while nothing is asked of
+        // it.
+        for frame in 0..30 {
+            app.home_loading = false;
+            app.videos.extend(demo_videos(20));
+            while app.videos.len() > HOME_MAX_ITEMS {
+                app.videos.remove(0);
+            }
+            app.scroll_pos.set(Some((offset, max)));
+            assert!(
+                !app.page_home_if_near_end(),
+                "frame {frame}: asked again with nothing changed"
+            );
+        }
+
+        // Clear of the end and back: that is a new approach, and it asks again.
+        app.scroll_pos.set(Some((0.0, max)));
+        assert!(!app.page_home_if_near_end());
+        app.scroll_pos.set(Some((offset, max)));
+        assert!(app.page_home_if_near_end());
+    }
+
+    /// A refresh empties the feed, so the approach state from the old list must not survive it:
+    /// the new feed has to be able to page from the top.
+    #[test]
+    fn a_refresh_clears_the_approach() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(20);
+        app.loading = false;
+        app.home_loading = false;
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        // A page shorter than the pane: it asked at the top, and `max` stays 0.
+        app.scroll_pos.set(Some((0.0, 0.0)));
+        assert!(app.page_home_if_near_end());
+        app.home_loading = false;
+        assert!(!app.page_home_if_near_end(), "the same standing asks once");
+        app.load_home_page(true);
+        // The refresh's own page lands.
+        app.home_loading = false;
+        app.videos = demo_videos(20);
+        app.scroll_pos.set(Some((0.0, 0.0)));
+        assert!(
+            app.page_home_if_near_end(),
+            "the refreshed feed asks for its next page"
+        );
+    }
+
+    /// A grid row is keyed by the video it starts with, so a landing page is a real change to
+    /// layout: an index-keyed row kept its key while showing a different video, which meant a
+    /// page could land and the layout would report nothing at all changed.
+    #[test]
+    fn a_grid_row_is_keyed_by_its_video() {
+        let mut app = BiliGuga::new();
+        app.videos = demo_videos(40);
+        app.loading = false;
+        app.card_columns.set(5);
+        app.card_width.set(232.0);
+        let mut runtime = Runtime::new(app, view, (1360.0, 820.0), rune::Env::new(true, 1.0));
+        runtime.frame(0.0);
+        let keys: Vec<String> = runtime
+            .elements()
+            .into_iter()
+            .filter_map(|element| element.key)
+            .filter(|key| key.starts_with("grid-row-"))
+            .collect();
+        assert!(!keys.is_empty(), "the grid mounted no rows");
+        assert!(
+            keys.iter().all(|key| key.starts_with("grid-row-BV1demo")),
+            "rows are keyed by index, not by content: {keys:?}"
+        );
     }
 
     /// The feed lays out from a plain state, which is what `--snap` shows too.
