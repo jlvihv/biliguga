@@ -39,6 +39,12 @@ use std::{
 };
 
 const HOME_MAX_ITEMS: usize = 120;
+/// How many panes of the rows above the reader a trim keeps before it lets go of them. A page
+/// landing has to be able to *grow* the feed, or the reader who reached the end is still at the
+/// end when the next page arrives, and the rows they are reading get replaced by it. Growth
+/// without a bound is the memory the retention limit exists to cap, so the trim drops only what
+/// the reader has scrolled well past, and the oldest rows still go.
+const TRIM_BEHIND_PANES: f32 = 2.0;
 /// How much of the next page to keep loaded past the bottom of what is loaded, in panes. The
 /// feed asks for more while the reader is within this of the end, so a page arrives before
 /// they reach it rather than after.
@@ -483,16 +489,34 @@ pub(crate) struct BiliGuga {
     /// end of a page pushed this past the end, and the next page's growth let the viewport land
     /// at that stale value: the feed jumped to wherever they had scrolled *past*.
     scroll_pos: std::rc::Rc<std::cell::Cell<Option<(f32, f32)>>>,
-    /// Whether a page has already been asked for while the reader has been inside the paging
-    /// runway. Being near the end is not enough to ask on its own: at [`HOME_MAX_ITEMS`] the
-    /// feed is at its retention limit, and the page that lands at the end adds rows below while
-    /// `trim_home_items` drops as many above, so the content comes back exactly as tall as it
-    /// was, at the same offset, with the reader still at the bottom. A stateless check called
-    /// every frame therefore asked for a page every frame — the feed loaded forever, and what it
-    /// loaded never showed, because the layout it was judged from never changed. Set on asking
-    /// and cleared once the reader is clear of the runway again, so a reader who leaves and
-    /// comes back asks again, and one who simply sits at the bottom asks once.
-    asked_within_runway: bool,
+    /// Set when the feed moves the reader past a row, and cleared when the feed asks for a page.
+    ///
+    /// This is the fact that separates "somebody is scrolling" from "the layout settled", and
+    /// distance to the end cannot tell them apart: a landing adds rows below, `trim_home_items`
+    /// takes rows off the top, and when the two cancel out the end sits exactly where it was, so
+    /// a reader parked at the bottom looks identical, frame after frame, to one who is still
+    /// travelling. `poll` runs the check on every frame, so that reading asked for a page on
+    /// every frame — the feed loaded forever and could never show what it had brought, because
+    /// what it brought never made the feed any taller.
+    ///
+    /// It is fed by the viewport's own `on_scroll_offset`, and counts *rows*, not points: that
+    /// handler is the only thing every way of scrolling the feed goes through (the wheel below,
+    /// a trackpad, a drag, the arrow keys, Page Down), and a row is what paging is about. A
+    /// ramp that lands under a reader who has not touched anything does not move the offset
+    /// (the trim keeps their row in place), so it does not set this either.
+    reader_row: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    /// The reader's place when the feed last asked for a page, counted in rows of the whole feed
+    /// rather than of the list currently loaded: `trim_home_items` drops rows off the top, which
+    /// shortens the list under the reader, and a bare index into the current list would then sit
+    /// permanently ahead of them — the feed would ask once and never again, however far they
+    /// scrolled. Measured this way, "the reader has moved on" survives a trim, and a landing that
+    /// the trim immediately cancels out leaves the number where it was, which is what keeps a
+    /// parked reader from paging forever.
+    asked_row: Option<usize>,
+    /// Rows the trim has dropped from the top of the feed since it was loaded, so a row index in
+    /// the current list can be turned into one of the whole feed.
+    trimmed_rows: usize,
+
     /// The browse pane's height, measured in `view`, so paging knows how much of the feed is
     /// on screen without guessing from a row count.
     pane_height: std::cell::Cell<f32>,
@@ -596,7 +620,11 @@ impl BiliGuga {
             stage_box: std::cell::Cell::new((320.0, 180.0)),
             feed_pane_width: std::cell::Cell::new(FEED_PANE_MAX),
             scroll_pos: std::rc::Rc::new(std::cell::Cell::new(None)),
-            asked_within_runway: false,
+            // `None` until the viewport has been laid out once: the first frame is what turns
+            // the offset into a row.
+            reader_row: std::rc::Rc::new(std::cell::Cell::new(None)),
+            asked_row: None,
+            trimmed_rows: 0,
             pane_height: std::cell::Cell::new(700.0),
         }
     }
@@ -646,7 +674,31 @@ impl BiliGuga {
         if self.videos.len() <= HOME_MAX_ITEMS {
             return;
         }
-        let remove_count = self.videos.len() - HOME_MAX_ITEMS;
+        // Only what the reader has scrolled well past may go. Trimming from the front
+        // unconditionally was wrong in a way a reader could see: a page landing at the end added
+        // twenty rows below, the trim took twenty off the top, and the content came back exactly
+        // as tall as it was — so the end never moved away from the reader, the feed could not
+        // advance out of the paging runway, and what they were reading was replaced by the next
+        // page's every time one landed.
+        let row_height = self.feed_row_height().max(1.0);
+        let behind = self.reader_row.get().unwrap_or(0);
+        let keep_behind = (self.pane_height.get() * TRIM_BEHIND_PANES / row_height).ceil() as usize;
+        let droppable = behind.saturating_sub(keep_behind);
+        let remove_count = (self.videos.len() - HOME_MAX_ITEMS).min(droppable);
+        if remove_count == 0 {
+            return;
+        }
+        // In whole grid rows. A grid row's key is its first video's bvid, so dropping a number
+        // of videos that is not a multiple of the column count renumbers *every* row: row 5 used
+        // to start at video 25 and now starts at video 21, which reads to the virtual list as an
+        // entirely new row. Every row on screen then counts as replaced, which is exactly the
+        // "the rows keep being overwritten" a reader saw. One column (a list) is the same rule
+        // with a row being a single video.
+        let per_row = self.card_columns.get().max(1);
+        let remove_count = (remove_count / per_row) * per_row;
+        if remove_count == 0 {
+            return;
+        }
         let dropped: Vec<String> = self.videos.drain(..remove_count).map(|v| v.bvid).collect();
         for bvid in dropped {
             self.forget_cover(&bvid);
@@ -654,6 +706,24 @@ impl BiliGuga {
         self.selected = self
             .selected
             .map(|selected| selected.saturating_sub(remove_count));
+        // In rows, like `reader_row`: the two are added together to place the reader in the
+        // whole feed, so they have to be counted the same way.
+        self.trimmed_rows += remove_count / per_row;
+        // Nothing else to do about the reader's place: Rune's virtual list anchors the commit to
+        // the row the reader is on and moves the viewport by itself (`anchor_delta` in
+        // `runtime/commit/measure.rs`), so rows dropped above them do not shift what they see.
+        // Moving the offset here as well would apply that shift twice.
+    }
+
+    /// One row of the browse grid or of the list, as the last frame laid it out. Turns a scroll
+    /// offset into a count of rows, which is what paging is about: a reader who has scrolled past
+    /// three more rows has moved on, whatever the pixel height of a row happens to be.
+    fn feed_row_height(&self) -> f32 {
+        if self.card_columns.get() >= 2 {
+            (self.card_width.get() * 9.0 / 16.0 + 78.0).round()
+        } else {
+            LIST_ROW_HEIGHT
+        }
     }
 
     /// Every bvid any feed column, the player or the open collection can still show. A cover
@@ -694,9 +764,10 @@ impl BiliGuga {
             self.home_generation = self.home_generation.wrapping_add(1);
             self.home_page = 0;
             self.home_has_more = true;
-            // The feed is about to be emptied, so nothing was asked for it: a refresh must be
-            // able to page from the top again.
-            self.asked_within_runway = false;
+            // The feed is about to be emptied, so nothing was asked for the list that is going
+            // away: the first row of the new one is a new approach to its end.
+            self.asked_row = None;
+            self.trimmed_rows = 0;
             self.loading = true;
             self.videos.clear();
             self.feed_error = None;
@@ -741,21 +812,30 @@ impl BiliGuga {
         // so "no room left below" is the same answer as "the reader is at the end".
         let runway = (self.pane_height.get() * PAGE_RUNWAY).max(1.0);
         if max - offset > runway {
-            // Clear of the end: the next approach is news again. A page that lands below the
-            // retention limit moves the end away from the reader and clears this by itself.
-            self.asked_within_runway = false;
             return false;
         }
-        // One page per approach, not one per frame. See `asked_within_runway`: with the feed
-        // trimmed back to its retention limit a landing page leaves both the offset and the
-        // end where they were, so the same reading that asked once would ask again next frame,
-        // forever, and the feed would never draw what it had already loaded.
-        if self.asked_within_runway {
+        // Near the end, and the reader has moved on since the last page was asked for. See
+        // `reader_row`: this is the case that a page per frame used to look like without it.
+        // The reader's place in the whole feed: rows the trim has taken off the top, plus their
+        // row in the list as it stands.
+        let row = self.reader_row.get().map(|row| row + self.trimmed_rows);
+        if row.is_some() && row <= self.asked_row {
             return false;
         }
-        self.asked_within_runway = true;
+        self.asked_row = row;
         self.load_home_page(false);
         true
+    }
+
+    /// Puts the feed where a reader who has scrolled to `offset` leaves it: the scroll position
+    /// `poll` reads, and the row it counts as their place. Tests say both because a bare offset
+    /// is a viewport no reader ever stood at — the row comes from the view, which is not running.
+    #[cfg(test)]
+    fn place_reader(&mut self, offset: f32, max: f32) {
+        self.scroll_pos.set(Some((offset, max)));
+        let row_height = self.feed_row_height().max(1.0);
+        self.reader_row
+            .set(Some((offset / row_height).floor() as usize));
     }
 
     fn load_search(&mut self) {
@@ -2099,7 +2179,13 @@ fn render_feed(app: &BiliGuga) -> El {
     // change rather than per frame, and the feed asks for more when that range gets close to the
     // end. Nothing here depends on how tall the loaded page happens to be.
     let scroll_read = app.scroll_pos.clone();
+    let scroll_wheel_read = app.scroll_pos.clone();
     let scroll_wheel = app.scroll_pos.clone();
+    let reader_row = app.reader_row.clone();
+    let wheel_row = app.reader_row.clone();
+    // One row of the browse grid, as this frame lays it out: turns a scroll offset into the row
+    // count paging is about. A plain value, not a `Cell`: it cannot change under a handler.
+    let row_height = app.feed_row_height();
     let viewport = col()
         .key("feed-scroll")
         .grow(1.0)
@@ -2108,8 +2194,18 @@ fn render_feed(app: &BiliGuga) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
-        // Where it stands, for the wheel handler below.
-        .on_scroll_offset(move |at| scroll_read.set(Some((at.offset[1], at.max[1]))))
+        // Where it stands, for the wheel handler below, and for `poll`'s paging check. Every
+        // way of scrolling the feed passes through here — the wheel below, a trackpad, a drag,
+        // the arrow keys, Page Down — which is why the row that drives paging is counted here
+        // and not in the wheel handler.
+        .on_scroll_offset(move |at| {
+            let at = (at.offset[1], at.max[1]);
+            scroll_read.set(Some(at));
+            scroll_wheel_read.set(Some(at));
+            if row_height > 0.0 {
+                reader_row.set(Some((at.0 / row_height).floor() as usize));
+            }
+        })
         // A notched wheel takes the feed further per click than Rune's flat 40 points. Taking
         // the delta means placing the viewport here, so the offset above is read back; a
         // trackpad (`precise`) and horizontal gestures are left to Rune.
@@ -2133,6 +2229,12 @@ fn render_feed(app: &BiliGuga) -> El {
                 // viewport, so holding the wheel at the end cannot build up an offset past it
                 // for the next page's growth to spring to.
                 scroll_wheel.set(Some((to, max)));
+                // This handler places the viewport itself, so the offset handler that counts
+                // rows hears about it a frame later; count it now so a reader scrolling faster
+                // than a page a frame still pages as fast as they read.
+                if row_height > 0.0 {
+                    wheel_row.set(Some((to / row_height).floor() as usize));
+                }
                 tx.scroll_to_instant("feed-scroll", 0.0, to);
                 true
             },
@@ -3229,9 +3331,11 @@ fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     //
     // A scroll callback could not do this job: it may not change state, and it would miss the
     // ways of moving the feed that are not the wheel (a trackpad, the arrow keys, Page Down).
-    if app.page_home_if_near_end() {
-        changed = true;
-    }
+    //
+    // Asking is not a visible change and must not report one: `poll` returning true commits the
+    // view, and a commit in the middle of a landing re-runs the layout the landing is measuring.
+    // The page's own arrival reports the change instead, a round trip later.
+    app.page_home_if_near_end();
 
     while let Ok(event) = app.events.try_recv() {
         changed = true;
@@ -4074,10 +4178,10 @@ mod tests {
         app.active_tab = AppTab::Home;
         app.pane_height.set(713.0);
         // Well above the end: nothing to do.
-        app.scroll_pos.set(Some((0.0, 8000.0)));
+        app.place_reader(0.0, 8000.0);
         assert!(!app.page_home_if_near_end());
         // One pane from the end: ask now.
-        app.scroll_pos.set(Some((8000.0 - 713.0, 8000.0)));
+        app.place_reader(8000.0 - 713.0, 8000.0);
         assert!(app.page_home_if_near_end());
         assert_eq!(app.home_page, 1, "and ask for page 1");
         assert!(app.home_loading);
@@ -4105,7 +4209,7 @@ mod tests {
         // Every position on the way back up, from the end to the top.
         let mut y = max;
         while y > 0.0 {
-            app.scroll_pos.set(Some((y, max)));
+            app.place_reader(y, max);
             y -= 100.0;
             // Only the last pane can ask, and once it is asked the request is in flight.
             if !app.home_loading {
@@ -4118,7 +4222,7 @@ mod tests {
         assert_eq!(app.home_page, 1, "asked once, at the bottom");
         assert!(app.home_loading);
         // Everything above the bottom pane changes nothing while the request is in flight.
-        app.scroll_pos.set(Some((0.0, max)));
+        app.place_reader(0.0, max);
         assert!(!app.page_home_if_near_end());
     }
 
@@ -4138,7 +4242,7 @@ mod tests {
         app.active_tab = AppTab::Home;
         app.pane_height.set(713.0);
         // Nothing to scroll, and the list is shorter than the pane.
-        app.scroll_pos.set(Some((0.0, 0.0)));
+        app.place_reader(0.0, 0.0);
         assert!(app.page_home_if_near_end());
         // With nothing left to load, it asks for nothing however close the reader gets.
         app.home_loading = false;
@@ -4165,7 +4269,7 @@ mod tests {
         app.active_tab = AppTab::Home;
         app.pane_height.set(713.0);
         // Nothing below the last row, and the reader there: the feed is waiting on a page.
-        app.scroll_pos.set(Some((0.0, 0.0)));
+        app.place_reader(0.0, 0.0);
         // The page lands as an event, with the rows it brings.
         drop(events);
         // Before the event is applied the viewport still describes the old, shorter content;
@@ -4227,31 +4331,33 @@ mod tests {
         app.active_tab = AppTab::Home;
         app.pane_height.set(713.0);
         let (offset, max) = (4000.0, 4713.0);
-        app.scroll_pos.set(Some((offset, max)));
+        app.place_reader(offset, max);
         assert!(app.page_home_if_near_end(), "at the end, it asks");
         assert!(app.home_loading);
 
         // The page lands and the trim drops as many rows as it brought: same height, same end,
-        // same offset. Every one of these frames is what `poll` does while nothing is asked of
-        // it.
+        // same offset, and nobody has touched the wheel. Every one of these frames is what
+        // `poll` does while the reader sits there.
         for frame in 0..30 {
             app.home_loading = false;
             app.videos.extend(demo_videos(20));
             while app.videos.len() > HOME_MAX_ITEMS {
                 app.videos.remove(0);
             }
-            app.scroll_pos.set(Some((offset, max)));
+            app.place_reader(offset, max);
             assert!(
                 !app.page_home_if_near_end(),
-                "frame {frame}: asked again with nothing changed"
+                "frame {frame}: asked again though the reader has not moved"
             );
         }
 
-        // Clear of the end and back: that is a new approach, and it asks again.
-        app.scroll_pos.set(Some((0.0, max)));
-        assert!(!app.page_home_if_near_end());
-        app.scroll_pos.set(Some((offset, max)));
-        assert!(app.page_home_if_near_end());
+        // The reader moves on and is still at the end: ask for the page that follows.
+        let asked = app.asked_row.expect("just asked");
+        app.reader_row.set(Some(asked + 1));
+        assert!(
+            app.page_home_if_near_end(),
+            "the reader moved on, so it asks again"
+        );
     }
 
     /// A refresh empties the feed, so the approach state from the old list must not survive it:
@@ -4271,7 +4377,7 @@ mod tests {
         app.active_tab = AppTab::Home;
         app.pane_height.set(713.0);
         // A page shorter than the pane: it asked at the top, and `max` stays 0.
-        app.scroll_pos.set(Some((0.0, 0.0)));
+        app.place_reader(0.0, 0.0);
         assert!(app.page_home_if_near_end());
         app.home_loading = false;
         assert!(!app.page_home_if_near_end(), "the same standing asks once");
@@ -4279,7 +4385,7 @@ mod tests {
         // The refresh's own page lands.
         app.home_loading = false;
         app.videos = demo_videos(20);
-        app.scroll_pos.set(Some((0.0, 0.0)));
+        app.place_reader(0.0, 0.0);
         assert!(
             app.page_home_if_near_end(),
             "the refreshed feed asks for its next page"
@@ -4308,6 +4414,213 @@ mod tests {
         assert!(
             keys.iter().all(|key| key.starts_with("grid-row-BV1demo")),
             "rows are keyed by index, not by content: {keys:?}"
+        );
+    }
+
+    /// The rows a reader can see, top to bottom, by the key the grid gives them.
+    fn visible_rows(rt: &Runtime<BiliGuga>) -> Vec<String> {
+        let Some([_, top, _, height]) = rt.presented("feed-scroll").map(|presented| presented.0)
+        else {
+            return Vec::new();
+        };
+        let bottom = top + height;
+        let mut rows: Vec<(f32, String)> = rt
+            .elements()
+            .into_iter()
+            .filter_map(|element| {
+                let key = element.key?;
+                if !key.starts_with("grid-row-") {
+                    return None;
+                }
+                let (y, h) = (element.rect[1], element.rect[3]);
+                (y + h > top + 1.0 && y < bottom - 1.0).then_some((y, key))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, key)| key).collect()
+    }
+
+    /// Drives the real view and the real `poll`, answering each page the feed asks for as the
+    /// network would, so what these tests see is what a reader would.
+    struct FeedRig {
+        runtime: Runtime<BiliGuga>,
+        events: std::sync::mpsc::Sender<Event>,
+        answered: usize,
+        serial: usize,
+    }
+
+    impl FeedRig {
+        fn new() -> Self {
+            let mut app = BiliGuga::new();
+            app.videos = demo_videos(HOME_MAX_ITEMS);
+            app.loading = false;
+            app.home_loading = false;
+            app.home_has_more = true;
+            let events = app.worker.as_ref().expect("a worker").events.clone();
+            let mut runtime = Runtime::new(app, view, (1360.0, 820.0), rune::Env::new(true, 1.0));
+            runtime.poll = Some(poll);
+            runtime.frame(0.0);
+            Self {
+                runtime,
+                events,
+                answered: 0,
+                serial: 0,
+            }
+        }
+
+        /// Answers a request the feed made, with rows nobody has seen.
+        fn answer(&mut self) {
+            if !self.runtime.state.home_loading {
+                return;
+            }
+            let videos = (0..20)
+                .map(|_| {
+                    let mut video = demo_video(0);
+                    video.bvid = format!("BV1landed{}", self.serial);
+                    self.serial += 1;
+                    video
+                })
+                .collect();
+            self.events
+                .send(Event::Home(
+                    Ok(api::RecommendationPage {
+                        videos,
+                        has_more: true,
+                    }),
+                    self.runtime.state.home_generation,
+                ))
+                .expect("the app is listening");
+            self.answered += 1;
+        }
+
+        /// One frame with a wheel delta over the feed, and the network's answer to it.
+        fn step(&mut self, delta: f32, clock: f64) {
+            self.runtime.wheel(600.0, 400.0, delta);
+            self.frame(clock);
+        }
+
+        /// One frame with no input at all: what `poll` alone does while the reader sits still.
+        fn idle(&mut self, clock: f64) {
+            self.frame(clock);
+        }
+
+        fn frame(&mut self, clock: f64) {
+            self.runtime.frame(clock);
+            // The network is fast enough that a page can land within the frame that asked for
+            // it, and a feed that asks on every frame looks exactly like one that asks once
+            // when the answer takes a round trip. Answer until the feed stops asking, so these
+            // tests see the loop rather than a sampling of it.
+            for _ in 0..4 {
+                if !self.runtime.state.home_loading {
+                    break;
+                }
+                self.answer();
+                self.runtime.frame(clock);
+            }
+        }
+    }
+
+    /// Scrolling through a feed at its retention limit keeps bringing pages, and a landing never
+    /// moves the rows on screen.
+    ///
+    /// This is the half of the retention limit that used to hurt: the trim dropped as many rows
+    /// off the top as a landing brought at the bottom, so the feed never got taller, the reader
+    /// never left the end, and what was on screen was swapped for the next page every time one
+    /// landed. The check is made with the reader standing still — a row that scrolls out of the
+    /// pane is the reader moving, not a landing misbehaving.
+    #[test]
+    fn scrolling_keeps_arriving_and_a_landing_does_not_move_the_screen() {
+        let mut rig = FeedRig::new();
+        let mut landings = Vec::new();
+        let mut last_answered = 0;
+        // What the reader sees before a landing, and what they see after it, with no scrolling
+        // in between.
+        let mut replaced = Vec::new();
+        for step in 0..200 {
+            // A notch a frame: a hundred points, what a wheel does over the feed.
+            rig.step(-100.0, step as f64 / 60.0);
+            let page_landed = rig.answered != last_answered;
+            if page_landed {
+                last_answered = rig.answered;
+                landings.push(step);
+            }
+            // Now stand still and let whatever is in flight arrive.
+            let before = visible_rows(&rig.runtime);
+            let answered_before = rig.answered;
+            rig.idle(500.0 + step as f64 / 60.0);
+            if rig.answered != answered_before {
+                let after = visible_rows(&rig.runtime);
+                let kept = before.iter().filter(|row| after.contains(row)).count();
+                if !before.is_empty() && kept < before.len() {
+                    replaced.push((step, kept, before.len(), before, after));
+                }
+            }
+        }
+        assert!(
+            replaced.is_empty(),
+            "a landing replaced what the reader was reading: {:?}",
+            &replaced[..replaced.len().min(3)]
+        );
+        assert!(
+            rig.answered >= 5,
+            "the feed stopped arriving after {} pages",
+            rig.answered
+        );
+        let per_frame = rig.answered as f64 / 200.0;
+        assert!(
+            per_frame < 0.5,
+            "a page every {:.2} frames: it is spinning",
+            per_frame
+        );
+        assert!(
+            landings.windows(2).all(|pair| pair[1] - pair[0] >= 2),
+            "two landings in as many frames: {landings:?}"
+        );
+    }
+
+    /// A reader who stops at the bottom gets the page already in flight and then nothing: the
+    /// feed settles, and stays settled.
+    #[test]
+    fn a_reader_who_stops_at_the_bottom_gets_one_page_and_then_rest() {
+        let mut rig = FeedRig::new();
+        for step in 0..60 {
+            rig.step(-1000.0, step as f64 / 60.0);
+        }
+        // Nobody touches the wheel from here on.
+        for step in 0..120 {
+            rig.runtime.frame(100.0 + step as f64 / 60.0);
+            rig.answer();
+        }
+        let settled = rig.answered;
+        for step in 0..300 {
+            rig.runtime.frame(400.0 + step as f64 / 60.0);
+            rig.answer();
+        }
+        assert_eq!(
+            rig.answered,
+            settled,
+            "asked {} pages while the reader sat still",
+            rig.answered - settled
+        );
+    }
+
+    /// Scrolling back up and down again asks again: that is a new approach to the end.
+    #[test]
+    fn coming_back_to_the_end_asks_again() {
+        let mut rig = FeedRig::new();
+        for step in 0..60 {
+            rig.step(-1000.0, step as f64 / 60.0);
+        }
+        let before = rig.answered;
+        for step in 0..40 {
+            rig.step(1000.0, 100.0 + step as f64 / 60.0);
+        }
+        for step in 0..60 {
+            rig.step(-1000.0, 200.0 + step as f64 / 60.0);
+        }
+        assert!(
+            rig.answered > before,
+            "coming back to the end asked for nothing ({before} pages before it)"
         );
     }
 
