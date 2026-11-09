@@ -27,10 +27,9 @@ use crate::{
     mpv, network,
     power::PowerInhibitor,
 };
-use rune::tok::type_;
 use rune::{
     AppSpec, Color, Cx, Drag, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, Phase, ScrollSpec,
-    SurfaceFit, TextEdit, Tx, Waker, col, el, row, text, text_input,
+    SurfaceFit, TextEdit, TextStyle, Tx, Waker, WheelEvent, col, el, row, text, text_input,
 };
 use std::{
     fs,
@@ -40,17 +39,42 @@ use std::{
 };
 
 const HOME_MAX_ITEMS: usize = 120;
+/// How much of the next page to keep loaded past the bottom of what is loaded, in panes. The
+/// feed asks for more while the reader is within this of the end, so a page arrives before
+/// they reach it rather than after.
+const PAGE_RUNWAY: f32 = 1.0;
 /// How many decoded covers to keep. A cover is 57 KB, so this bounds the cache at a few
 /// megabytes even if some path keeps adding rows without trimming.
 const COVER_CACHE_LIMIT: usize = 256;
 const SPEED_OPTIONS: [f64; 5] = [0.5, 1., 1.25, 1.5, 2.];
 const DEFAULT_VOLUME: f64 = 100.;
 const DEFAULT_SPEED: f64 = 1.;
-const SIDEBAR_WIDTH: f32 = 64.;
-const FEED_WIDTH: f32 = 414.;
-const GRID_CARD_HEIGHT: f32 = 170.;
-const GRID_CARD_WIDTH: f32 = 190.;
-/// How long the player's controls stay up after the pointer moves.
+/// The left navigation rail.
+const RAIL_WIDTH: f32 = 88.;
+/// The feed pane's width while a video is open beside it: a share of the window, held between
+/// these bounds, so the player beside it keeps the room a 16:9 frame needs.
+const FEED_PANE_MIN: f32 = 300.;
+const FEED_PANE_MAX: f32 = 460.;
+const FEED_PANE_SHARE: f32 = 0.32;
+/// Padding inside every pane.
+const PANE_PAD: f32 = 20.;
+/// The narrowest a browse card gets before the grid gives up a column.
+const CARD_MIN_WIDTH: f32 = 232.;
+/// The space between two cards, and the padding inside one around its cover.
+const CARD_GAP: f32 = 14.;
+const CARD_PAD: f32 = 6.;
+/// How many points one notch of a mouse wheel moves the feed.
+///
+/// Rune turns a notch into a flat 40 points, which was a quarter of the old 170-point cards
+/// and is a *fifth* of a row now that a poster card is ~200 points tall: the feed crawled, and
+/// the two dozen notches a page of posters takes felt broken. A hundred points a notch is what
+/// a browser scrolls, and it moves half a card, so a card can be crossed in two.
+const WHEEL_NOTCH: f32 = 100.0;
+/// The list layout's row: a 74-point cover plus the padding around it.
+const LIST_ROW_HEIGHT: f32 = 88.0;
+/// What Rune itself moves for a notch, so the handler below can scale rather than assume.
+const RUNE_WHEEL_NOTCH: f32 = 40.0;
+/// How long the player's controls stay up after the pointer moves, in full screen.
 const CONTROLS_LINGER: Duration = Duration::from_millis(2400);
 
 fn player_settings_path() -> Option<PathBuf> {
@@ -112,7 +136,10 @@ fn save_player_settings(volume: f64, speed: f64) {
 /// These used to be functions calling `oklch(..)` on every access, so the OKLCH to linear-sRGB
 /// conversion ran thousands of times a frame (each `theme::HOVER` in each row) and produced the
 /// same numbers every time. They are the same colours, precomputed; the comment on each is the
-/// `oklch(l c h)` it came from, so a designer can still edit the triple and rerun the conversion.
+/// sRGB hex it came from, so a designer can still edit one and rerun the conversion.
+///
+/// The palette is one hue family (a cool near-black) with a single warm accent, so the eye lands
+/// on the poster art and the one thing that is clickable rather than on the chrome.
 mod theme {
     use rune::Color;
 
@@ -120,32 +147,42 @@ mod theme {
         Color { r, g, b, a: 1.0 }
     }
 
-    /// oklch(0.185 0.02 265)
-    pub(super) const BG: Color = c(0.004_503_9, 0.006_317_4, 0.011_431_3);
-    /// oklch(0.215 0.022 265)
-    pub(super) const PANEL: Color = c(0.007_211_4, 0.009_929_4, 0.017_459_9);
-    /// oklch(0.205 0.021 265)
-    pub(super) const FEED: Color = c(0.006_248_8, 0.008_607_1, 0.015_143_3);
-    /// oklch(0.30 0.022 265)
-    pub(super) const BORDER: Color = c(0.021_578_9, 0.027_099_4, 0.041_115);
-    /// oklch(0.94 0.004 265)
-    pub(super) const TEXT: Color = c(0.820_442, 0.831_242, 0.853_617);
-    /// oklch(0.72 0.012 265)
-    pub(super) const TEXT_DIM: Color = c(0.355_543, 0.374_257, 0.414_456);
-    /// oklch(0.58 0.014 265)
-    pub(super) const TEXT_FAINT: Color = c(0.181_774, 0.195_807, 0.226_616);
-    /// oklch(0.62 0.19 285)
-    pub(super) const ACCENT: Color = c(0.209_745, 0.156_45, 0.884_517);
-    /// oklch(0.72 0.15 285)
-    pub(super) const ACCENT_SOFT: Color = c(0.332_29, 0.300_493, 0.990_357);
-    /// oklch(0.245 0.024 265)
-    pub(super) const HOVER: Color = c(0.010_830_8, 0.014_706_3, 0.025_302_4);
-    /// oklch(0.28 0.05 280)
-    pub(super) const ACTIVE_ROW: Color = c(0.017_726_2, 0.019_160_6, 0.052_899_6);
-    /// oklch(0.66 0.16 25)
-    pub(super) const DANGER: Color = c(0.771_293, 0.127_848, 0.113_027);
-    /// oklch(0.42 0.02 265)
-    pub(super) const TRACK: Color = c(0.064_254_2, 0.074_446_4, 0.098_420_2);
+    /// #0A0B0F — the page behind everything.
+    pub(super) const BG: Color = c(0.003_035, 0.003_347, 0.004_777);
+    /// #0E1015 — the navigation rail, one step up from the page.
+    pub(super) const RAIL: Color = c(0.004_391, 0.005_182, 0.007_499);
+    /// #111319 — the player column and control bars.
+    pub(super) const PANEL: Color = c(0.005_605, 0.006_512, 0.009_721);
+    /// #16181F — anything raised: cards, fields, chips.
+    pub(super) const CARD: Color = c(0.008_023, 0.009_134, 0.013_702);
+    /// #1B1E27 — an input well, a shade above a card so a field reads as editable.
+    pub(super) const FIELD: Color = c(0.010_960, 0.012_983, 0.019_382);
+    /// #1E212B — a card under the pointer.
+    pub(super) const CARD_HOVER: Color = c(0.012_983, 0.015_209, 0.024_158);
+    /// #23262F — a visible edge, for fields and the split between panes.
+    pub(super) const BORDER: Color = c(0.016_807, 0.019_382, 0.028_426);
+    /// #191C24 — a divider that only needs to be sensed.
+    pub(super) const HAIRLINE: Color = c(0.009_721, 0.011_612, 0.017_642);
+    /// #F1F3F7
+    pub(super) const TEXT: Color = c(0.879_622, 0.896_269, 0.930_111);
+    /// #A3ABBA — secondary: uploaders, counts, metadata.
+    pub(super) const TEXT_DIM: Color = c(0.366_253, 0.407_240, 0.491_021);
+    /// #6E7686 — tertiary: labels, hints, placeholders.
+    pub(super) const TEXT_FAINT: Color = c(0.155_926, 0.181_164, 0.238_398);
+    /// #FB7299 — the one accent: the play button, the active tab, the seek fill.
+    pub(super) const ACCENT: Color = c(0.964_686, 0.168_269, 0.318_547);
+    /// #FF9CBE — the accent as text, which has to be lighter to stay readable.
+    pub(super) const ACCENT_SOFT: Color = c(1.0, 0.332_452, 0.514_918);
+    /// #3A1B25 — the accent, nearly black, for a selected row's wash.
+    pub(super) const ACCENT_DIM: Color = c(0.042_311, 0.010_960, 0.018_500);
+    /// #FF6B6B
+    pub(super) const DANGER: Color = c(1.0, 0.147_027, 0.147_027);
+    /// #2A2E39 — the unfilled half of a slider.
+    pub(super) const TRACK: Color = c(0.023_153, 0.027_321, 0.040_915);
+    /// The pointer resting on something that can be pressed.
+    pub(super) const HOVER: Color = c(0.008_023, 0.009_134, 0.014_000);
+    /// The pointer holding it down.
+    pub(super) const PRESS: Color = c(0.013_000, 0.015_209, 0.024_158);
 
     /// The placeholder a cover shows before its pixels arrive: the row's own accent, which
     /// `api` assigns per position so a feed of half-loaded covers still looks intentional.
@@ -370,6 +407,10 @@ pub(crate) struct BiliGuga {
     volume_dragging: bool,
     controls_until: Option<Instant>,
     player_fullscreen: bool,
+    /// Windowed, the player can take the whole window instead of sharing it with the feed: a
+    /// video that wants the room does not need the OS-level full screen (which hides the rail
+    /// and the title bar) to get it.
+    theater: bool,
     playing_video: Option<Video>,
     /// The stage size the view last drew at.
     ///
@@ -424,6 +465,32 @@ pub(crate) struct BiliGuga {
     /// Set by any `Event` that added rows, so `poll` looks for missing covers once per frame
     /// rather than once per answer.
     new_rows: bool,
+    /// How many cards the browse grid fits across, and how wide each one is. `view` gets
+    /// `&self`, so — as with `stage_size` — it measures the pane and leaves the numbers here
+    /// for the grid it is building in the same pass.
+    card_columns: std::cell::Cell<usize>,
+    card_width: std::cell::Cell<f32>,
+    /// Where the feed's scroll viewport stands and how far it can go, published by
+    /// `on_scroll_offset` so the wheel handler (which takes the delta and places the viewport
+    /// itself) knows both. An `Rc<Cell>` because `on_scroll_offset` may not change state: it is
+    /// a per-frame read, not a commit.
+    ///
+    /// `None` until the viewport has been laid out once. That matters as much as the numbers:
+    /// before the first layout `max` is 0, which reads as "there is nothing below the last row",
+    /// and taking that for the truth paged the feed four times in its first four frames.
+    ///
+    /// The limit matters as much as the offset. Without it, a reader holding the wheel at the
+    /// end of a page pushed this past the end, and the next page's growth let the viewport land
+    /// at that stale value: the feed jumped to wherever they had scrolled *past*.
+    scroll_pos: std::rc::Rc<std::cell::Cell<Option<(f32, f32)>>>,
+    /// The browse pane's height, measured in `view`, so paging knows how much of the feed is
+    /// on screen without guessing from a row count.
+    pane_height: std::cell::Cell<f32>,
+    /// The width the feed gets while the player shares the window with it.
+    feed_pane_width: std::cell::Cell<f32>,
+    /// The box `view` gives the stage, worked out from the player column's own size: the video
+    /// keeps its 16:9 shape without ever growing taller than the room it has.
+    stage_box: std::cell::Cell<(f32, f32)>,
 }
 
 impl BiliGuga {
@@ -481,6 +548,7 @@ impl BiliGuga {
             volume_dragging: false,
             controls_until: None,
             player_fullscreen: false,
+            theater: false,
             playing_video: None,
             stage_size: std::cell::Cell::new(None),
             stats: None,
@@ -513,6 +581,12 @@ impl BiliGuga {
             last_position: 0.,
             action_note: None,
             new_rows: false,
+            card_columns: std::cell::Cell::new(2),
+            card_width: std::cell::Cell::new(CARD_MIN_WIDTH),
+            stage_box: std::cell::Cell::new((320.0, 180.0)),
+            feed_pane_width: std::cell::Cell::new(FEED_PANE_MAX),
+            scroll_pos: std::rc::Rc::new(std::cell::Cell::new(None)),
+            pane_height: std::cell::Cell::new(700.0),
         }
     }
 }
@@ -627,6 +701,38 @@ impl BiliGuga {
         );
     }
 
+    /// Asks for the next home page while the reader is within [`PAGE_RUNWAY`] of the end of
+    /// what is loaded, and says whether that changed anything.
+    ///
+    /// The test is on the distance to the end of the content, and nothing else. Reading it off
+    /// the grid's *visible rows* was wrong twice over: the range comes from row heights, so a
+    /// commit that measures a row shifts it by one, and the check then flips direction — the
+    /// reader could sit at the bottom of a page without it loading, then nudge the wheel up and
+    /// watch it load. Distance to the end has no such edge: scrolling up only increases it.
+    fn page_home_if_near_end(&mut self) -> bool {
+        if self.active_tab != AppTab::Home
+            || self.home_loading
+            || !self.home_has_more
+            || self.videos.is_empty()
+        {
+            return false;
+        }
+        // Nothing is known about where the viewport stands until it has been laid out once, and
+        // its `max` is 0 before that: treated as the truth, it says "the last row is the bottom
+        // of the pane" and the feed pages away before it has anything to show.
+        let Some((offset, max)) = self.scroll_pos.get() else {
+            return false;
+        };
+        // A page that fits the pane has nothing to scroll (max == 0) and is still short of it,
+        // so "no room left below" is the same answer as "the reader is at the end".
+        let runway = (self.pane_height.get() * PAGE_RUNWAY).max(1.0);
+        if max - offset > runway {
+            return false;
+        }
+        self.load_home_page(false);
+        true
+    }
+
     fn load_search(&mut self) {
         // Read from the field itself: `search_query` was a second copy kept in step by hand at
         // four call sites, and three of those synced it immediately before this function
@@ -726,6 +832,9 @@ impl BiliGuga {
         }
         self.active_tab = tab;
         self.selected = None;
+        // A failure belongs to the tab it happened on. Carrying it over showed the previous
+        // tab's error on a tab that had not even asked for anything yet.
+        self.feed_error = None;
         match tab {
             AppTab::Home if self.videos.is_empty() => self.load_home_page(false),
             AppTab::Dynamic => self.load_signed_in(SignedInFeed::Dynamic),
@@ -825,6 +934,22 @@ impl BiliGuga {
         self.power_inhibitor.set_active(false);
     }
 
+    /// Closes the player and gives the window back to the browse pane.
+    fn close_player(&mut self) {
+        self.stop_playback();
+        self.playing_video = None;
+        self.stats = None;
+        self.collection = None;
+        self.comments.clear();
+        self.comments_total = 0;
+        self.comments_error = None;
+        self.action_note = None;
+        self.playback_error = None;
+        self.open_menu = None;
+        self.theater = false;
+        self.selected = None;
+    }
+
     fn seek_percent(&mut self, percent: f64) {
         self.player.seek_percent(percent.clamp(0., 1.));
     }
@@ -865,6 +990,19 @@ impl BiliGuga {
 
     fn show_controls(&mut self) {
         self.controls_until = Some(Instant::now() + CONTROLS_LINGER);
+    }
+
+    /// Whether the browse pane is waiting on a request. A signed-in feed knows, the home feed
+    /// only while it has nothing to show yet, and a search until its answer lands.
+    fn is_loading(&self) -> bool {
+        if let Some(feed) = self.active_tab.signed_in() {
+            return feed.loading(self);
+        }
+        match self.active_tab {
+            AppTab::Home => self.loading && self.videos.is_empty(),
+            AppTab::Author => self.author_loading,
+            _ => self.loading,
+        }
     }
 
     fn controls_visible(&self) -> bool {
@@ -1028,277 +1166,472 @@ impl BiliGuga {
 
 // ---- The view -------------------------------------------------------------------------------
 
-/// The app's colour for a video's placeholder, picked from its accent so a feed of
-/// half-loaded covers does not look broken.
-fn card_cover(video: &Video, image: Option<&Image>, width: f32, height: f32) -> El {
+/// Our own icon set, drawn as SVG bodies rather than borrowed from the text font.
+///
+/// A house, a play mark and a bookmark all exist in whatever font happens to be installed, at
+/// different weights and sometimes not at all; a column of mismatched shapes is exactly what a
+/// sidebar looks like when it borrows glyphs. These are 16-point bodies in a 16-point box,
+/// stroked in `currentColor`, and drawn through Rune's icon cache so one body rasterises once.
+mod icons {
+    use rune::Icon;
+
+    pub(super) static HOME: Icon = Icon {
+        name: "bg-home",
+        view: 16.0,
+        body: r#"<path d="M2.6 7.1 8 2.7l5.4 4.4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.1 6.6v6.7h7.8V6.6" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M6.6 13.3v-3.5h2.8v3.5" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static PULSE: Icon = Icon {
+        name: "bg-pulse",
+        view: 16.0,
+        body: r#"<path d="M1.8 8.4h2.9l1.7-4.1 2.4 8.2 1.7-4.1h3.7" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static HISTORY: Icon = Icon {
+        name: "bg-history",
+        view: 16.0,
+        body: r#"<path d="M3 3.4v2.9h2.9" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.3 6.9a5.2 5.2 0 1 1-.3 2.6" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 5.1v3.3l2.2 1.4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static CLOCK: Icon = Icon {
+        name: "bg-clock",
+        view: 16.0,
+        body: r#"<circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M8 4.9v3.4l2.3 1.4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static STAR: Icon = Icon {
+        name: "bg-star",
+        view: 16.0,
+        body: r#"<path d="M8 2.1 9.9 6l4.3.6-3.1 3 0.7 4.3L8 11.9 4.2 13.9l0.7-4.3-3.1-3L6.1 6z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static USER: Icon = Icon {
+        name: "bg-user",
+        view: 16.0,
+        body: r#"<circle cx="8" cy="5.5" r="2.7" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M3 13.4a5 5 0 0 1 10 0" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>"#,
+    };
+    pub(super) static SEARCH: Icon = Icon {
+        name: "bg-search",
+        view: 16.0,
+        body: r#"<circle cx="7.1" cy="7.1" r="4.4" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="m10.4 10.4 3.2 3.2" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>"#,
+    };
+    pub(super) static REFRESH: Icon = Icon {
+        name: "bg-refresh",
+        view: 16.0,
+        body: r#"<path d="M13.3 7.2a5.3 5.3 0 1 1-1.6-3.3" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/><path d="M13.6 2.6v2.7h-2.7" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static PLAY: Icon = Icon {
+        name: "bg-play",
+        view: 16.0,
+        body: r#"<path d="M5.6 3.6 12.2 8l-6.6 4.4z" fill="currentColor" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static PAUSE: Icon = Icon {
+        name: "bg-pause",
+        view: 16.0,
+        body: r#"<rect x="4.6" y="3.4" width="2.5" height="9.2" rx="0.8" fill="currentColor"/><rect x="8.9" y="3.4" width="2.5" height="9.2" rx="0.8" fill="currentColor"/>"#,
+    };
+    pub(super) static PREV: Icon = Icon {
+        name: "bg-prev",
+        view: 16.0,
+        body: r#"<path d="M11.6 3.7 5.7 8l5.9 4.3z" fill="currentColor"/><rect x="3.5" y="3.6" width="1.5" height="8.8" rx="0.7" fill="currentColor"/>"#,
+    };
+    pub(super) static NEXT: Icon = Icon {
+        name: "bg-next",
+        view: 16.0,
+        body: r#"<path d="M4.4 3.7 10.3 8l-5.9 4.3z" fill="currentColor"/><rect x="11" y="3.6" width="1.5" height="8.8" rx="0.7" fill="currentColor"/>"#,
+    };
+    pub(super) static VOLUME: Icon = Icon {
+        name: "bg-volume",
+        view: 16.0,
+        body: r#"<path d="M7.6 3.1 4.4 5.6H2.2v4.8h2.2l3.2 2.5z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/><path d="M9.9 5.8a3 3 0 0 1 0 4.4" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><path d="M11.7 4.1a5.4 5.4 0 0 1 0 7.8" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>"#,
+    };
+    pub(super) static MUTED: Icon = Icon {
+        name: "bg-muted",
+        view: 16.0,
+        body: r#"<path d="M7.6 3.1 4.4 5.6H2.2v4.8h2.2l3.2 2.5z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/><path d="m10.2 6 3.4 4M13.6 6l-3.4 4" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>"#,
+    };
+    pub(super) static FULLSCREEN: Icon = Icon {
+        name: "bg-fullscreen",
+        view: 16.0,
+        body: r#"<path d="M2.6 6.2V2.6h3.6M13.4 9.8v3.6H9.8M9.8 2.6h3.6v3.6M6.2 13.4H2.6V9.8" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static EXIT_FULLSCREEN: Icon = Icon {
+        name: "bg-exit-fullscreen",
+        view: 16.0,
+        body: r#"<path d="M6.2 2.6v3.6H2.6M9.8 13.4v-3.6h3.6M13.4 6.2h-3.6V2.6M2.6 9.8h3.6v3.6" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static QUALITY: Icon = Icon {
+        name: "bg-quality",
+        view: 16.0,
+        body: r#"<rect x="2.2" y="3.6" width="11.6" height="8.8" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M6.4 6.4 9.2 8l-2.8 1.6z" fill="currentColor"/>"#,
+    };
+    pub(super) static LIKE: Icon = Icon {
+        name: "bg-like",
+        view: 16.0,
+        body: r#"<path d="M6.1 13.6H3.4a1 1 0 0 1-1-1V8.1a1 1 0 0 1 1-1h2.7M6.1 7.4 8.3 2.6a1.7 1.7 0 0 1 2.2 2.1l-.7 2.4h2.9a1.6 1.6 0 0 1 1.6 1.9l-.9 3.5a1.8 1.8 0 0 1-1.7 1.3H6.1z" stroke="currentColor" stroke-width="1.35" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static COIN: Icon = Icon {
+        name: "bg-coin",
+        view: 16.0,
+        body: r#"<circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M8 5.4v5.2M6.3 8h3.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/>"#,
+    };
+    pub(super) static COMMENT: Icon = Icon {
+        name: "bg-comment",
+        view: 16.0,
+        body: r#"<path d="M13.6 9.1a2 2 0 0 1-2 2H6.2l-3 2.3V5.1a2 2 0 0 1 2-2h6.4a2 2 0 0 1 2 2z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static LOGO: Icon = Icon {
+        name: "bg-logo",
+        view: 16.0,
+        body: r##"<rect x="1.4" y="3.6" width="13.2" height="9.2" rx="2.6" fill="currentColor"/><path d="M5.2 2.1 6.9 4.4M10.8 2.1 9.1 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/><circle cx="5.6" cy="7.4" r="0.95" fill="#0A0B0F"/><circle cx="10.4" cy="7.4" r="0.95" fill="#0A0B0F"/><path d="M6.6 10.2h2.8" stroke="#0A0B0F" stroke-width="0.9" fill="none" stroke-linecap="round"/>"##,
+    };
+    /// Theater mode: the video alone, no feed beside it.
+    pub(super) static EXPAND: Icon = Icon {
+        name: "bg-expand",
+        view: 16.0,
+        body: r#"<rect x="1.6" y="3.4" width="12.8" height="9.2" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/><rect x="4.2" y="5.8" width="4.6" height="4.4" rx="1" fill="currentColor" opacity="0.55"/>"#,
+    };
+    /// Back to the split layout: video with its feed beside it.
+    pub(super) static COLLAPSE: Icon = Icon {
+        name: "bg-collapse",
+        view: 16.0,
+        body: r#"<rect x="1.6" y="3.4" width="12.8" height="9.2" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M9.6 3.4v9.2" stroke="currentColor" stroke-width="1.4"/><path d="M4.4 6h2.8M4.4 8h2.8M4.4 10h2.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
+    };
+    pub(super) static CHECK: Icon = Icon {
+        name: "bg-check",
+        view: 16.0,
+        body: r#"<path d="m3.4 8.4 3 3 6.2-6.8" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+    pub(super) static CLOSE: Icon = Icon {
+        name: "bg-close",
+        view: 16.0,
+        body: r#"<path d="m4.2 4.2 7.6 7.6M11.8 4.2l-7.6 7.6" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>"#,
+    };
+    pub(super) static TV: Icon = Icon {
+        name: "bg-tv",
+        view: 16.0,
+        body: r#"<rect x="1.8" y="4.2" width="12.4" height="8.6" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M5.2 1.9 8 4.2l2.8-2.3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    };
+}
+
+/// A 16-point glyph in `color`, laid out inline.
+fn glyph(icon: &'static rune::Icon, color: Color, size: f32) -> El {
+    rune::icon(icon, size).color(color)
+}
+
+/// One line of text that is allowed to run out of room rather than wrap.
+fn label(content: impl Into<String>, size: f32, weight: f32, color: Color) -> El {
+    text(content)
+        .font(TextStyle::new(size, weight))
+        .color(color)
+        .single_line()
+        .truncate()
+}
+
+/// The "this is the current one" wash. A tint and a bar down the leading edge rather than a
+/// ring: a border on a poster card reads as a focus ring, which is not what this is.
+fn selection_wash(el: El) -> El {
+    el.fill(theme::ACCENT_DIM.alpha(0.7))
+        .hover(theme::ACCENT_DIM)
+        .press(theme::ACCENT_DIM)
+        .border_sides([0.0, 0.0, 0.0, 2.0], theme::ACCENT)
+}
+
+/// A pill button with an icon and a label, the shape used for every action in the app.
+fn pill(key: &'static str, icon: Option<&'static rune::Icon>, caption: &str, tone: Tone) -> El {
+    let (fill, ink) = match tone {
+        Tone::Quiet => (Color::TRANSPARENT, theme::TEXT_DIM),
+        Tone::Raised => (theme::CARD, theme::TEXT),
+        Tone::Accent => (theme::ACCENT, Color::WHITE),
+    };
+    let mut body = row()
+        .key(key)
+        .h(32.0)
+        .px(12.0)
+        .gap(6.0)
+        .center_y()
+        .radius(16.0)
+        .fill(fill)
+        .hover(if matches!(tone, Tone::Accent) {
+            theme::ACCENT_SOFT
+        } else {
+            theme::CARD_HOVER
+        })
+        .press(theme::PRESS)
+        .cursor(rune::Cursor::Pointer)
+        .shrink();
+    if matches!(tone, Tone::Raised) {
+        body = body.border(1.0, theme::BORDER);
+    }
+    if let Some(icon) = icon {
+        body = body.child(glyph(icon, ink, 14.0));
+    }
+    if !caption.is_empty() {
+        body = body.child(
+            text(caption)
+                .font(TextStyle::new(12.5, 500.0))
+                .color(ink)
+                .single_line(),
+        );
+    }
+    body
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    /// No fill: secondary actions that sit in a row of their own.
+    Quiet,
+    /// A card-coloured chip with a border: the default for a real button.
+    Raised,
+    /// The accent, filled: the one primary action on a screen.
+    Accent,
+}
+
+/// A flat square button for the player's control strip.
+fn icon_button(key: &'static str, icon: &'static rune::Icon, caption: &str) -> El {
+    let mut body = row()
+        .key(key)
+        .h(30.0)
+        .px(9.0)
+        .gap(5.0)
+        .center_y()
+        .radius(8.0)
+        .hover(theme::CARD_HOVER)
+        .press(theme::PRESS)
+        .cursor(rune::Cursor::Pointer)
+        .help(caption)
+        .shrink()
+        .child(glyph(icon, theme::TEXT_DIM, 14.0));
+    body = body.child(
+        text(caption)
+            .font(TextStyle::new(12.0, 500.0))
+            .color(theme::TEXT_DIM)
+            .single_line(),
+    );
+    body
+}
+
+/// A 34-point square icon-only button (window chrome, quiet round controls).
+fn square_button(key: &'static str, icon: &'static rune::Icon, help: &'static str) -> El {
+    el().key(key)
+        .size(34.0, 34.0)
+        .center()
+        .radius(10.0)
+        .hover(theme::CARD_HOVER)
+        .press(theme::PRESS)
+        .cursor(rune::Cursor::Pointer)
+        .help(help)
+        .shrink()
+        .child(glyph(icon, theme::TEXT_DIM, 16.0))
+}
+
+/// The poster frame of a video: the decoded cover when it has arrived, else its own accent.
+///
+/// Rounded and clipped, so a cover fills its box whatever shape the CDN sent, and a duration
+/// chip sits in the corner where Bilibili puts one.
+fn poster(app: &BiliGuga, video: &Video, width: f32, height: f32, radius: f32, badge: bool) -> El {
+    // No `.shrink()`: a flex item defaults to its content size, but shrinking is what let a
+    // long title squash the cover in a narrow row.
     let mut frame = el()
         .w(width)
         .h(height)
-        .radius(6.0)
+        .radius(radius)
+        .clip_rounded(radius)
         .fill(theme::cover_placeholder(video.accent));
-    if let Some(image) = image {
+    if let Some(image) = app.cover_for(video) {
         frame = frame.child(
             el().w_full()
                 .h_full()
-                .radius(6.0)
                 .pixels_fit(image.pixels(), SurfaceFit::Fill),
+        );
+    }
+    if badge {
+        // Revealed by the card's own hover group, so it costs no commit: the card sets
+        // `.hover_group()`, and this child fades in while the pointer is anywhere on it.
+        frame = frame.child(
+            el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .center()
+                .fill(Color::BLACK.alpha(0.32))
+                .group_opacity(0.0, 1.0)
+                .a11y_hidden()
+                .child(
+                    el().size(46.0, 46.0)
+                        .center()
+                        .radius(23.0)
+                        .fill(theme::ACCENT)
+                        .child(glyph(&icons::PLAY, Color::WHITE, 19.0)),
+                ),
+        );
+    }
+    if !video.duration.is_empty() && !video.duration.starts_with("--") {
+        // Pinned to the corner, not placed from an assumed width: a duration is "03:00" or
+        // "1:02:33", and the chip has to hold both without running off the poster.
+        frame = frame.child(
+            row()
+                .pin(None, None, Some(6.0), Some(6.0))
+                .h(18.0)
+                .px(5.0)
+                .center_y()
+                .radius(4.0)
+                .fill(Color::BLACK.alpha(0.62))
+                .child(
+                    text(&video.duration)
+                        .font(TextStyle::new(10.5, 600.0))
+                        .color(Color::WHITE)
+                        .single_line(),
+                ),
         );
     }
     frame
 }
 
-/// An icon drawn from lines rather than taken from the text font.
-///
-/// A house, a play mark, a clock, a bookmark, a star and a person all exist in whatever font
-/// happens to be installed, at different widths and weights and sometimes missing entirely;
-/// a column of mismatched shapes is exactly what a sidebar looks like when it borrows glyphs.
-fn sidebar_icon(icon: SidebarIcon, color: Color) -> El {
-    let mut shape = rune::Shape::new().view_box(16.0, 16.0);
-    match icon {
-        SidebarIcon::Home => {
-            shape = shape
-                .stroke(vec![[2.5, 7.5], [8.0, 2.5], [13.5, 7.5]], 1.4, color)
-                .stroke(
-                    vec![[4.5, 6.5], [4.5, 13.5], [11.5, 13.5], [11.5, 6.5]],
-                    1.4,
-                    color,
-                );
-        }
-        SidebarIcon::Dynamic => {
-            // A triangle inside a circle: the play mark a feed of videos suggests.
-            let mut circle = Vec::with_capacity(25);
-            for step in 0..=24 {
-                let angle = step as f32 * std::f32::consts::TAU / 24.0;
-                circle.push([8.0 + 6.3 * angle.cos(), 8.0 + 6.3 * angle.sin()]);
-            }
-            shape = shape
-                .stroke(circle, 1.3, color)
-                .fill(vec![[6.6, 5.4], [10.8, 8.0], [6.6, 10.6]], color);
-        }
-        SidebarIcon::History => {
-            shape = shape
-                .stroke(
-                    vec![
-                        [13.0, 8.0],
-                        [11.0, 10.8],
-                        [8.0, 12.6],
-                        [5.0, 10.8],
-                        [3.0, 8.0],
-                        [5.0, 5.2],
-                        [8.0, 3.4],
-                        [11.0, 5.2],
-                        [13.0, 8.0],
-                    ],
-                    1.4,
-                    color,
-                )
-                .stroke(vec![[8.0, 5.2], [8.0, 8.3], [10.2, 9.4]], 1.3, color);
-        }
-        SidebarIcon::WatchLater => {
-            shape = shape.stroke(
-                vec![
-                    [4.0, 2.5],
-                    [12.0, 2.5],
-                    [12.0, 13.5],
-                    [8.0, 10.6],
-                    [4.0, 13.5],
-                    [4.0, 2.5],
-                ],
-                1.4,
-                color,
-            );
-        }
-        SidebarIcon::Favorites => {
-            let mut points = Vec::with_capacity(11);
-            for step in 0..10 {
-                let angle = -std::f32::consts::FRAC_PI_2 + step as f32 * std::f32::consts::PI / 5.0;
-                let radius = if step % 2 == 0 { 6.2 } else { 2.7 };
-                points.push([8.0 + radius * angle.cos(), 8.0 + radius * angle.sin()]);
-            }
-            points.push(points[0]);
-            shape = shape.stroke(points, 1.3, color);
-        }
-        SidebarIcon::Login => {
-            // A person: a head and shoulders, so it cannot be read as the feed's mark.
-            let mut head = Vec::with_capacity(17);
-            for step in 0..=16 {
-                let angle = step as f32 * std::f32::consts::TAU / 16.0;
-                head.push([8.0 + 2.9 * angle.cos(), 5.4 + 2.9 * angle.sin()]);
-            }
-            shape = shape.stroke(head, 1.3, color).stroke(
-                vec![
-                    [3.2, 14.0],
-                    [4.6, 10.4],
-                    [8.0, 9.4],
-                    [11.4, 10.4],
-                    [12.8, 14.0],
-                ],
-                1.3,
-                color,
-            );
-        }
-    }
-    // The canvas *is* the icon: as a child of a sized wrapper it would lay out at zero width
-    // and only its first stroke would draw.
-    rune::canvas(shape).size(16.0, 16.0).shrink()
-}
+// ---- The rail -------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SidebarIcon {
+enum RailItem {
     Home,
     Dynamic,
     History,
     WatchLater,
     Favorites,
-    Login,
 }
 
-fn sidebar_item(label: &'static str, icon: SidebarIcon, active: bool, tab: AppTab) -> El {
-    let (fill, glyph, caption) = if active {
-        (theme::ACTIVE_ROW, theme::ACCENT_SOFT, theme::ACCENT_SOFT)
-    } else {
-        (Color::TRANSPARENT, theme::TEXT_DIM, theme::TEXT_FAINT)
-    };
-    col()
-        .w(SIDEBAR_WIDTH)
-        .h(52.0)
-        .items_center()
-        .justify_center()
-        .gap(3.0)
-        .cursor(rune::Cursor::Pointer)
-        .fill(fill)
-        .hover(theme::HOVER)
-        .on_press(move |app: &mut BiliGuga| app.show_tab(tab))
-        .child(sidebar_icon(icon, glyph))
-        .child(text(label).font(type_::SECTION).color(caption))
-}
-
-fn render_sidebar(app: &BiliGuga) -> El {
-    col()
-        .w(SIDEBAR_WIDTH)
-        .h_full()
-        .items_center()
-        .py(8.0)
-        .gap(4.0)
-        .fill(theme::BG)
-        .child(sidebar_item(
-            "首页",
-            SidebarIcon::Home,
-            app.active_tab == AppTab::Home,
-            AppTab::Home,
-        ))
-        .child(sidebar_item(
-            "动态",
-            SidebarIcon::Dynamic,
-            app.active_tab == AppTab::Dynamic,
-            AppTab::Dynamic,
-        ))
-        .child(sidebar_item(
-            "历史",
-            SidebarIcon::History,
-            app.active_tab == AppTab::History,
-            AppTab::History,
-        ))
-        .child(sidebar_item(
-            "稍后",
-            SidebarIcon::WatchLater,
-            app.active_tab == AppTab::WatchLater,
-            AppTab::WatchLater,
-        ))
-        .child(sidebar_item(
-            "收藏",
-            SidebarIcon::Favorites,
-            app.active_tab == AppTab::Favorites,
-            AppTab::Favorites,
-        ))
-        .child(sidebar_item(
-            "登录",
-            SidebarIcon::Login,
-            app.active_tab == AppTab::Login,
-            AppTab::Login,
-        ))
-}
-
-/// One row of the feed: a 16:9 cover, the title over two lines, and the uploader and duration.
-fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
-    let selected = app.selected == Some(index);
-    let image = app.cover_for(video);
-    // No `.key()`: `virtual_rows` assigns this row's key from its own `key(s, i)` closure and
-    // documents that it overrides whatever the element set. Building one here was a `format!`
-    // per row per commit that was thrown away.
-    let mut row_el = row()
-        .w_full()
-        .gap(10.0)
-        .padding(8.0)
-        .radius(8.0)
-        .cursor(rune::Cursor::Pointer)
-        .hover(theme::HOVER)
-        .on_press(move |app: &mut BiliGuga| app.select(index))
-        .child(card_cover(video, image, 132.0, 74.0))
-        .child(
-            col()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(4.0)
-                .child(
-                    text(&video.title)
-                        .font(type_::BODY)
-                        .color(theme::TEXT)
-                        .max_lines(2),
-                )
-                .child(
-                    text(&video.uploader)
-                        .font(type_::LABEL)
-                        .color(theme::TEXT_FAINT)
-                        .truncate(),
-                )
-                .child(
-                    text(&video.duration)
-                        .font(type_::LABEL)
-                        .color(theme::TEXT_FAINT),
-                ),
-        );
-    if selected {
-        row_el = row_el.fill(theme::ACTIVE_ROW);
-    }
-    row_el
-}
-
-/// A two-column card for the home grid.
-fn video_card(app: &BiliGuga, index: usize, video: &Video) -> El {
-    let image = app.cover_for(video);
-    // Keyed by `virtual_rows`, as the row above.
-    let mut card = col()
-        .w(GRID_CARD_WIDTH)
-        .h(GRID_CARD_HEIGHT)
-        .shrink()
-        .gap(4.0)
-        .padding(4.0)
-        .radius(8.0)
-        .cursor(rune::Cursor::Pointer)
-        .hover(theme::HOVER)
-        .on_press(move |app: &mut BiliGuga| app.select(index))
-        .child(card_cover(video, image, GRID_CARD_WIDTH - 8.0, 106.0))
-        .child(
-            text(&video.title)
-                .font(type_::LABEL)
-                .color(theme::TEXT)
-                .max_lines(2),
+impl RailItem {
+    /// The tabs this item stands for. Search and author pages are reached from the home rail.
+    fn owns(self, tab: AppTab) -> bool {
+        matches!(
+            (self, tab),
+            (
+                RailItem::Home,
+                AppTab::Home | AppTab::Search | AppTab::Author
+            ) | (RailItem::Dynamic, AppTab::Dynamic)
+                | (RailItem::History, AppTab::History)
+                | (RailItem::WatchLater, AppTab::WatchLater)
+                | (RailItem::Favorites, AppTab::Favorites)
         )
-        .child(
-            text(&video.uploader)
-                .font(type_::SECTION)
-                .color(theme::TEXT_FAINT)
-                .truncate(),
-        );
-    if app.selected == Some(index) {
-        card = card.fill(theme::ACTIVE_ROW);
     }
-    card
 }
+
+fn rail_entry(item: RailItem, icon: &'static rune::Icon, caption: &str, active: bool) -> El {
+    let icon_color = if active {
+        theme::ACCENT
+    } else {
+        theme::TEXT_DIM
+    };
+    let text_color = if active {
+        theme::TEXT
+    } else {
+        theme::TEXT_FAINT
+    };
+    let mut entry = col()
+        .w_full()
+        .h(56.0)
+        .center()
+        .gap(4.0)
+        .radius(12.0)
+        .hover(theme::CARD_HOVER)
+        .press(theme::PRESS)
+        .cursor(rune::Cursor::Pointer)
+        .help(caption)
+        .on_press(move |app: &mut BiliGuga| app.show_tab(tab_of(item)))
+        .child(glyph(icon, icon_color, 19.0))
+        .child(
+            text(caption)
+                .font(TextStyle::new(10.5, 500.0))
+                .color(text_color)
+                .single_line(),
+        );
+    if active {
+        // A wash plus a bar down the inner edge: the bar is a child with `.h(..)` and its own
+        // offset rather than an absolute overlay, so it needs no ancestor positioning.
+        entry = entry
+            .fill(theme::CARD)
+            .border(1.0, theme::ACCENT.alpha(0.22));
+    }
+    entry
+}
+
+fn tab_of(item: RailItem) -> AppTab {
+    match item {
+        RailItem::Home => AppTab::Home,
+        RailItem::Dynamic => AppTab::Dynamic,
+        RailItem::History => AppTab::History,
+        RailItem::WatchLater => AppTab::WatchLater,
+        RailItem::Favorites => AppTab::Favorites,
+    }
+}
+
+fn render_rail(app: &BiliGuga) -> El {
+    let mut rail = col()
+        .key("rail")
+        .w(RAIL_WIDTH)
+        .h_full()
+        .shrink()
+        .items_center()
+        .py(14.0)
+        .gap(6.0)
+        .fill(theme::RAIL)
+        .border_sides([0.0, 1.0, 0.0, 0.0], theme::HAIRLINE)
+        .child(col().w_full().items_center().pb(10.0).child(
+            el().size(36.0, 36.0).center().radius(11.0).child(glyph(
+                &icons::LOGO,
+                theme::ACCENT,
+                24.0,
+            )),
+        ));
+    for (item, icon, caption) in [
+        (RailItem::Home, &icons::HOME, "首页"),
+        (RailItem::Dynamic, &icons::PULSE, "动态"),
+        (RailItem::History, &icons::HISTORY, "历史"),
+        (RailItem::WatchLater, &icons::CLOCK, "稍后"),
+        (RailItem::Favorites, &icons::STAR, "收藏"),
+    ] {
+        rail = rail.child(el().w(RAIL_WIDTH - 20.0).child(rail_entry(
+            item,
+            icon,
+            caption,
+            item.owns(app.active_tab),
+        )));
+    }
+    rail = rail.child(el().grow(1.0));
+    // The account is the last thing in the rail, always in the same place: an avatar when
+    // signed in, the sign-in door when not.
+    let has_session = app.session.is_some();
+    let mut account = el()
+        .key("account")
+        .size(40.0, 40.0)
+        .center()
+        .radius(20.0)
+        .clip_rounded(20.0)
+        .cursor(rune::Cursor::Pointer)
+        .hover(theme::CARD_HOVER)
+        .press(theme::PRESS)
+        .help(if has_session { "账号" } else { "登录" })
+        .on_press(|app: &mut BiliGuga| app.show_tab(AppTab::Login));
+    match (has_session, app.account_avatar.as_ref()) {
+        (true, Some(avatar)) => {
+            account = account.child(
+                el().w_full()
+                    .h_full()
+                    .pixels_fit(avatar.pixels(), SurfaceFit::Fill),
+            );
+        }
+        (true, None) => {
+            account = account.fill(theme::ACCENT_DIM).child(glyph(
+                &icons::USER,
+                theme::ACCENT_SOFT,
+                18.0,
+            ));
+        }
+        (false, _) => {
+            account = account
+                .fill(theme::CARD)
+                .border(1.0, theme::BORDER)
+                .child(glyph(&icons::USER, theme::TEXT_DIM, 17.0));
+        }
+    }
+    rail.child(account)
+}
+
+// ---- The browse pane ------------------------------------------------------------------------
 
 /// The feed column's heading: a fixed sentence for every tab but one, which borrows the
-/// uploader's name. Returning `String` allocated on every render for seven of the eight cases.
+/// uploader's name. Returning a `Cow` keeps the seven fixed cases allocation-free.
 fn feed_title<'a>(tab: AppTab, author_name: &'a str) -> std::borrow::Cow<'a, str> {
     match tab {
         AppTab::Home => "为你推荐".into(),
@@ -1312,174 +1645,390 @@ fn feed_title<'a>(tab: AppTab, author_name: &'a str) -> std::borrow::Cow<'a, str
     }
 }
 
+/// What an empty feed means, in the tab's own terms.
 fn empty_message(app: &BiliGuga) -> &'static str {
     let logged_in = app.session.is_some();
     match app.active_tab {
-        AppTab::Search => "没有找到视频，请换个关键词试试",
-        AppTab::Dynamic if !logged_in => "请先登录后查看动态",
-        AppTab::Dynamic => "暂时没有关注中的视频动态",
-        AppTab::WatchLater if !logged_in => "请先登录后查看稍后再看",
-        AppTab::WatchLater => "还没有稍后再看",
-        AppTab::Favorites if !logged_in => "请先登录后查看收藏夹",
-        AppTab::Favorites => "还没有收藏视频",
-        AppTab::History if !logged_in => "请先登录后查看观看历史",
-        AppTab::History => "还没有观看历史",
-        AppTab::Author => "该作者暂时没有公开视频",
-        _ => "没有加载到视频，请点击刷新重试",
+        AppTab::Search => "没有找到视频",
+        AppTab::Dynamic if !logged_in => "登录后可以看到动态",
+        AppTab::Dynamic => "关注的人最近没有更新",
+        AppTab::WatchLater if !logged_in => "登录后可以看到稍后再看",
+        AppTab::WatchLater => "稍后再看还是空的",
+        AppTab::Favorites if !logged_in => "登录后可以看到收藏夹",
+        AppTab::Favorites => "收藏夹还是空的",
+        AppTab::History if !logged_in => "登录后可以看到观看历史",
+        AppTab::History => "还没有观看记录",
+        AppTab::Author => "这位 UP 主还没有公开投稿",
+        _ => "没有加载到视频",
     }
 }
 
+/// What the spinner says while a feed is on its way.
 fn loading_message(tab: AppTab) -> &'static str {
     match tab {
-        AppTab::Search => "正在搜索 B 站视频…",
-        AppTab::Dynamic => "正在加载动态视频…",
+        AppTab::Search => "正在搜索…",
+        AppTab::Dynamic => "正在加载动态…",
         AppTab::WatchLater => "正在加载稍后再看…",
         AppTab::Favorites => "正在加载收藏夹…",
         AppTab::History => "正在加载观看历史…",
-        AppTab::Author => "正在加载作者视频…",
-        _ => "正在加载 B 站推荐…",
+        AppTab::Author => "正在加载 UP 主的投稿…",
+        _ => "正在加载推荐…",
     }
 }
 
-fn render_search_bar(app: &BiliGuga) -> El {
-    row()
+/// The heading above the feed: what this column is, the one control that acts on it, and the
+/// search field.
+///
+/// The field is here on every tab rather than only on the search results page. It used to be
+/// reachable only *from* the search results, which meant the only way to search was to already
+/// have searched: a first run had no search at all.
+fn render_topbar(app: &BiliGuga) -> El {
+    let mut header = col()
+        .key("feed-header")
         .w_full()
-        .gap(8.0)
-        .px(12.0)
-        .py(8.0)
+        .shrink()
+        .child(render_title_row(app));
+    if app.active_tab != AppTab::Login {
+        header = header.child(render_search(app));
+    }
+    header
+}
+
+/// The title, the refresh button, and "load more" when an author page has another batch.
+fn render_title_row(app: &BiliGuga) -> El {
+    let title = match app.active_tab {
+        AppTab::Author => app.author_name().to_string(),
+        tab => feed_title(tab, app.author_name()).into_owned(),
+    };
+    let busy = app.is_loading();
+    let mut title_row = row()
+        .key("topbar")
+        .w_full()
+        .shrink()
+        .px(PANE_PAD)
+        .pt(14.0)
+        .pb(10.0)
         .items_center()
-        .fill(theme::PANEL)
+        .gap(12.0)
         .child(
-            el().key("search-field")
+            text(title)
+                .font(TextStyle::new(19.0, 650.0))
+                .color(theme::TEXT)
+                .single_line()
+                .truncate()
+                .grow(1.0),
+        );
+    if app.active_tab == AppTab::Author && app.author_has_more {
+        title_row = title_row.child(
+            pill("author-more", None, "更多", Tone::Raised)
+                .on_press(|app: &mut BiliGuga| app.load_author_page(false)),
+        );
+    }
+    // Loading says so in the corner, in the same place the refresh button lives, so the two
+    // never both occupy it: a second refresh of a request in flight would be a no-op anyway.
+    if app.active_tab == AppTab::Login {
+        return title_row;
+    }
+    title_row.child(if busy {
+        el().key("refresh")
+            .size(34.0, 34.0)
+            .center()
+            .help("正在加载…")
+            .child(pulse_dot())
+    } else {
+        square_button("refresh", &icons::REFRESH, "刷新")
+            .on_press(|app: &mut BiliGuga| app.refresh_feed())
+    })
+}
+
+/// The search field. Always present at the top of the browse pane; Enter submits, and the
+/// button beside it does the same for people who would rather click.
+fn render_search(app: &BiliGuga) -> El {
+    row()
+        .key("search")
+        .w_full()
+        .shrink()
+        .px(PANE_PAD)
+        .pb(12.0)
+        .gap(8.0)
+        .child(
+            row()
+                .key("search-field")
                 .grow(1.0)
-                .h(32.0)
-                .radius(6.0)
-                .fill(theme::BG)
-                .border(1.0, theme::BORDER)
-                .px(8.0)
+                .h(36.0)
+                .gap(8.0)
+                .px(11.0)
                 .items_center()
+                .radius(10.0)
+                .fill(theme::FIELD)
+                .border(1.0, theme::BORDER)
+                .child(glyph(&icons::SEARCH, theme::TEXT_FAINT, 14.0))
                 .child(
-                    text_input(&app.search_edit, type_::BODY)
+                    text_input(&app.search_edit, TextStyle::new(13.0, 400.0))
                         .key("search-input")
-                        .w_full()
+                        .grow(1.0)
                         .single_line()
-                        .placeholder("搜索视频", theme::TEXT_FAINT)
+                        .placeholder("搜视频、UP 主、话题", theme::TEXT_FAINT)
                         .color(theme::TEXT)
                         .on_edit(|app: &mut BiliGuga| &mut app.search_edit)
                         .on_submit(|app: &mut BiliGuga, _: &mut Tx| app.load_search()),
                 ),
         )
         .child(
-            el().key("search-button")
-                .h(32.0)
-                .px(12.0)
-                .radius(6.0)
-                .items_center()
-                .justify_center()
-                .cursor(rune::Cursor::Pointer)
-                .fill(theme::ACCENT)
-                .hover(theme::ACCENT_SOFT)
-                .on_press(|app: &mut BiliGuga| app.load_search())
-                .child(text("搜索").font(type_::LABEL).color(Color::WHITE)),
+            pill("search-button", None, "搜索", Tone::Accent)
+                .h(36.0)
+                .on_press(|app: &mut BiliGuga| app.load_search()),
         )
+}
+
+/// A poster card for the browse grid: cover, two-line title, uploader, and a play badge on
+/// hover so it reads as playable rather than as a link.
+fn browse_card(app: &BiliGuga, index: usize, video: &Video, slot: f32) -> El {
+    // The 6 pt padding is drawn inside the slot, so the card's own box is the slot less it.
+    let width = (slot - 2.0 * CARD_PAD).max(80.0);
+    let cover_width = width;
+    let cover_height = (width * 9.0 / 16.0).round();
+    let selected = app.selected == Some(index);
+    let playing = app
+        .playing_video
+        .as_ref()
+        .is_some_and(|current| current.bvid == video.bvid);
+    let mut card = col()
+        .w(width)
+        .shrink()
+        .gap(8.0)
+        .padding(CARD_PAD)
+        .radius(12.0)
+        .hover(theme::CARD_HOVER)
+        .hover_group()
+        .cursor(rune::Cursor::Pointer)
+        .on_press(move |app: &mut BiliGuga| app.select(index))
+        .child(el().w(cover_width).h(cover_height).shrink().child(poster(
+            app,
+            video,
+            cover_width,
+            cover_height,
+            10.0,
+            true,
+        )))
+        .child(
+            col()
+                .w_full()
+                .min_w(0.0)
+                .gap(5.0)
+                .px(2.0)
+                .child(
+                    text(&video.title)
+                        .font(TextStyle::new(13.0, 550.0))
+                        .color(if playing {
+                            theme::ACCENT_SOFT
+                        } else {
+                            theme::TEXT
+                        })
+                        .max_lines(2),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(5.0)
+                        .items_center()
+                        .child(glyph(&icons::USER, theme::TEXT_FAINT, 11.0))
+                        .child(label(&video.uploader, 11.5, 400.0, theme::TEXT_FAINT).grow(1.0)),
+                ),
+        );
+    if selected {
+        card = selection_wash(card);
+    }
+    card
+}
+
+/// A list row: 16:9 cover on the left, title and metadata stacked beside it.
+fn video_row(app: &BiliGuga, index: usize, video: &Video) -> El {
+    let selected = app.selected == Some(index);
+    let playing = app
+        .playing_video
+        .as_ref()
+        .is_some_and(|current| current.bvid == video.bvid);
+    let mut body = row()
+        .w_full()
+        .padding(6.0)
+        .gap(10.0)
+        .radius(10.0)
+        .hover(theme::CARD_HOVER)
+        .hover_group()
+        .cursor(rune::Cursor::Pointer)
+        .on_press(move |app: &mut BiliGuga| app.select(index))
+        .child(poster(app, video, 132.0, 74.0, 8.0, true))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .shrink()
+                .gap(4.0)
+                .py(1.0)
+                .child(
+                    text(&video.title)
+                        .font(TextStyle::new(12.5, 550.0))
+                        .color(if playing {
+                            theme::ACCENT_SOFT
+                        } else {
+                            theme::TEXT
+                        })
+                        .max_lines(2),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(5.0)
+                        .items_center()
+                        .child(glyph(&icons::USER, theme::TEXT_FAINT, 10.0))
+                        .child(label(&video.uploader, 11.0, 400.0, theme::TEXT_FAINT).grow(1.0)),
+                ),
+        );
+    if selected {
+        body = selection_wash(body);
+    }
+    body
+}
+
+/// A spinner-ish placeholder that says what is happening without a fake progress bar: a dot
+/// that breathes, and the message beside it.
+fn pulse_dot() -> El {
+    el().size(7.0, 7.0)
+        .radius(4.0)
+        .fill(theme::ACCENT)
+        .looping(rune::LoopSpec::opacity(1.4, 0.0, 0.22, 1.0))
+}
+
+/// A centred message for the empty, loading and error states.
+/// A centred message for the empty, loading and error states, with an optional action under it.
+/// The action lives in the same centred column: as a sibling of a grown panel it was pushed to
+/// the bottom of the pane, a screen away from the sentence it belonged to.
+fn state_panel(
+    icon: &'static rune::Icon,
+    headline: &str,
+    detail: Option<&str>,
+    tone: Color,
+    action: Option<El>,
+) -> El {
+    let mut panel = col()
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(10.0)
+        .padding(24.0)
+        .child(
+            el().size(52.0, 52.0)
+                .center()
+                .radius(26.0)
+                .fill(theme::CARD)
+                .border(1.0, theme::BORDER)
+                .child(glyph(icon, tone, 22.0)),
+        )
+        .child(
+            text(headline)
+                .font(TextStyle::new(14.0, 550.0))
+                .color(theme::TEXT_DIM),
+        );
+    if let Some(detail) = detail {
+        panel = panel.child(
+            text(detail)
+                .font(TextStyle::new(12.0, 400.0))
+                .color(theme::TEXT_FAINT)
+                .max_w(280.0)
+                .align(rune::Align::Center),
+        );
+    }
+    if let Some(action) = action {
+        panel = panel.child(el().h(4.0)).child(action);
+    }
+    panel
 }
 
 fn render_feed(app: &BiliGuga) -> El {
     if app.active_tab == AppTab::Login {
         return render_login(app);
     }
-    let is_home = app.active_tab == AppTab::Home;
-    // One question, asked of the tab: which feed is showing, and is it still loading. This was
-    // a five-arm match here plus five more in the loader, all naming the same five fields.
-    let is_loading = match app.active_tab.signed_in() {
-        Some(feed) => feed.loading(app),
-        None => match app.active_tab {
-            AppTab::Home => app.loading && app.videos.is_empty(),
-            AppTab::Author => app.author_loading,
-            _ => app.loading,
-        },
-    };
     let videos = app.current_videos();
+    let is_loading = app.is_loading();
 
-    let mut header = row()
-        .w_full()
-        .px(12.0)
-        .py(12.0)
-        .items_center()
-        .justify_between()
-        .fill(theme::PANEL)
-        .child(
-            text(feed_title(app.active_tab, app.author_name()))
-                .font(type_::TITLE)
-                .color(theme::TEXT),
-        );
-    if app.active_tab == AppTab::Author && app.author_has_more {
-        header = header.child(
-            el().key("author-more")
-                .px(8.0)
-                .py(4.0)
-                .radius(4.0)
-                .cursor(rune::Cursor::Pointer)
-                .hover(theme::HOVER)
-                .on_press(|app: &mut BiliGuga| app.load_author_page(false))
-                .child(
-                    text("加载更多")
-                        .font(type_::SECTION)
-                        .color(theme::ACCENT_SOFT),
-                ),
-        );
-    }
-    if app.active_tab != AppTab::Search {
-        header = header.child(
-            el().key("refresh")
-                .px(8.0)
-                .py(4.0)
-                .radius(4.0)
-                .cursor(rune::Cursor::Pointer)
-                .hover(theme::HOVER)
-                .on_press(|app: &mut BiliGuga| app.refresh_feed())
-                .child(text("刷新").font(type_::SECTION).color(theme::ACCENT_SOFT)),
-        );
-    }
-
-    let body = if is_loading {
-        col().w_full().py(32.0).items_center().gap(6.0).child(
-            text(loading_message(app.active_tab))
-                .font(type_::BODY)
-                .color(theme::TEXT_FAINT),
-        )
-    } else if let Some(error) = &app.feed_error {
+    let body = if is_loading && videos.is_empty() {
         col()
             .w_full()
-            .py(32.0)
-            .items_center()
-            .child(text(error).font(type_::BODY).color(theme::DANGER).wrap())
-    } else if videos.is_empty() {
-        col().w_full().py(32.0).items_center().child(
-            text(empty_message(app))
-                .font(type_::BODY)
-                .color(theme::TEXT_FAINT),
+            .grow(1.0)
+            .center()
+            .gap(12.0)
+            .child(pulse_dot())
+            .child(
+                text(loading_message(app.active_tab))
+                    .font(TextStyle::new(12.5, 400.0))
+                    .color(theme::TEXT_FAINT),
+            )
+    } else if let Some(error) = &app.feed_error {
+        // A failure offers the way out of it: the old panel said "no" and left the fixed
+        // refresh button in the corner as the only way to try again.
+        state_panel(
+            &icons::CLOSE,
+            "没能加载出来",
+            Some(error.as_str()),
+            theme::DANGER,
+            Some(
+                pill("retry", Some(&icons::REFRESH), "重试", Tone::Raised)
+                    .on_press(|app: &mut BiliGuga| app.refresh_feed()),
+            ),
         )
-    } else if is_home {
+    } else if videos.is_empty() {
+        let needs_session = app.active_tab.signed_in().is_some() && app.session.is_none();
+        state_panel(
+            &icons::TV,
+            empty_message(app),
+            // A signed-out feed already says what to do in its headline; a second line under
+            // it would only repeat the offer the button makes.
+            (app.session.is_some() || app.active_tab.signed_in().is_none()).then_some(
+                match app.active_tab {
+                    AppTab::Home => "点右上角刷新试试",
+                    AppTab::Search => "换一个关键词",
+                    _ => "这里还是空的",
+                },
+            ),
+            theme::TEXT_FAINT,
+            needs_session.then(|| {
+                pill(
+                    "empty-sign-in",
+                    Some(&icons::USER),
+                    "扫码登录",
+                    Tone::Accent,
+                )
+                .on_press(|app: &mut BiliGuga| app.show_tab(AppTab::Login))
+            }),
+        )
+    } else if app.card_columns.get() >= 2 {
+        // The grid takes as many equal columns as the pane allows, so the same view is two
+        // columns in a narrow window and five in a wide one, without a measurement pass: the
+        // view is handed the pane's width by `card_columns`. One column is a list, not a grid:
+        // a poster card as wide as the pane is a billboard, and the pane is this narrow only
+        // when the player has taken the rest of the window.
+        let columns = app.card_columns.get();
+        let width = app.card_width.get();
+        let rows = videos.len().div_ceil(columns);
         col()
             .key("home-grid")
             .w_full()
             .growth(GrowthSpec::default())
-            .gap(4.0)
-            .padding(4.0)
+            .px(PANE_PAD)
+            .py(6.0)
             .virtual_rows(
-                videos.len().div_ceil(2),
-                GRID_CARD_HEIGHT + 4.0,
+                rows,
+                (width * 9.0 / 16.0 + 78.0).round(),
                 |_app: &BiliGuga, row_index| format!("grid-row-{row_index}").into(),
-                |app: &BiliGuga, row_index| {
+                move |app: &BiliGuga, row_index| {
                     let videos = app.current_videos();
-                    let first = row_index * 2;
-                    let mut line = row().w_full().gap(4.0);
-                    if let Some(video) = videos.get(first) {
-                        line = line.child(video_card(app, first, video));
-                    }
-                    if let Some(video) = videos.get(first + 1) {
-                        line = line.child(video_card(app, first + 1, video));
+                    let mut line = row().w_full().gap(CARD_GAP);
+                    for column in 0..columns {
+                        let index = row_index * columns + column;
+                        if let Some(video) = videos.get(index) {
+                            line = line.child(browse_card(app, index, video, width));
+                        }
                     }
                     line
                 },
@@ -1489,11 +2038,11 @@ fn render_feed(app: &BiliGuga) -> El {
             .key("video-list")
             .w_full()
             .growth(GrowthSpec::default())
-            .gap(2.0)
-            .padding(4.0)
+            .px(PANE_PAD - 6.0)
+            .py(6.0)
             .virtual_rows(
                 videos.len(),
-                90.0,
+                LIST_ROW_HEIGHT,
                 |app: &BiliGuga, index| {
                     app.current_videos()
                         .get(index)
@@ -1501,109 +2050,236 @@ fn render_feed(app: &BiliGuga) -> El {
                         .unwrap_or_else(|| format!("row-{index}"))
                         .into()
                 },
-                |app: &BiliGuga, index| {
-                    let videos = app.current_videos();
-                    match videos.get(index) {
-                        Some(video) => video_row(app, index, video),
-                        None => el(),
-                    }
+                |app: &BiliGuga, index| match app.current_videos().get(index) {
+                    Some(video) => video_row(app, index, video),
+                    None => el(),
                 },
             )
     };
 
-    let mut root = col()
-        .w(FEED_WIDTH)
-        .h_full()
-        .shrink()
-        .fill(theme::FEED)
-        .child(header);
-    if app.active_tab == AppTab::Search {
-        root = root.child(render_search_bar(app));
-    }
-    // Paging hangs off the viewport: it reports when the reader is far from the bottom, once
-    // per crossing rather than per frame, which is what makes this cheap.
-    let mut viewport = col()
+    // Paging hangs off the list itself: it reports the range of rows it has mounted, once per
+    // change rather than per frame, and the feed asks for more when that range gets close to the
+    // end. Nothing here depends on how tall the loaded page happens to be.
+    let scroll_read = app.scroll_pos.clone();
+    let scroll_wheel = app.scroll_pos.clone();
+    let viewport = col()
         .key("feed-scroll")
         .grow(1.0)
         .min_h(0.0)
         .w_full()
         .scroll(ScrollSpec {
             stick_bottom: false,
-        });
-    if app.active_tab == AppTab::Home {
-        viewport = viewport.on_far_from_bottom(600.0, |app: &mut BiliGuga, far: bool| {
-            if far && !app.home_loading && app.home_has_more {
-                app.load_home_page(false);
-            }
-        });
-    }
-    root.child(viewport.child(body))
+        })
+        // Where it stands, for the wheel handler below.
+        .on_scroll_offset(move |at| scroll_read.set(Some((at.offset[1], at.max[1]))))
+        // A notched wheel takes the feed further per click than Rune's flat 40 points. Taking
+        // the delta means placing the viewport here, so the offset above is read back; a
+        // trackpad (`precise`) and horizontal gestures are left to Rune.
+        .on_wheel(
+            move |_: &mut BiliGuga, ev: WheelEvent, tx: &mut Tx| -> bool {
+                if ev.precise || ev.dy == 0.0 || ev.dx != 0.0 || ev.momentum {
+                    return false;
+                }
+                let Some((offset, max)) = scroll_wheel.get() else {
+                    // Not laid out yet: nothing to place the viewport at, so let Rune scroll.
+                    return false;
+                };
+                if max <= 0.0 {
+                    // Everything fits: nothing to scroll, and nothing to take from Rune.
+                    return false;
+                }
+                let step = ev.dy * (WHEEL_NOTCH / RUNE_WHEEL_NOTCH);
+                let to = (offset - step).clamp(0.0, max);
+                // Two notches can arrive between frames; the second starts where the first left
+                // off, not where the last frame's offset was. Clamped here as well as by the
+                // viewport, so holding the wheel at the end cannot build up an offset past it
+                // for the next page's growth to spring to.
+                scroll_wheel.set(Some((to, max)));
+                tx.scroll_to_instant("feed-scroll", 0.0, to);
+                true
+            },
+        );
+    // "Loading the next page" is a footer inside the viewport, so the reader sees the feed
+    // still filling rather than a frozen list.
+    let footer = if is_loading && !videos.is_empty() {
+        row()
+            .w_full()
+            .py(16.0)
+            .justify_center()
+            .gap(8.0)
+            .child(pulse_dot())
+            .child(
+                text("正在加载更多…")
+                    .font(TextStyle::new(11.5, 400.0))
+                    .color(theme::TEXT_FAINT),
+            )
+    } else {
+        el().h(12.0).w_full()
+    };
+
+    col()
+        .key("feed")
+        .h_full()
+        .min_h(0.0)
+        .min_w(0.0)
+        .grow(1.0)
+        .fill(theme::BG)
+        .child(render_topbar(app))
+        .child(el().w_full().h(1.0).shrink().fill(theme::HAIRLINE))
+        .child(viewport.child(body).child(footer))
 }
 
 fn render_login(app: &BiliGuga) -> El {
-    let mut panel = col()
-        .w_full()
-        .h_full()
-        .padding(20.0)
-        .gap(12.0)
-        .items_center()
-        .fill(theme::FEED);
-    if let Some(session) = &app.session {
-        panel = panel
+    let body = if let Some(session) = &app.session {
+        let initial: String = session
+            .username
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().collect())
+            .unwrap_or_else(|| "B".into());
+        let mut card = col()
+            .w(320.0)
+            .shrink()
+            .gap(14.0)
+            .padding(24.0)
+            .items_center()
+            .radius(16.0)
+            .fill(theme::CARD)
+            .border(1.0, theme::BORDER)
+            .shadow(12.0, 40.0, Color::BLACK.alpha(0.35))
+            .child(match app.account_avatar.as_ref() {
+                Some(avatar) => el().size(64.0, 64.0).radius(32.0).clip_rounded(32.0).child(
+                    el().w_full()
+                        .h_full()
+                        .pixels_fit(avatar.pixels(), SurfaceFit::Fill),
+                ),
+                None => el()
+                    .size(64.0, 64.0)
+                    .center()
+                    .radius(32.0)
+                    .fill(theme::ACCENT_DIM)
+                    .child(
+                        text(initial)
+                            .font(TextStyle::new(24.0, 650.0))
+                            .color(theme::ACCENT_SOFT),
+                    ),
+            })
             .child(
-                text(format!("已登录：{}", session.username))
-                    .font(type_::TITLE)
+                text(&session.username)
+                    .font(TextStyle::new(17.0, 600.0))
                     .color(theme::TEXT),
             )
             .child(
-                el().px(12.0)
-                    .py(6.0)
-                    .radius(6.0)
-                    .cursor(rune::Cursor::Pointer)
-                    .fill(theme::PANEL)
-                    .hover(theme::HOVER)
-                    .on_press(|app: &mut BiliGuga| {
-                        login::clear_session();
-                        app.session = None;
-                        app.account_avatar = None;
-                        app.login_status = "使用哔哩哔哩 App 扫码登录".into();
-                        app.active_tab = AppTab::Home;
-                    })
-                    .child(text("退出登录").font(type_::LABEL).color(theme::DANGER)),
+                text(if session.is_vip {
+                    "大会员 · 已登录"
+                } else {
+                    "已登录"
+                })
+                .font(TextStyle::new(12.0, 400.0))
+                .color(theme::TEXT_FAINT),
+            )
+            .child(pill("sign-out", None, "退出登录", Tone::Raised).on_press(
+                |app: &mut BiliGuga| {
+                    login::clear_session();
+                    app.session = None;
+                    app.account_avatar = None;
+                    app.login_status = "使用哔哩哔哩 App 扫码登录".into();
+                    app.active_tab = AppTab::Home;
+                },
+            ));
+        if app.session.is_some() {
+            card = card.child(
+                row()
+                    .gap(8.0)
+                    .child(
+                        pill("to-history", Some(&icons::HISTORY), "观看历史", Tone::Quiet)
+                            .on_press(|app: &mut BiliGuga| app.show_tab(AppTab::History)),
+                    )
+                    .child(
+                        pill("to-favs", Some(&icons::STAR), "我的收藏", Tone::Quiet)
+                            .on_press(|app: &mut BiliGuga| app.show_tab(AppTab::Favorites)),
+                    ),
             );
-        return panel;
-    }
-    if let Some(qr) = &app.login_qr {
-        panel = panel.child(
-            el().w(220.0)
-                .h(220.0)
-                .radius(8.0)
-                .pixels_fit(qr.pixels(), SurfaceFit::Fit),
-        );
-    }
-    panel = panel
-        .child(
-            text(app.login_status.as_ref())
-                .font(type_::BODY)
-                .color(theme::TEXT_DIM),
-        )
-        .child(
-            el().px(12.0)
-                .py(6.0)
-                .radius(6.0)
-                .cursor(rune::Cursor::Pointer)
-                .fill(theme::ACCENT)
-                .hover(theme::ACCENT_SOFT)
-                .on_press(|app: &mut BiliGuga| app.start_login())
-                .child(text("刷新二维码").font(type_::LABEL).color(Color::WHITE)),
-        );
-    panel
+        }
+        card
+    } else {
+        let mut card = col()
+            .w(320.0)
+            .shrink()
+            .gap(14.0)
+            .padding(24.0)
+            .items_center()
+            .radius(16.0)
+            .fill(theme::CARD)
+            .border(1.0, theme::BORDER)
+            .shadow(12.0, 40.0, Color::BLACK.alpha(0.35))
+            .child(
+                text("扫码登录")
+                    .font(TextStyle::new(17.0, 600.0))
+                    .color(theme::TEXT),
+            )
+            .child(
+                text("用哔哩哔哩 App 扫一扫，收藏和历史就会出现在这里")
+                    .font(TextStyle::new(12.0, 400.0))
+                    .color(theme::TEXT_FAINT)
+                    .max_w(240.0)
+                    .align(rune::Align::Center),
+            );
+        // The code sits on a white plate whatever the theme: scanners need the quiet zone.
+        let plate = el()
+            .size(196.0, 196.0)
+            .center()
+            .radius(10.0)
+            .fill(Color::WHITE)
+            .clip_rounded(10.0);
+        card = card.child(match &app.login_qr {
+            Some(qr) => plate.child(
+                el().size(172.0, 172.0)
+                    .pixels_fit(qr.pixels(), SurfaceFit::Fit),
+            ),
+            None => plate.child(el().size(172.0, 172.0).center().child(glyph(
+                &icons::REFRESH,
+                theme::TEXT_FAINT,
+                26.0,
+            ))),
+        });
+        card = card
+            .child(
+                text(app.login_status.as_ref())
+                    .font(TextStyle::new(12.0, 400.0))
+                    .color(if app.login_qr.is_some() {
+                        theme::TEXT_DIM
+                    } else {
+                        theme::TEXT_FAINT
+                    })
+                    .align(rune::Align::Center),
+            )
+            .child(
+                pill(
+                    "refresh-qr",
+                    Some(&icons::REFRESH),
+                    "刷新二维码",
+                    Tone::Accent,
+                )
+                .on_press(|app: &mut BiliGuga| app.start_login()),
+            );
+        card
+    };
+    col()
+        .w_full()
+        .h_full()
+        .grow(1.0)
+        .fill(theme::BG)
+        .child(render_topbar(app))
+        .child(el().w_full().h(1.0).shrink().fill(theme::HAIRLINE))
+        .child(col().w_full().grow(1.0).center().child(body))
 }
 
-/// A thin track with a filled portion. Only the display half: the seek bar and the volume
-/// slider wrap it in the drag handler that turns a pointer x into a fraction.
-fn progress_track(fraction: f32, height: f32) -> El {
-    let fraction = fraction.clamp(0., 1.);
+// ---- The player -----------------------------------------------------------------------------
+
+/// A thin track with a filled portion, used by the seek bar and the volume slider.
+fn track(fraction: f32, height: f32, fill: Color) -> El {
+    let fraction = fraction.clamp(0.0, 1.0);
     col()
         .w_full()
         .h(height)
@@ -1613,52 +2289,76 @@ fn progress_track(fraction: f32, height: f32) -> El {
             el().h(height)
                 .w_frac(fraction)
                 .radius(height / 2.0)
-                .fill(theme::ACCENT),
+                .fill(fill),
         )
 }
 
-/// The seek bar: presses and drags anywhere on the track jump the video there.
+/// The seek bar: presses and drags anywhere on the track jump the video there. The hit area is
+/// taller than the drawn line, so it is easy to grab.
 fn seek_bar(position: f64, duration: f64) -> El {
-    let fraction = if duration > 0. {
+    row()
+        .key("seek-row")
+        .w_full()
+        .gap(10.0)
+        .items_center()
+        .child(
+            text(Clock::new(position).as_str())
+                .font(TextStyle::new(11.5, 500.0))
+                .color(theme::TEXT_DIM)
+                .shrink(),
+        )
+        .child(seek_track(position, duration))
+        .child(
+            text(Clock::new(duration).as_str())
+                .font(TextStyle::new(11.5, 500.0))
+                .color(theme::TEXT_FAINT)
+                .shrink(),
+        )
+}
+
+/// The track itself: presses and drags anywhere on it jump the video there. The hit area is
+/// taller than the drawn line, so it is easy to grab.
+fn seek_track(position: f64, duration: f64) -> El {
+    let fraction = if duration > 0.0 {
         (position / duration) as f32
     } else {
-        0.
+        0.0
     };
     col()
         .key("seek-bar")
-        .w_full()
-        .h(14.0)
+        .grow(1.0)
+        .h(18.0)
         .justify_center()
         .cursor(rune::Cursor::Pointer)
         .on_drag(move |app: &mut BiliGuga, drag: &mut Drag, _: &mut Tx| {
             // `drag.x` is the pointer in the element's own points, so a press at 30% is 30%.
-            let fraction = if drag.w > 0. {
-                (drag.x / drag.w).clamp(0., 1.)
+            let fraction = if drag.w > 0.0 {
+                (drag.x / drag.w).clamp(0.0, 1.0)
             } else {
-                0.
+                0.0
             };
             app.seek_percent(fraction as f64);
             app.seek_dragging = drag.phase != Phase::Up;
             app.show_controls();
         })
-        .child(progress_track(fraction, 4.0))
+        .child(track(fraction, 4.0, theme::ACCENT))
 }
 
-/// The volume slider, sharing the drag driver with the seek bar.
-fn volume_bar(volume: f64) -> El {
+fn volume_bar(volume: f64, width: f32) -> El {
     col()
         .key("volume-bar")
-        .w(72.0)
-        .h(14.0)
+        .w(width)
+        .h(18.0)
         .justify_center()
         .cursor(rune::Cursor::Pointer)
+        .help("音量")
         .on_drag(move |app: &mut BiliGuga, drag: &mut Drag, _: &mut Tx| {
-            let fraction = if drag.w > 0. {
-                (drag.x / drag.w).clamp(0., 1.)
+            let fraction = if drag.w > 0.0 {
+                (drag.x / drag.w).clamp(0.0, 1.0)
             } else {
-                0.
+                0.0
             };
-            app.volume = (fraction as f64 * 100.).clamp(0., 100.);
+            app.volume = (fraction as f64 * 100.0).clamp(0.0, 100.0);
             app.player.set_volume(app.volume);
             app.volume_dragging = drag.phase != Phase::Up;
             if !app.volume_dragging {
@@ -1666,11 +2366,10 @@ fn volume_bar(volume: f64) -> El {
             }
             app.show_controls();
         })
-        .child(progress_track((volume / 100.) as f32, 4.0))
+        .child(track((volume / 100.0) as f32, 4.0, theme::TEXT_DIM))
 }
 
-/// Which collection the current episode belongs to, and where in it, when it belongs to one.
-/// The title comes from the API and had nowhere to show before this.
+/// Which collection the current episode belongs to, and where in it.
 fn collection_marker(app: &BiliGuga) -> El {
     let Some(collection) = &app.collection else {
         return el();
@@ -1682,82 +2381,49 @@ fn collection_marker(app: &BiliGuga) -> El {
             .position(|episode| episode.bvid == video.bvid)
             .map(|index| index + 1)
     });
-    let label = match position {
+    let text = match position {
         Some(index) => format!(
-            "{} {}/{}",
+            "{} · {}/{}",
             collection.title,
             index,
             collection.episodes.len()
         ),
         None => collection.title.clone(),
     };
-    text(label)
+    // Keyed by the collection, so switching episodes keeps this label's identity (and its
+    // place in the transport row) instead of looking like a new element every time.
+    row()
         .key(format!("collection-{}", collection.id))
-        .font(type_::SECTION)
-        .color(theme::TEXT_FAINT)
-        .truncate()
-        .max_w(180.0)
+        .shrink()
+        .max_w(220.0)
+        .gap(5.0)
+        .items_center()
+        .child(glyph(&icons::TV, theme::TEXT_FAINT, 12.0))
+        .child(label(text, 11.5, 500.0, theme::TEXT_FAINT))
 }
 
-fn control_button(label: &'static str, key: &'static str) -> El {
-    el().key(key)
-        .px(8.0)
-        .py(4.0)
-        .radius(4.0)
-        .cursor(rune::Cursor::Pointer)
-        .hover(theme::HOVER)
-        .child(text(label).font(type_::LABEL).color(theme::TEXT))
-}
-
-/// The player column. The video area's measured size reaches mpv through
-/// `BiliGuga::stage_size` and `poll`, so a 1080p frame is not decoded for a 400 pt column.
-fn render_player(app: &BiliGuga) -> El {
-    let Some(video) = &app.playing_video else {
-        return col()
-            .grow(1.0)
-            .h_full()
-            .items_center()
-            .justify_center()
-            .fill(theme::PANEL)
-            .child(
-                text("暂无正在播放的视频")
-                    .font(type_::BODY)
-                    .color(theme::TEXT_FAINT),
-            );
-    };
-
-    let status = app.player.status();
-    let duration = if status.duration.is_finite() && status.duration > 0. {
-        status.duration
-    } else {
-        0.
-    };
-    let position = if status.time_pos.is_finite() {
-        status.time_pos.clamp(0., duration.max(0.))
-    } else {
-        0.
-    };
-    // The stage: the video frame letterboxed on black, or a message until one arrives.
+/// The video stage: the frame letterboxed on black, or a message until one arrives. In the
+/// windowed layout it is one block at the top of the player column; in full screen it takes
+/// everything and the controls float over it.
+fn render_stage(app: &BiliGuga, size: Option<(f32, f32)>) -> El {
     let mut stage = col()
         .key("player-stage")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
         .items_center()
         .justify_center()
         .fill(Color::BLACK)
         .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
-    // The stage keeps the clip's own shape until a frame says otherwise, so a 4:3 video is
-    // letterboxed instead of being stretched into 16:9.
-    if !app.player_fullscreen {
-        let aspect = app
-            .player
-            .source_size()
-            .filter(|(_, height)| *height > 0)
-            .map(|(width, height)| width as f32 / height as f32)
-            .unwrap_or(16. / 9.);
-        stage = stage.aspect_ratio(aspect);
-    }
+    stage = match size {
+        // The windowed player is handed the box it may use, so the frame is letterboxed inside
+        // a known rectangle: the layout never depends on what mpv happens to be decoding.
+        Some((width, height)) => stage
+            .w(width)
+            .h(height)
+            .radius(12.0)
+            .clip_rounded(12.0)
+            .border(1.0, theme::BORDER),
+        // Full screen: everything, edge to edge.
+        None => stage.grow(1.0).w_full().h_full().min_h(0.0),
+    };
     match app.player.presented() {
         Some(pixels) => {
             stage = stage.child(
@@ -1768,348 +2434,600 @@ fn render_player(app: &BiliGuga) -> El {
             );
         }
         None => {
-            // Borrowed, not cloned: this runs on every commit, and the message is either an
-            // error already in the state or one of two fixed sentences.
-            let message = app.playback_error.as_deref().unwrap_or({
-                if app.playback == PlaybackState::Buffering {
-                    "正在缓冲…"
-                } else {
-                    "点击播放开始观看"
-                }
-            });
-            stage = stage.child(text(message).font(type_::BODY).color(
-                if app.playback_error.is_some() {
-                    theme::DANGER
-                } else {
-                    theme::TEXT_FAINT
-                },
-            ));
-        }
-    }
-    // The controls, over the stage, while the pointer has been around recently.
-    let controls_visible = app.controls_visible();
-    let transport = row()
-        .w_full()
-        .items_center()
-        .gap(8.0)
-        .child(
-            control_button(
-                if app.playback == PlaybackState::Playing {
-                    "暂停"
-                } else {
-                    "播放"
-                },
-                "play-pause",
-            )
-            .on_press(|app: &mut BiliGuga| app.toggle_pause()),
-        )
-        .child(
-            text({
-                // Written into stack buffers: this runs on every commit, and two times plus a
-                // separator used to be three allocations.
-                let mut line = String::with_capacity(16);
-                line.push_str(Clock::new(position).as_str());
-                line.push_str(" / ");
-                line.push_str(Clock::new(duration).as_str());
-                line
-            })
-            .font(type_::LABEL)
-            .color(theme::TEXT_DIM),
-        )
-        .child(el().grow(1.0))
-        .child(collection_marker(app))
-        .child(
-            control_button("画质", "quality")
-                .child(
-                    text(crate::api::quality_label(app.quality))
-                        .font(type_::SECTION)
-                        .color(theme::TEXT_FAINT),
-                )
-                .on_press(|app: &mut BiliGuga| {
-                    app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
-                        None
+            let (message, tone) = match &app.playback_error {
+                Some(error) => (error.as_str(), theme::DANGER),
+                None if app.playback == PlaybackState::Buffering => ("正在缓冲…", theme::TEXT_DIM),
+                None => ("准备播放…", theme::TEXT_DIM),
+            };
+            stage = stage.child(
+                col()
+                    .gap(12.0)
+                    .center()
+                    .child(if app.playback_error.is_some() {
+                        el().size(44.0, 44.0)
+                            .center()
+                            .radius(22.0)
+                            .fill(theme::DANGER.alpha(0.12))
+                            .child(glyph(&icons::CLOSE, theme::DANGER, 20.0))
                     } else {
-                        Some(PlayerMenu::Quality)
-                    };
-                }),
-        )
-        .child(control_button("全屏", "fullscreen").on_press_tx(
-            |app: &mut BiliGuga, tx: &mut Tx| {
-                app.player_fullscreen = !app.player_fullscreen;
-                tx.toggle_full_screen();
-            },
-        ));
-
-    // Actions on their own row: eleven buttons in one line is wider than the player column at
-    // the default window size, and the rightmost ones were cut off entirely.
-    let actions = row()
-        .w_full()
-        .items_center()
-        .gap(6.0)
-        .child(control_button("点赞", "like").on_press(|app: &mut BiliGuga| app.like_current()))
-        .child(control_button("投币", "coin").on_press(|app: &mut BiliGuga| app.coin_current()))
-        .child(
-            control_button("稍后", "watch-later")
-                .on_press(|app: &mut BiliGuga| app.save_to_watch_later()),
-        )
-        .child(
-            control_button("收藏", "favorite")
-                .on_press(|app: &mut BiliGuga| app.save_to_favorites()),
-        )
-        .child(
-            control_button("上集", "prev-episode")
-                .on_press(|app: &mut BiliGuga| app.play_collection_step(false)),
-        )
-        .child(
-            control_button("下集", "next-episode")
-                .on_press(|app: &mut BiliGuga| app.play_collection_step(true)),
-        )
-        .child(el().grow(1.0))
-        .child(volume_bar(app.volume))
-        .child(control_button("倍速", "speed").on_press(|app: &mut BiliGuga| app.cycle_speed()))
-        .child(
-            text(format!("{:.2}x", app.speed))
-                .font(type_::LABEL)
-                .color(theme::TEXT_DIM),
-        );
-
-    let controls = col()
-        .w_full()
-        .gap(4.0)
-        .px(12.0)
-        .py(8.0)
-        .fill(theme::PANEL)
-        .child(seek_bar(position, duration))
-        .child(transport)
-        .child(actions);
-
-    let mut root = col()
-        .key("player")
-        .grow(1.0)
-        .min_h(0.0)
-        .h_full()
-        .fill(theme::PANEL)
-        .child(stage);
-    if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
-        root = root.child(
-            col()
-                .key("quality-menu")
-                .w_full()
-                .gap(1.0)
-                .px(12.0)
-                .py(4.0)
-                .fill(theme::PANEL)
-                .children(app.quality_options.iter().map(|option| {
-                    let selected = option.qn == app.quality;
-                    let quality = option.qn;
-                    let label = option.label.as_str();
-                    // `switchable` says whether the account may play this quality at all (4K
-                    // without a membership is listed but refused), so the menu says so rather
-                    // than letting the click fail with a server error.
-                    let allowed = option.switchable;
-                    let mut row_el = row()
-                        .w_full()
-                        .items_center()
-                        .gap(6.0)
-                        .px(6.0)
-                        .py(3.0)
-                        .radius(4.0)
-                        .cursor(rune::Cursor::Pointer)
-                        .hover(theme::HOVER)
-                        .on_press(move |app: &mut BiliGuga| {
-                            if allowed {
-                                app.select_quality(quality)
-                            }
-                        })
-                        .child(text(label).font(type_::LABEL).color(if selected {
-                            theme::ACCENT_SOFT
-                        } else if allowed {
-                            theme::TEXT_DIM
-                        } else {
-                            theme::TEXT_FAINT
-                        }));
-                    if !allowed {
-                        row_el = row_el.child(
-                            text("需要会员")
-                                .font(type_::SECTION)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                    if selected {
-                        row_el = row_el.fill(theme::ACTIVE_ROW);
-                    }
-                    row_el
-                })),
-        );
-    }
-    if controls_visible {
-        root = root.child(controls);
-    }
-    let mut root = root;
-    if let Some(note) = &app.action_note {
-        root = root.child(
-            row()
-                .w_full()
-                .px(12.0)
-                .py(4.0)
-                .fill(theme::PANEL)
-                .child(text(note).font(type_::LABEL).color(theme::ACCENT_SOFT)),
-        );
-    }
-    root.child(render_detail(app, video))
-        .child(render_comments(app, video))
-}
-
-/// The clip's own numbers: what the detail call fetches. They lived in fields nobody read
-/// until this row existed, so the view count, danmaku count and publish date never showed.
-fn render_detail(app: &BiliGuga, video: &Video) -> El {
-    let mut line = row()
-        .key("player-detail")
-        .w_full()
-        .min_w(0.0)
-        .items_center()
-        .gap(10.0)
-        .px(12.0)
-        .py(6.0)
-        .fill(theme::PANEL)
-        .child(
-            text(&video.title)
-                .font(type_::BODY)
-                .color(theme::TEXT)
-                .truncate(),
-        );
-    // Nothing has arrived yet: no numbers is honest, where a row of dashes is noise.
-    if let Some(stats) = &app.stats {
-        for (label, value) in [
-            ("播放", &stats.view_count),
-            ("弹幕", &stats.danmaku_count),
-            ("点赞", &stats.like_count),
-            ("发布于", &stats.published_at),
-        ] {
-            // Two elements rather than one `format!`: this runs on every commit, and a label
-            // plus its value costs no allocation this way.
-            line = line
-                .child(text(label).font(type_::SECTION).color(theme::TEXT_FAINT))
-                .child(text(value).font(type_::SECTION).color(theme::TEXT_FAINT));
-        }
-    }
-    line
-}
-
-fn render_comments(app: &BiliGuga, video: &Video) -> El {
-    let mut section = col()
-        .key("comments")
-        .w_full()
-        .max_h(220.0)
-        .gap(4.0)
-        .px(12.0)
-        .py(8.0)
-        .fill(theme::PANEL)
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .child(
-                    text(format!("评论 {}", app.comments_total.max(0)))
-                        .font(type_::LABEL)
-                        .color(theme::TEXT_DIM),
-                )
-                .child(
-                    text(&video.uploader)
-                        .font(type_::LABEL)
-                        .color(theme::ACCENT_SOFT)
-                        .cursor(rune::Cursor::Pointer)
-                        .hover(theme::HOVER)
-                        .on_press(move |app: &mut BiliGuga| {
-                            let (mid, name) = match &app.playing_video {
-                                Some(video) => (video.uploader_mid, video.uploader.clone()),
-                                None => return,
-                            };
-                            app.open_author(mid, name);
-                        }),
-                ),
-        );
-    if app.comments_loading && app.comments.is_empty() {
-        section = section.child(
-            text("正在加载评论…")
-                .font(type_::LABEL)
-                .color(theme::TEXT_FAINT),
-        );
-    } else if let Some(error) = &app.comments_error {
-        section = section.child(text(error).font(type_::LABEL).color(theme::DANGER));
-    } else if app.comments.is_empty() {
-        section = section.child(
-            text("还没有评论")
-                .font(type_::LABEL)
-                .color(theme::TEXT_FAINT),
-        );
-    } else {
-        // A scroll viewport needs a bounded height: inside an auto-height column `.grow()`
-        // resolves to 0 pt (Rune's own debug warning says so), so the list gets one outright.
-        section = section.child(
-            col()
-                .key("comment-list")
-                .w_full()
-                .h(150.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .children(app.comments.iter().map(|comment| {
-                    // A loaded comment never changes, so `memo` keeps its subtree across
-                    // commits: loading another page no longer re-builds and re-shapes every
-                    // comment already on screen, which is the expensive half of a list.
-                    rune::memo(format!("comment-{}", comment.rpid), comment.rpid, || {
-                        col()
-                            .w_full()
-                            .gap(1.0)
-                            .padding(4.0)
-                            .child(
-                                row()
-                                    .gap(6.0)
-                                    .child(
-                                        text(&comment.username)
-                                            .font(type_::LABEL)
-                                            .color(theme::ACCENT_SOFT),
-                                    )
-                                    .child(
-                                        text(&comment.time)
-                                            .font(type_::SECTION)
-                                            .color(theme::TEXT_FAINT),
-                                    )
-                                    .child(el().grow(1.0))
-                                    .child(
-                                        text(comment.like.to_string())
-                                            .font(type_::SECTION)
-                                            .color(theme::TEXT_FAINT),
-                                    ),
-                            )
-                            .child(
-                                text(&comment.message)
-                                    .font(type_::LABEL)
-                                    .color(theme::TEXT_DIM)
-                                    .wrap(),
-                            )
+                        pulse_dot()
                     })
-                })),
-        );
-        if app.comments_has_more {
-            section = section.child(
-                el().w_full()
-                    .py(4.0)
-                    .items_center()
-                    .cursor(rune::Cursor::Pointer)
-                    .hover(theme::HOVER)
-                    .on_press(|app: &mut BiliGuga| app.load_comments(false))
                     .child(
-                        text("加载更多评论")
-                            .font(type_::SECTION)
-                            .color(theme::ACCENT_SOFT),
+                        text(message)
+                            .font(TextStyle::new(12.5, 400.0))
+                            .color(tone)
+                            .max_w(420.0)
+                            .align(rune::Align::Center),
                     ),
             );
         }
     }
+    stage
+}
+
+/// The transport bar: the play button, then the switches that change how it plays.
+///
+/// `compact` is the windowed player, whose column is a share of the window and can be as
+/// narrow as 390 points. There the quality is its icon alone and the volume slider is short,
+/// so the row fits on one line; full screen has the room to spell the quality out.
+fn render_transport(app: &BiliGuga, fullscreen: bool) -> El {
+    let playing = app.playback == PlaybackState::Playing;
+    let mut quality =
+        icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
+            app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
+                None
+            } else {
+                Some(PlayerMenu::Quality)
+            };
+        });
+    if fullscreen {
+        quality = quality.child(
+            text(crate::api::quality_label(app.quality))
+                .font(TextStyle::new(11.0, 500.0))
+                .color(theme::TEXT_FAINT)
+                .single_line(),
+        );
+    }
+    row()
+        .key("transport")
+        .w_full()
+        .items_center()
+        .gap(4.0)
+        .child(
+            el().size(34.0, 34.0)
+                .center()
+                .radius(17.0)
+                .fill(theme::ACCENT)
+                .hover(theme::ACCENT_SOFT)
+                .press(theme::ACCENT_SOFT)
+                .cursor(rune::Cursor::Pointer)
+                .help(if playing { "暂停" } else { "播放" })
+                .on_press(|app: &mut BiliGuga| app.toggle_pause())
+                .child(glyph(
+                    if playing { &icons::PAUSE } else { &icons::PLAY },
+                    Color::WHITE,
+                    15.0,
+                )),
+        )
+        .child(el().grow(1.0).min_w(4.0))
+        .child(if fullscreen {
+            collection_marker(app)
+        } else {
+            el()
+        })
+        .child(quality)
+        .child(
+            square_button(
+                "mute",
+                if app.volume <= 0.5 {
+                    &icons::MUTED
+                } else {
+                    &icons::VOLUME
+                },
+                "静音",
+            )
+            .on_press(|app: &mut BiliGuga| {
+                app.volume = if app.volume > 0.5 { 0.0 } else { 100.0 };
+                app.player.set_volume(app.volume);
+                app.persist_player_settings();
+            }),
+        )
+        .child(volume_bar(app.volume, if fullscreen { 96.0 } else { 62.0 }))
+        .child(
+            pill("speed", None, &format!("{:.2}x", app.speed), Tone::Quiet)
+                .h(28.0)
+                .px(8.0)
+                .help("倍速")
+                .on_press(|app: &mut BiliGuga| app.cycle_speed()),
+        )
+        .child(if fullscreen {
+            el()
+        } else {
+            square_button(
+                "theater",
+                if app.theater {
+                    &icons::COLLAPSE
+                } else {
+                    &icons::EXPAND
+                },
+                if app.theater {
+                    "还原分栏"
+                } else {
+                    "影院模式"
+                },
+            )
+            .on_press(|app: &mut BiliGuga| app.theater = !app.theater)
+        })
+        .child(
+            square_button(
+                "fullscreen",
+                if app.player_fullscreen {
+                    &icons::EXIT_FULLSCREEN
+                } else {
+                    &icons::FULLSCREEN
+                },
+                "全屏",
+            )
+            .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
+                app.player_fullscreen = !app.player_fullscreen;
+                tx.toggle_full_screen();
+            }),
+        )
+}
+
+/// Like, coin, watch later, favourite and the episode steppers: the things you do *to* a video.
+fn render_actions(app: &BiliGuga) -> El {
+    let has_collection = app.collection.is_some();
+    let mut actions = row()
+        .key("actions")
+        .shrink()
+        .gap(6.0)
+        .items_center()
+        .child(
+            pill("like", Some(&icons::LIKE), "点赞", Tone::Raised)
+                .on_press(|app: &mut BiliGuga| app.like_current()),
+        )
+        .child(
+            pill("coin", Some(&icons::COIN), "投币", Tone::Raised)
+                .on_press(|app: &mut BiliGuga| app.coin_current()),
+        )
+        .child(
+            pill("favorite", Some(&icons::STAR), "收藏", Tone::Raised)
+                .on_press(|app: &mut BiliGuga| app.save_to_favorites()),
+        )
+        .child(
+            pill("watch-later", Some(&icons::CLOCK), "稍后看", Tone::Raised)
+                .on_press(|app: &mut BiliGuga| app.save_to_watch_later()),
+        );
+    if has_collection {
+        actions = actions
+            .child(
+                pill("prev-episode", Some(&icons::PREV), "上一集", Tone::Quiet)
+                    .on_press(|app: &mut BiliGuga| app.play_collection_step(false)),
+            )
+            .child(
+                pill("next-episode", Some(&icons::NEXT), "下一集", Tone::Quiet)
+                    .on_press(|app: &mut BiliGuga| app.play_collection_step(true)),
+            );
+    }
+    actions
+}
+
+/// The quality popup, drawn under the transport bar while it is open.
+fn render_quality_menu(app: &BiliGuga) -> El {
+    col()
+        .key("quality-menu")
+        .w(220.0)
+        .shrink()
+        .padding(6.0)
+        .gap(2.0)
+        .radius(12.0)
+        .fill(theme::CARD)
+        .border(1.0, theme::BORDER)
+        .shadow(10.0, 32.0, Color::BLACK.alpha(0.45))
+        .children(app.quality_options.iter().map(|option| {
+            let selected = option.qn == app.quality;
+            let quality = option.qn;
+            let allowed = option.switchable;
+            let mut row_el = row()
+                .w_full()
+                .h(30.0)
+                .px(8.0)
+                .gap(8.0)
+                .items_center()
+                .radius(7.0)
+                .cursor(rune::Cursor::Pointer)
+                .hover(theme::CARD_HOVER)
+                .on_press(move |app: &mut BiliGuga| {
+                    if allowed {
+                        app.select_quality(quality);
+                    }
+                })
+                .child(
+                    text(&option.label)
+                        .font(TextStyle::new(12.5, 500.0))
+                        .color(if selected {
+                            theme::ACCENT_SOFT
+                        } else if allowed {
+                            theme::TEXT
+                        } else {
+                            theme::TEXT_FAINT
+                        })
+                        .grow(1.0),
+                );
+            if !allowed {
+                row_el = row_el.child(
+                    text("需要会员")
+                        .font(TextStyle::new(10.5, 500.0))
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+            if selected {
+                row_el = row_el.child(glyph(&icons::CHECK, theme::ACCENT, 13.0));
+            }
+            row_el
+        }))
+}
+
+/// The clip's title, uploader and numbers, under the stage. Three lines rather than one: a
+/// title, then who made it, then the counts — the player column is narrow enough that a single
+/// row of all three ran off the right edge.
+fn render_detail(app: &BiliGuga, video: &Video) -> El {
+    let mut block = col()
+        .key("player-detail")
+        .w_full()
+        .gap(8.0)
+        .child(
+            text(&video.title)
+                .font(TextStyle::new(15.5, 600.0))
+                .color(theme::TEXT)
+                .max_lines(2),
+        )
+        .child(
+            row().gap(6.0).items_center().child(
+                row()
+                    .gap(6.0)
+                    .items_center()
+                    .radius(14.0)
+                    .pr(10.0)
+                    .cursor(rune::Cursor::Pointer)
+                    .hover(theme::HOVER)
+                    .press(theme::PRESS)
+                    .help("查看该 UP 主的投稿")
+                    .on_press({
+                        let mid = video.uploader_mid;
+                        let name = video.uploader.clone();
+                        move |app: &mut BiliGuga| app.open_author(mid, name.clone())
+                    })
+                    .child(
+                        el().size(24.0, 24.0)
+                            .center()
+                            .radius(12.0)
+                            .fill(theme::CARD)
+                            .child(glyph(&icons::USER, theme::TEXT_DIM, 13.0)),
+                    )
+                    .child(
+                        text(&video.uploader)
+                            .font(TextStyle::new(12.0, 550.0))
+                            .color(theme::ACCENT_SOFT)
+                            .single_line()
+                            .truncate(),
+                    ),
+            ),
+        )
+        .child(render_detail_stats(app));
+    if let Some(note) = &app.action_note {
+        block = block.child(
+            row()
+                .gap(6.0)
+                .items_center()
+                .child(glyph(&icons::CHECK, theme::ACCENT, 12.0))
+                .child(
+                    text(note)
+                        .font(TextStyle::new(11.5, 500.0))
+                        .color(theme::ACCENT_SOFT),
+                ),
+        );
+    }
+    block
+}
+
+/// The four numbers the detail call brings back, as glyph-plus-value chips.
+fn render_detail_stats(app: &BiliGuga) -> El {
+    let Some(stats) = &app.stats else {
+        return el();
+    };
+    row().gap(12.0).items_center().shrink().children(
+        [
+            ("播放", &stats.view_count),
+            ("弹幕", &stats.danmaku_count),
+            ("点赞", &stats.like_count),
+            ("发布", &stats.published_at),
+        ]
+        .into_iter()
+        .map(|(caption, value)| {
+            row()
+                .gap(4.0)
+                .items_center()
+                .shrink()
+                .child(
+                    text(caption)
+                        .font(TextStyle::new(10.5, 500.0))
+                        .color(theme::TEXT_FAINT)
+                        .single_line(),
+                )
+                .child(
+                    text(value)
+                        .font(TextStyle::new(11.5, 500.0))
+                        .color(theme::TEXT_DIM)
+                        .single_line(),
+                )
+        }),
+    )
+}
+
+fn render_comments(app: &BiliGuga) -> El {
+    let mut section = col().key("comments").w_full().gap(8.0).child(
+        row()
+            .w_full()
+            .items_center()
+            .gap(6.0)
+            .child(glyph(&icons::COMMENT, theme::TEXT_DIM, 14.0))
+            .child(
+                text(format!("评论 {}", app.comments_total.max(0)))
+                    .font(TextStyle::new(12.5, 600.0))
+                    .color(theme::TEXT_DIM),
+            )
+            .child(el().grow(1.0)),
+    );
+    if app.comments_loading && app.comments.is_empty() {
+        section = section.child(
+            row()
+                .py(12.0)
+                .gap(8.0)
+                .items_center()
+                .child(pulse_dot())
+                .child(
+                    text("正在加载评论…")
+                        .font(TextStyle::new(11.5, 400.0))
+                        .color(theme::TEXT_FAINT),
+                ),
+        );
+    } else if let Some(error) = &app.comments_error {
+        section = section.child(
+            text(error)
+                .font(TextStyle::new(11.5, 400.0))
+                .color(theme::DANGER),
+        );
+    } else if app.comments.is_empty() {
+        section = section.child(
+            text("还没有评论")
+                .font(TextStyle::new(11.5, 400.0))
+                .color(theme::TEXT_FAINT),
+        );
+    } else {
+        section = section.child(col().w_full().gap(2.0).children(app.comments.iter().map(
+            |comment| {
+                // A loaded comment never changes, so `memo` keeps its subtree across commits:
+                // loading another page no longer re-builds and re-shapes every comment on
+                // screen, which is the expensive half of a list.
+                rune::memo(format!("comment-{}", comment.rpid), comment.rpid, || {
+                    col()
+                        .w_full()
+                        .gap(3.0)
+                        .padding(6.0)
+                        .radius(8.0)
+                        .hover(theme::HOVER)
+                        .child(
+                            row()
+                                .gap(6.0)
+                                .items_center()
+                                .child(
+                                    el().size(18.0, 18.0)
+                                        .center()
+                                        .radius(9.0)
+                                        .fill(theme::CARD)
+                                        .child(glyph(&icons::USER, theme::TEXT_FAINT, 10.0)),
+                                )
+                                .child(
+                                    text(&comment.username)
+                                        .font(TextStyle::new(11.5, 600.0))
+                                        .color(theme::ACCENT_SOFT),
+                                )
+                                .child(
+                                    text(&comment.time)
+                                        .font(TextStyle::new(10.5, 400.0))
+                                        .color(theme::TEXT_FAINT),
+                                )
+                                .child(el().grow(1.0))
+                                .child(glyph(&icons::LIKE, theme::TEXT_FAINT, 11.0))
+                                .child(
+                                    text(comment.like.to_string())
+                                        .font(TextStyle::new(10.5, 400.0))
+                                        .color(theme::TEXT_FAINT),
+                                ),
+                        )
+                        .child(
+                            text(&comment.message)
+                                .font(TextStyle::new(12.0, 400.0))
+                                .color(theme::TEXT_DIM)
+                                .wrap(),
+                        )
+                })
+            },
+        )));
+        if app.comments_has_more {
+            section = section.child(
+                pill("more-comments", None, "加载更多评论", Tone::Quiet)
+                    .on_press(|app: &mut BiliGuga| app.load_comments(false)),
+            );
+        }
+    }
     section
+}
+
+/// The player column while a video is open: the stage in its 16:9 block, then one card holding
+/// everything that acts on it, then the comments. It scrolls as a whole, because a player
+/// column that pinned its controls would leave the comments in a 150-point slot.
+fn render_player(app: &BiliGuga, video: &Video) -> El {
+    let (stage_width, stage_height) = app.stage_box.get();
+    let status = app.player.status();
+    let duration = if status.duration.is_finite() && status.duration > 0.0 {
+        status.duration
+    } else {
+        0.0
+    };
+    let position = if status.time_pos.is_finite() {
+        status.time_pos.clamp(0.0, duration.max(0.0))
+    } else {
+        0.0
+    };
+    let mut stage_block = col()
+        .key("stage-block")
+        .w_full()
+        .shrink()
+        .padding(PANE_PAD)
+        .child(render_stage(app, Some((stage_width, stage_height))));
+    // The windowed layout always shows its controls: hiding them would hide the only way to
+    // act on the video, since the pointer is usually over the feed.
+    stage_block = stage_block
+        .child(el().h(10.0))
+        .child(
+            col()
+                .w_full()
+                .gap(8.0)
+                .padding(10.0)
+                .radius(12.0)
+                .fill(theme::PANEL)
+                .child(seek_bar(position, duration))
+                .child(render_transport(app, false)),
+        )
+        .child(
+            if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
+                row()
+                    .w_full()
+                    .pt(6.0)
+                    .justify_end()
+                    .child(render_quality_menu(app))
+            } else {
+                el()
+            },
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .items_center()
+                .child(render_actions(app))
+                .child(el().grow(1.0))
+                .child(
+                    pill("close-player", Some(&icons::CLOSE), "关闭", Tone::Quiet)
+                        .on_press(|app: &mut BiliGuga| app.close_player()),
+                ),
+        );
+
+    let column = col()
+        .key("player")
+        .grow(1.0)
+        .h_full()
+        .min_w(0.0)
+        .min_h(0.0)
+        .fill(theme::PANEL)
+        .border_sides([0.0, 0.0, 0.0, 1.0], theme::HAIRLINE);
+    column.child(
+        col()
+            .key("player-scroll")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(
+                col()
+                    .w_full()
+                    .gap(14.0)
+                    .child(stage_block)
+                    .child(
+                        col()
+                            .w_full()
+                            .gap(12.0)
+                            .px(PANE_PAD)
+                            .pb(8.0)
+                            .child(render_detail(app, video)),
+                    )
+                    .child(
+                        col()
+                            .w_full()
+                            .gap(10.0)
+                            .px(PANE_PAD)
+                            .pb(28.0)
+                            .child(render_comments(app)),
+                    ),
+            ),
+    )
+}
+
+/// The player column while the video is in full screen: stage and a control strip that fades
+/// out with the pointer.
+fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
+    let status = app.player.status();
+    let duration = if status.duration.is_finite() && status.duration > 0.0 {
+        status.duration
+    } else {
+        0.0
+    };
+    let position = if status.time_pos.is_finite() {
+        status.time_pos.clamp(0.0, duration.max(0.0))
+    } else {
+        0.0
+    };
+    // The picture keeps the whole window; the title and the controls ride over it, pinned to
+    // the edges, so showing them never resizes the video or re-times mpv's decode.
+    let mut root = col()
+        .key("player")
+        .w_full()
+        .h_full()
+        .fill(Color::BLACK)
+        .child(render_stage(app, None));
+    if app.controls_visible() {
+        root = root.child(
+            col()
+                .pin(Some(0.0), None, Some(0.0), Some(0.0))
+                .gap(8.0)
+                .px(24.0)
+                .pt(14.0)
+                .pb(14.0)
+                .fill(Color::BLACK.alpha(0.82))
+                .child(seek_bar(position, duration))
+                .child(render_transport(app, true)),
+        );
+    } else {
+        root = root.child(
+            row()
+                .pin(Some(0.0), Some(0.0), Some(0.0), None)
+                .h(44.0)
+                .px(20.0)
+                .items_center()
+                .fill(Color::BLACK.alpha(0.45))
+                .child(
+                    text(&video.title)
+                        .font(TextStyle::new(12.5, 500.0))
+                        .color(Color::WHITE.alpha(0.78))
+                        .truncate(),
+                ),
+        );
+    }
+    if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
+        root = root.child(
+            row()
+                .pin(Some(0.0), None, Some(0.0), Some(78.0))
+                .px(24.0)
+                .justify_end()
+                .child(render_quality_menu(app)),
+        );
+    }
+    root
 }
 
 fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
@@ -2122,12 +3040,103 @@ fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         )
     });
     app.stage_size.set(stage_size);
-    let mut root = row().w_full().h_full().fill(theme::BG);
-    if app.player_fullscreen {
-        return root.child(render_player(app));
+    // The browse pane's width decides how many cards fit. `layout_with` re-runs this view only
+    // when that count changes, not on every point the window is dragged wider.
+    if let Some(columns) = cx.layout_with("feed-scroll", column_count)
+        && let Some([_, _, pane_width, _]) = cx.layout("feed-scroll")
+    {
+        app.card_columns.set(columns);
+        app.card_width.set(slot_width(pane_width, columns));
     }
-    root = root.child(render_sidebar(app)).child(render_feed(app));
-    root.child(render_player(app))
+    // The player column's size decides the stage: 16:9 across the column, or the height it has
+    // left under the controls, whichever is smaller. Reading the column (not the stage) keeps
+    // the stage's own size out of the measurement, so no read can feed its own output.
+    if let Some([_, _, width, height]) = cx.layout("player") {
+        // The clip's own shape, once mpv reports one: a 4:3 upload keeps its proportions
+        // instead of floating small inside a 16:9 letterbox.
+        let aspect = app
+            .player
+            .source_size()
+            .filter(|(_, height)| *height > 0)
+            .map_or(16.0 / 9.0, |(width, height)| width as f32 / height as f32);
+        app.stage_box.set(stage_box(width, height, aspect));
+    }
+    // The browse pane's height, which paging measures its runway against.
+    if let Some([_, _, _, pane_height]) = cx.layout("feed-scroll") {
+        app.pane_height.set(pane_height);
+    }
+    // The window's own width, which the feed's share beside the player is worked out from.
+    // Reading the root is safe: its size is the window's, not something the view decides.
+    if let Some([_, _, window_width, _]) = cx.layout("window") {
+        app.feed_pane_width
+            .set((window_width * FEED_PANE_SHARE).clamp(FEED_PANE_MIN, FEED_PANE_MAX));
+    }
+    let mut root = row().key("window").w_full().h_full().fill(theme::BG);
+    if app.player_fullscreen {
+        return match &app.playing_video {
+            Some(video) => root.child(render_player_fullscreen(app, video)),
+            None => root,
+        };
+    }
+    root = root.child(render_rail(app));
+    // What the browse pane is depends on whether something is open: with a video playing the
+    // feed becomes a list beside it, so the two never fight over the window's width.
+    let watching = app.playing_video.is_some();
+    if watching && app.theater {
+        if let Some(video) = &app.playing_video {
+            root = root.child(render_player(app, video));
+        }
+    } else if watching {
+        let feed = col()
+            .key("feed-pane")
+            .w(app.feed_pane_width.get())
+            .h_full()
+            .shrink()
+            .child(render_feed(app));
+        root = root.child(feed);
+        if let Some(video) = &app.playing_video {
+            root = root.child(render_player(app, video));
+        }
+    } else {
+        root = root.child(render_feed(app));
+    }
+    root
+}
+
+/// The rectangle the video gets inside a player column `width` × `height` points.
+///
+/// The controls under the stage are a fixed strip (seek bar, transport, actions), so the stage
+/// takes what is left, and its frame is fitted to 16:9 inside that: a wide window fills the
+/// stage, a short one letterboxes it instead of pushing the controls off the bottom.
+fn stage_box(column_width: f32, column_height: f32, aspect: f32) -> (f32, f32) {
+    let width = (column_width - 2.0 * PANE_PAD).max(160.0);
+    // Everything under the stage, measured rather than guessed: the block's own padding, the
+    // gap, the controls card (10 + 18 + 8 + 34 + 10), the gap, the actions row, and a little
+    // slack so a rounding point never clips the last row.
+    let reserved = 2.0 * PANE_PAD + 10.0 + 80.0 + 10.0 + 32.0 + 10.0;
+    let room = (column_height - reserved).max(90.0);
+    let height = ((width / aspect.max(0.2)).min(room)).max(90.0);
+    (width, height)
+}
+
+/// `layout_size_with`'s comparison for the browse pane: the view only has to run again when the
+/// number of columns changes, not on every point the window is dragged wider.
+fn column_count([_, _, width, _]: [f32; 4]) -> usize {
+    column_count_of(width)
+}
+
+fn column_count_of(width: f32) -> usize {
+    let usable = width - 2.0 * PANE_PAD;
+    (((usable + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor() as i32).clamp(1, 5) as usize
+}
+
+/// One card's share of the pane: the padded width, less the gaps, split evenly.
+fn slot_width(pane_width: f32, columns: usize) -> f32 {
+    let usable = pane_width - 2.0 * PANE_PAD;
+    let columns = columns.max(1) as f32;
+    ((usable - (columns - 1.0) * CARD_GAP) / columns)
+        .floor()
+        .max(80.0)
 }
 
 // ---- Runtime hooks ---------------------------------------------------------------------------
@@ -2170,6 +3179,21 @@ fn setup(app: &mut BiliGuga, waker: Waker) {
 /// idle window draws nothing and arms no timer.
 fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+
+    // Keep the next page in hand before the reader reaches the end of this one.
+    //
+    // This runs *before* this frame's events, and that order is the whole point. A page that
+    // lands below grows the rows, but `max` still describes the layout of the frame before,
+    // which was built from the shorter list: checked after the event, every arrival looked like
+    // the reader standing at the bottom of the old content, and the feed paged again and again
+    // without ever drawing what it had already asked for. Checked first, each arrival gets its
+    // own frame of layout before anything is decided from it.
+    //
+    // A scroll callback could not do this job: it may not change state, and it would miss the
+    // ways of moving the feed that are not the wheel (a trackpad, the arrow keys, Page Down).
+    if app.page_home_if_near_end() {
+        changed = true;
+    }
 
     while let Ok(event) = app.events.try_recv() {
         changed = true;
@@ -2472,34 +3496,40 @@ impl BiliGuga {
     }
 }
 
+/// Keys the window handles itself. The transport keys only count while something is open:
+/// with nothing playing, Space used to start a "playback" of nothing, and it swallowed the
+/// key a reader might be using for something else.
 fn on_key(app: &mut BiliGuga, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
+    let watching = app.playing_video.is_some();
     match event.key {
-        Key::Text(ref typed) if typed == " " && !mods.ctrl && !mods.alt => {
+        Key::Text(ref typed) if typed == " " && !mods.ctrl && !mods.alt && watching => {
             app.toggle_pause();
             true
         }
-        Key::Left => {
+        Key::Left if watching => {
             app.player.seek_relative(-10.);
             true
         }
-        Key::Right => {
+        Key::Right if watching => {
             app.player.seek_relative(10.);
             true
         }
-        Key::Up => {
+        Key::Up if watching => {
             app.volume = (app.volume + 5.).clamp(0., 100.);
             app.player.set_volume(app.volume);
             app.persist_player_settings();
             true
         }
-        Key::Down => {
+        Key::Down if watching => {
             app.volume = (app.volume - 5.).clamp(0., 100.);
             app.player.set_volume(app.volume);
             app.persist_player_settings();
             true
         }
-        Key::Text(ref typed) if typed.eq_ignore_ascii_case("f") && !mods.ctrl && !mods.alt => {
+        Key::Text(ref typed)
+            if typed.eq_ignore_ascii_case("f") && !mods.ctrl && !mods.alt && watching =>
+        {
             app.player_fullscreen = !app.player_fullscreen;
             tx.toggle_full_screen();
             true
@@ -2508,6 +3538,11 @@ fn on_key(app: &mut BiliGuga, event: &KeyEvent, tx: &mut Tx) -> bool {
             if app.player_fullscreen {
                 app.player_fullscreen = false;
                 tx.toggle_full_screen();
+                return true;
+            }
+            // Windowed, Escape is the way out of the player: back to the browse grid.
+            if watching {
+                app.close_player();
                 return true;
             }
             false
@@ -2650,6 +3685,12 @@ const SCENES: &[Scene] = &[
     ("feed", seed_feed),
     ("player", seed_player),
     ("search", seed_search),
+    ("empty", seed_empty),
+    ("login", seed_login),
+    ("history", seed_history),
+    ("signed-out", seed_signed_out),
+    ("theater", seed_theater),
+    ("fullscreen", seed_fullscreen),
 ];
 
 fn seed_loaded(app: &mut BiliGuga) {
@@ -2685,6 +3726,49 @@ fn seed_player(app: &mut BiliGuga) {
     app.comments_total = 6;
 }
 
+/// The first frame a fresh install shows: nothing loaded, nothing playing.
+fn seed_empty(app: &mut BiliGuga) {
+    app.loading = false;
+    app.home_loading = false;
+}
+
+/// A feed that needs a session, on a machine that has none: the panel offers the door.
+fn seed_signed_out(app: &mut BiliGuga) {
+    seed_empty(app);
+    // The session is loaded from disk at launch, so a machine that has one would otherwise
+    // never show this screen.
+    app.session = None;
+    app.account_avatar = None;
+    app.active_tab = AppTab::Dynamic;
+    app.dynamic_loading = false;
+}
+
+/// Theater mode: the player alone in the window, no feed beside it.
+fn seed_theater(app: &mut BiliGuga) {
+    seed_player(app);
+    app.theater = true;
+}
+
+/// The OS-level full screen, with its floating control strip.
+fn seed_fullscreen(app: &mut BiliGuga) {
+    seed_player(app);
+    app.player_fullscreen = true;
+}
+
+/// The login card, before the QR code has arrived.
+fn seed_login(app: &mut BiliGuga) {
+    seed_empty(app);
+    app.active_tab = AppTab::Login;
+    app.login_status = "正在获取登录二维码…".into();
+}
+
+/// A signed-in feed, so the history list can be checked without an account.
+fn seed_history(app: &mut BiliGuga) {
+    seed_loaded(app);
+    app.active_tab = AppTab::History;
+    app.history = demo_videos(10);
+}
+
 fn seed_search(app: &mut BiliGuga) {
     seed_loaded(app);
     app.active_tab = AppTab::Search;
@@ -2698,6 +3782,7 @@ pub(crate) fn launch() {
         poll: Some(poll),
         on_key: Some(on_key),
         scenes: SCENES,
+        min_size: Some((820.0, 560.0)),
         ..AppSpec::new("哔哩咕嘎", (1360.0, 820.0), BiliGuga::new, view)
     });
 }
@@ -2929,6 +4014,156 @@ mod tests {
         assert!(app.playback_error.is_none());
         app.apply(Event::ActionDone("已投币", Err("未登录".into())));
         assert_eq!(app.action_note.as_deref(), Some("未登录"));
+    }
+
+    /// The home feed asks for the next page while the reader is a pane away from the end, and
+    /// only downward progress narrows that distance: it used to be judged from the grid's
+    /// visible rows, so measuring a row could shift the range by one and the check flipped
+    /// direction — the feed would sit still at the bottom of a page and then load one as the
+    /// reader scrolled *up*.
+    #[test]
+    fn the_feed_pages_a_pane_before_its_end() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(40);
+        app.loading = false;
+        app.home_loading = false;
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        // Well above the end: nothing to do.
+        app.scroll_pos.set(Some((0.0, 8000.0)));
+        assert!(!app.page_home_if_near_end());
+        // One pane from the end: ask now.
+        app.scroll_pos.set(Some((8000.0 - 713.0, 8000.0)));
+        assert!(app.page_home_if_near_end());
+        assert_eq!(app.home_page, 1, "and ask for page 1");
+        assert!(app.home_loading);
+        // Already in flight: asking again would queue a duplicate page.
+        assert!(!app.page_home_if_near_end());
+    }
+
+    /// The distance to the end only grows when the reader scrolls up, so a feed that is loading
+    /// when it reaches the bottom never turns around and asks again on the way back.
+    #[test]
+    fn scrolling_up_never_asks_for_a_page() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(40);
+        app.loading = false;
+        app.home_loading = false;
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        let max = 8000.0;
+        // Every position on the way back up, from the end to the top.
+        let mut y = max;
+        while y > 0.0 {
+            app.scroll_pos.set(Some((y, max)));
+            y -= 100.0;
+            // Only the last pane can ask, and once it is asked the request is in flight.
+            if !app.home_loading {
+                app.page_home_if_near_end();
+            }
+            if app.home_loading {
+                break;
+            }
+        }
+        assert_eq!(app.home_page, 1, "asked once, at the bottom");
+        assert!(app.home_loading);
+        // Everything above the bottom pane changes nothing while the request is in flight.
+        app.scroll_pos.set(Some((0.0, max)));
+        assert!(!app.page_home_if_near_end());
+    }
+
+    /// A page that fits the pane has no scroll room at all, and still asks for the next one.
+    #[test]
+    fn a_page_shorter_than_the_pane_still_pages() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(20);
+        app.loading = false;
+        app.home_loading = false;
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        // Nothing to scroll, and the list is shorter than the pane.
+        app.scroll_pos.set(Some((0.0, 0.0)));
+        assert!(app.page_home_if_near_end());
+        // With nothing left to load, it asks for nothing however close the reader gets.
+        app.home_loading = false;
+        app.home_has_more = false;
+        assert!(!app.page_home_if_near_end());
+    }
+
+    /// A frame that lands a page then decides again from data that has not been laid out:
+    /// that was the bug that made the feed page forever. `poll` therefore decides *before* it
+    /// applies the frame's events, so the layout `max` describes is the layout the decision
+    /// reads.
+    #[test]
+    fn a_landed_page_is_measured_before_the_next_decision() {
+        let mut app = BiliGuga::new();
+        let (sender, events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(20);
+        app.loading = false;
+        app.home_loading = true;
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        // Nothing below the last row, and the reader there: the feed is waiting on a page.
+        app.scroll_pos.set(Some((0.0, 0.0)));
+        // The page lands as an event, with the rows it brings.
+        drop(events);
+        // Before the event is applied the viewport still describes the old, shorter content;
+        // once it has grown, `max` must be allowed to catch up before another page is asked
+        // for. Standing at `max == 0` with content that fits is a real case (it asks once,
+        // while `home_loading` then blocks a second ask), so the guard under test is the
+        // in-flight flag: a landing must not clear it and let the same frame ask again.
+        assert!(!app.page_home_if_near_end(), "a page is already in flight");
+        app.home_loading = false;
+        app.videos.extend(demo_videos(20));
+        // The taller list's `max` has not been published yet: it still says 0. That is exactly
+        // what the old order read, and why it asked again every frame.
+        assert!(
+            app.page_home_if_near_end(),
+            "with the stale max, it asks again — the reason the order matters"
+        );
+    }
+
+    /// Before the viewport has ever been laid out there is nothing to judge: its `max` is 0,
+    /// which used to read as "the last row is the bottom of the pane" and paged the feed four
+    /// times in the first four frames of a run.
+    #[test]
+    fn nothing_is_decided_before_the_viewport_has_been_measured() {
+        let mut app = BiliGuga::new();
+        let (sender, _events) = std::sync::mpsc::channel();
+        app.worker = Some(Worker {
+            events: sender,
+            waker: Arc::new(|| {}),
+        });
+        app.videos = demo_videos(20);
+        app.home_has_more = true;
+        app.active_tab = AppTab::Home;
+        app.pane_height.set(713.0);
+        assert_eq!(app.scroll_pos.get(), None, "nothing is known yet");
+        assert!(!app.page_home_if_near_end(), "so nothing is asked for");
+        assert!(!app.home_loading);
     }
 
     /// The feed lays out from a plain state, which is what `--snap` shows too.
