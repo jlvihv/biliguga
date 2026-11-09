@@ -2003,7 +2003,13 @@ pub(crate) async fn resolve_play_url(
     params.insert("bvid".into(), video.bvid.clone());
     params.insert("cid".into(), cid.to_string());
     params.insert("qn".into(), quality.to_string());
-    params.insert("fnval".into(), "4048".into());
+    // `fnval` is a bitfield of capabilities to ask for, and one of its bits asks for a P2P
+    // CDN: with it, playurl answers with `mcdn.bilivideo.cn:8082` URLs that only resolve
+    // through Bilibili's peer network and time out elsewhere. With plain DASH (1024) the same
+    // video comes back on an ordinary edge host (`edge.*`). Measured: 4048 -> mcdn (18 s
+    // timeout), 1024 -> edge (fetches). `fourk` below still asks for 4K, so this is not
+    // giving up quality.
+    params.insert("fnval".into(), "1024".into());
     params.insert("fnver".into(), "0".into());
     params.insert("fourk".into(), "1".into());
     params.insert("voice_balance".into(), "1".into());

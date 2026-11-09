@@ -3480,4 +3480,56 @@ mod stress {
         let per = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
         eprintln!("frame only (no clock tick): {per:.3} ms/frame");
     }
+    /// The exact path the window takes when a signed-in viewer clicks a video.
+    #[test]
+    #[ignore = "needs the network and a session"]
+    fn live_signed_in_playback() {
+        let session = login::load_session();
+        eprintln!("session: {}", session.is_some());
+        let cookie = session.as_ref().map(|s| s.cookie.clone());
+        let page = futures::executor::block_on(network::run(async {
+            fetch_recommendations(1, None).await
+        }))
+        .expect("feed failed");
+        let video = page.videos.first().expect("no rows").clone();
+        eprintln!(
+            "row: bvid={} aid={} cid={}",
+            video.bvid, video.aid, video.cid
+        );
+        let v2 = video.clone();
+        let c = cookie.clone();
+        let play = futures::executor::block_on(network::run(async move {
+            resolve_play_url(&v2, c.as_deref(), 64).await
+        }));
+        match &play {
+            Ok(p) => eprintln!("resolved: url len {} qn {}", p.url.len(), p.actual_quality),
+            Err(e) => panic!("resolve failed: {e}"),
+        }
+        let play = play.expect("resolve");
+        let mut player = mpv::MpvPlayer::new();
+        player.load(play.url, play.audio_url, 100., 1.);
+        let start = Instant::now();
+        let mut last = 0.0;
+        while start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(100));
+            player.poll_frame();
+            let s = player.status();
+            if s.time_pos.is_finite() && s.time_pos > last {
+                last = s.time_pos;
+            }
+            if last > 3.0 {
+                break;
+            }
+        }
+        let s = player.status();
+        eprintln!(
+            "time_pos={:.2} duration={:.2} paused={} presented={}",
+            s.time_pos,
+            s.duration,
+            s.paused,
+            player.presented().is_some()
+        );
+        assert!(s.time_pos > 1.0, "playback did not start: {s:?}");
+        assert!(player.presented().is_some(), "no frame buffer ever arrived");
+    }
 }
