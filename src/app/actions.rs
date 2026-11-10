@@ -64,6 +64,19 @@ impl BiliGuga {
         );
     }
 
+    /// Plays one episode of the collection on screen, by index.
+    pub(crate) fn play_episode_at(&mut self, index: usize) {
+        let Some(episode) = self
+            .collection
+            .as_ref()
+            .and_then(|collection| collection.episodes.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        self.play_episode(episode);
+    }
+
     /// Jump to the next or previous episode of the collection the player is in.
     pub(crate) fn play_collection_step(&mut self, forward: bool) {
         let Some(collection) = &self.collection else {
@@ -82,7 +95,7 @@ impl BiliGuga {
             _ => None,
         };
         if let Some(episode) = target.cloned() {
-            self.play_video(episode);
+            self.play_episode(episode);
         }
     }
 }

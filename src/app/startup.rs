@@ -32,6 +32,8 @@ pub(crate) const SCENES: &[Scene] = &[
     ("login", seed_login),
     ("history", seed_history),
     ("signed-out", seed_signed_out),
+    ("episodes", seed_episodes),
+    ("episodes-open", seed_episodes_open),
     ("fullscreen", seed_fullscreen),
 ];
 
@@ -85,6 +87,25 @@ pub(crate) fn seed_signed_out(app: &mut BiliGuga) {
     app.account_avatar = None;
     app.active_tab = AppTab::Dynamic;
     app.dynamic_loading = false;
+}
+
+/// A clip that belongs to a collection, so the episode picker has something to show.
+pub(crate) fn seed_episodes(app: &mut BiliGuga) {
+    seed_player(app);
+    let episodes = demo_videos(12);
+    app.collection = Some(VideoCollection {
+        id: 9001,
+        title: "从零写一个窗口管理器".into(),
+        episodes: episodes.clone(),
+    });
+    // The third episode is the one playing, so the list has something above and below it.
+    app.playing_video = Some(Arc::new(episodes[2].clone()));
+}
+
+/// The same, with the episode list already open.
+pub(crate) fn seed_episodes_open(app: &mut BiliGuga) {
+    seed_episodes(app);
+    app.episode_menu_open = true;
 }
 
 /// The OS-level full screen, with its floating control strip.

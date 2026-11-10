@@ -110,37 +110,164 @@ pub(crate) fn volume_bar(volume: f64, width: f32) -> El {
         .child(track((volume / 100.0) as f32, 4.0, theme::TEXT_DIM))
 }
 
-/// Which collection the current episode belongs to, and where in it.
+/// Which episode of which collection is playing, as a button that opens the episode list.
+///
+/// It only exists when the clip has siblings: a single video has no list to open, and a chip
+/// that did nothing would be a control that lies about what it does.
 pub(crate) fn collection_marker(app: &BiliGuga) -> El {
     let Some(collection) = &app.collection else {
         return el();
     };
-    let position = app.playing_video.as_ref().and_then(|video| {
-        collection
-            .episodes
-            .iter()
-            .position(|episode| episode.bvid == video.bvid)
-            .map(|index| index + 1)
-    });
+    let position = current_episode_index(app);
     let text = match position {
         Some(index) => format!(
             "{} · {}/{}",
             collection.title,
-            index,
+            index + 1,
             collection.episodes.len()
         ),
         None => collection.title.clone(),
     };
     // Keyed by the collection, so switching episodes keeps this label's identity (and its
     // place in the transport row) instead of looking like a new element every time.
-    row()
+    let open = app.episode_menu_open;
+    icon_button("episodes", &icons::TV, &text)
         .key(format!("collection-{}", collection.id))
+        .fill(if open {
+            theme::CARD_HOVER
+        } else {
+            Color::TRANSPARENT
+        })
+        .help("选集")
+        .on_press(|app: &mut BiliGuga| {
+            app.episode_menu_open = !app.episode_menu_open;
+            app.quality_menu_open = false;
+            // Opening the list is using the controls: keep them up while it is open.
+            app.show_controls();
+        })
+}
+
+/// The index of the episode playing, within its collection.
+pub(crate) fn current_episode_index(app: &BiliGuga) -> Option<usize> {
+    let collection = app.collection.as_ref()?;
+    let playing = app.playing_video.as_ref()?;
+    collection
+        .episodes
+        .iter()
+        .position(|episode| episode.bvid == playing.bvid)
+}
+
+/// The episode list, scrolled to the playing one and marking it. Same shape as the quality
+/// menu: a card of rows, the current one in the accent, the rest plain.
+pub(crate) fn render_episode_menu(app: &BiliGuga) -> El {
+    let Some(collection) = &app.collection else {
+        return el();
+    };
+    let playing = current_episode_index(app);
+    // The header stays put; the rows scroll under it, so the list can hold a series of any
+    // length inside a 320-point menu.
+    let rows = col()
+        .key("episode-rows")
+        .w_full()
+        .gap(2.0)
+        .children(collection.episodes.iter().enumerate().map(|(index, episode)| {
+            let is_current = playing == Some(index);
+            // The playing one is washed and its number in the accent: the list opens on the
+            // episode the viewer is on, and this is what says which that is.
+            row()
+                .key(format!("episode-{}-{}", collection.id, episode.bvid))
+                .w_full()
+                .h(34.0)
+                .px(8.0)
+                .gap(8.0)
+                .items_center()
+                .radius(7.0)
+                .cursor(rune::Cursor::Pointer)
+                .hover(theme::CARD_HOVER)
+                .fill(if is_current {
+                    theme::ACCENT_DIM
+                } else {
+                    Color::TRANSPARENT
+                })
+                .on_press(move |app: &mut BiliGuga| {
+                    if !is_current {
+                        app.play_episode_at(index);
+                    }
+                })
+                .child(
+                    text((index + 1).to_string())
+                        .font(TextStyle::new(11.5, 600.0))
+                        .color(if is_current {
+                            theme::ACCENT_SOFT
+                        } else {
+                            theme::TEXT_FAINT
+                        })
+                        .w(22.0)
+                        .single_line(),
+                )
+                .child(
+                    text(&episode.title)
+                        .font(TextStyle::new(12.0, if is_current { 600.0 } else { 400.0 }))
+                        .color(if is_current {
+                            theme::ACCENT_SOFT
+                        } else {
+                            theme::TEXT
+                        })
+                        .single_line()
+                        .truncate()
+                        .grow(1.0),
+                )
+                .child(if is_current {
+                    glyph(&icons::PLAY, theme::ACCENT, 11.0)
+                } else {
+                    el()
+                })
+        }));
+    // A fixed height rather than `max_h`: the row list is the only thing that may scroll, and a
+    // `grow` inside a box whose height is decided by its content reserves no room to scroll in.
+    // Twelve episodes fit; a longer series scrolls.
+    col()
+        .key("episode-menu")
+        .w(320.0)
+        .h(320.0)
         .shrink()
-        .max_w(220.0)
-        .gap(5.0)
-        .items_center()
-        .child(glyph(&icons::TV, theme::TEXT_FAINT, 12.0))
-        .child(label(text, 11.5, 500.0, theme::TEXT_FAINT))
+        .padding(6.0)
+        .gap(4.0)
+        .radius(12.0)
+        .fill(theme::CARD)
+        .border(1.0, theme::BORDER)
+        .shadow(10.0, 32.0, Color::BLACK.alpha(0.45))
+        .child(
+            row()
+                .w_full()
+                .px(8.0)
+                .gap(6.0)
+                .items_center()
+                .child(
+                    text(&collection.title)
+                        .font(TextStyle::new(12.0, 600.0))
+                        .color(theme::TEXT_DIM)
+                        .single_line()
+                        .truncate()
+                        .grow(1.0),
+                )
+                .child(
+                    text(format!("{} 集", collection.episodes.len()))
+                        .font(TextStyle::new(10.5, 500.0))
+                        .color(theme::TEXT_FAINT),
+                ),
+        )
+        .child(
+            col()
+                .key("episode-scroll")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(rows),
+        )
 }
 
 /// The video stage: the frame letterboxed on black, or a message until one arrives.
@@ -211,7 +338,10 @@ pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
     // them nothing to do but cover the video. A press, the quality menu or a paused picture
     // holds them — see `controls_visible`.
     if app.controls_visible() {
-        stage = stage.child(quality_overlay(app)).child(controls_overlay(app));
+        stage = stage
+            .child(episode_overlay(app))
+            .child(quality_overlay(app))
+            .child(controls_overlay(app));
     }
     stage
 }
@@ -239,12 +369,29 @@ fn controls_overlay(app: &BiliGuga) -> El {
 /// The quality menu, when it is open, pinned just above [`controls_overlay`].
 fn quality_overlay(app: &BiliGuga) -> El {
     if app.quality_menu_open && !app.quality_options.is_empty() {
+        // Above the controls, aligned with the right end of the transport row, where the
+        // quality button sits.
         row()
             .pin(Some(0.0), None, Some(0.0), Some(78.0))
             .w_full()
             .px(PANE_PAD)
             .justify_end()
             .child(render_quality_menu(app))
+    } else {
+        el()
+    }
+}
+
+/// The episode list, pinned above the controls and aligned with the left end of the transport
+/// row, where its own button sits. The two menus never open together — opening one closes the
+/// other — so they cannot overlap.
+fn episode_overlay(app: &BiliGuga) -> El {
+    if app.episode_menu_open && app.collection.is_some() {
+        row()
+            .pin(Some(0.0), None, Some(0.0), Some(78.0))
+            .w_full()
+            .px(PANE_PAD)
+            .child(render_episode_menu(app))
     } else {
         el()
     }
@@ -258,6 +405,9 @@ pub(crate) fn render_transport(app: &BiliGuga) -> El {
     let playing = app.playback == PlaybackState::Playing;
     let quality = icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
         app.quality_menu_open = !app.quality_menu_open;
+        // One popup at a time: they occupy the same space above the controls.
+        app.episode_menu_open = false;
+        app.show_controls();
     });
     row()
         .key("transport")

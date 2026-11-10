@@ -80,6 +80,8 @@ pub(crate) struct BiliGuga {
     /// The quality menu is open. It was `Option<PlayerMenu>` with a one-variant enum: a menu
     /// that can only be one menu is a `bool` wearing a type's clothes.
     pub(crate) quality_menu_open: bool,
+    /// The episode list is open, when the clip belongs to a collection.
+    pub(crate) episode_menu_open: bool,
     pub(crate) seek_dragging: bool,
     pub(crate) volume_dragging: bool,
     pub(crate) controls_until: Option<Instant>,
@@ -244,6 +246,7 @@ impl BiliGuga {
             quality: 64,
             quality_options: Vec::new(),
             quality_menu_open: false,
+            episode_menu_open: false,
             seek_dragging: false,
             volume_dragging: false,
             controls_until: None,
@@ -628,7 +631,23 @@ impl BiliGuga {
     // ---- Playback ------------------------------------------------------------------------
 
     /// Opens `video` on the stage and asks for everything it needs to play.
+    ///
+    /// The collection is dropped and re-fetched: another clip is another clip's collection,
+    /// which the detail call will bring back if it has one.
     pub(crate) fn play_video(&mut self, video: Video) {
+        self.play_video_keeping_collection(video, false)
+    }
+
+    /// Opens another episode of the collection already on screen.
+    ///
+    /// The collection survives the switch: it is the list the viewer is picking from, and
+    /// dropping it to re-fetch would empty the menu they are pointing at — and make the episode
+    /// buttons flip out of the transport row for a round trip.
+    pub(crate) fn play_episode(&mut self, video: Video) {
+        self.play_video_keeping_collection(video, true)
+    }
+
+    fn play_video_keeping_collection(&mut self, video: Video, keep_collection: bool) {
         // Release the previous stream first: its decoder, its audio track and its frame buffer
         // all belong to the video being replaced. Without this a quality change left the old
         // session decoding until the new one started.
@@ -639,7 +658,10 @@ impl BiliGuga {
         self.playback_error = None;
         self.comments.clear();
         self.comments_page = 0;
-        self.collection = None;
+        if !keep_collection {
+            self.collection = None;
+        }
+        self.episode_menu_open = false;
         self.stats = None;
         // A fresh stream has its own generation, and its own first seek: the cloud position,
         // asked for below.
@@ -747,6 +769,7 @@ impl BiliGuga {
         self.action_note = None;
         self.playback_error = None;
         self.quality_menu_open = false;
+        self.episode_menu_open = false;
         self.selected = None;
     }
 
@@ -829,6 +852,7 @@ impl BiliGuga {
             || self.controls_until
                 .is_some_and(|until| Instant::now() < until)
             || self.quality_menu_open
+            || self.episode_menu_open
             || self.seek_dragging
             || self.volume_dragging
             || self.playback == PlaybackState::Paused
@@ -1075,6 +1099,42 @@ mod tests {
         // Expire the linger the way `poll` does when it comes due.
         app.controls_until = None;
         assert!(!app.controls_visible(), "and they go when it runs out");
+    }
+
+    /// The episode list holds the controls up: it is a thing the viewer is using, and it is
+    /// drawn by the same branch.
+    #[test]
+    fn an_open_episode_list_holds_the_controls() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.episode_menu_open = true;
+        assert!(app.controls_visible());
+    }
+
+    /// Switching episode keeps the collection, so the list the viewer is picking from does not
+    /// empty itself, and picks up on the new episode.
+    #[test]
+    fn an_episode_switch_keeps_the_collection() {
+        let mut app = app_watching(PlaybackState::Playing);
+        let episodes = super::demo_videos(4);
+        app.collection = Some(VideoCollection {
+            id: 7,
+            title: "合集".into(),
+            episodes: episodes.clone(),
+        });
+        app.playing_video = Some(Arc::new(episodes[0].clone()));
+        app.episode_menu_open = true;
+
+        app.play_episode_at(2);
+        assert!(app.collection.is_some(), "the list survives the switch");
+        assert_eq!(current_episode_index(&app), Some(2), "and follows the new episode");
+        assert!(!app.episode_menu_open, "picking one closes the list");
+    }
+
+    /// A clip with no siblings has no list: opening one is not offered.
+    #[test]
+    fn a_standalone_clip_has_no_episode_index() {
+        let app = app_watching(PlaybackState::Playing);
+        assert_eq!(current_episode_index(&app), None);
     }
 
     /// What holds them up: a paused picture (no other way to resume), a press on a slider, and
