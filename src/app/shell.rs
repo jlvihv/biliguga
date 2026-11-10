@@ -56,15 +56,16 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
 
 /// The rectangle the video gets inside a player column `width` × `height` points.
 ///
-/// The controls under the stage are a fixed strip (seek bar, transport, actions), so the stage
-/// takes what is left, and its frame is fitted to 16:9 inside that: a wide window fills the
+/// The picture spans the column edge to edge, so its width is the column's own. The controls
+/// under it are a fixed strip (seek bar, transport, actions), so the stage takes what is left
+/// of the height, and its frame is fitted to its aspect inside that: a wide window fills the
 /// stage, a short one letterboxes it instead of pushing the controls off the bottom.
 pub(crate) fn stage_box(column_width: f32, column_height: f32, aspect: f32) -> (f32, f32) {
-    let width = (column_width - 2.0 * PANE_PAD).max(160.0);
-    // Everything under the stage, measured rather than guessed: the block's own padding, the
-    // gap, the controls card (10 + 18 + 8 + 34 + 10), the gap, the actions row, and a little
-    // slack so a rounding point never clips the last row.
-    let reserved = 2.0 * PANE_PAD + 10.0 + 80.0 + 10.0 + 32.0 + 10.0;
+    let width = column_width.max(160.0);
+    // Everything under the stage, measured rather than guessed: the pad above the stage, the
+    // gap that follows it, the controls card (10 + 18 + 8 + 34 + 10), the actions row with its
+    // own top pad, and a little slack so a rounding point never clips the last row.
+    let reserved = PANE_PAD + PANE_PAD + 80.0 + 10.0 + 32.0 + 10.0;
     let room = (column_height - reserved).max(90.0);
     let height = ((width / aspect.max(0.2)).min(room)).max(90.0);
     (width, height)

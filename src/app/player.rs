@@ -139,13 +139,10 @@ pub(crate) fn render_stage(app: &BiliGuga, size: Option<(f32, f32)>) -> El {
         .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
     stage = match size {
         // The windowed player is handed the box it may use, so the frame is letterboxed inside
-        // a known rectangle: the layout never depends on what mpv happens to be decoding.
-        Some((width, height)) => stage
-            .w(width)
-            .h(height)
-            .radius(12.0)
-            .clip_rounded(12.0)
-            .border(1.0, theme::BORDER),
+        // a known rectangle: the layout never depends on what mpv happens to be decoding. The
+        // picture runs edge to edge — no side margin, no rounding, no border — while everything
+        // under it keeps the pane's own margin.
+        Some((width, height)) => stage.w(width).h(height),
         // Full screen: everything, edge to edge.
         None => stage.grow(1.0).w_full().h_full().min_h(0.0),
     };
@@ -582,30 +579,35 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
     } else {
         0.0
     };
+    // The stage is the one block with no side margin: it starts at the pane's left edge and ends
+    // at its right, and only the rows under it are inset by `PANE_PAD`.
     let mut stage_block = col()
         .key("stage-block")
         .w_full()
         .shrink()
-        .padding(PANE_PAD)
-        .child(render_stage(app, Some((stage_width, stage_height))));
+        .pt(PANE_PAD)
+        .child(render_stage(app, Some((stage_width, stage_height))))
+        .child(el().h(PANE_PAD));
     // The windowed layout always shows its controls: there is nothing underneath to reveal
     // them over, and hiding them would only hide the way to act on the video.
     stage_block = stage_block
-        .child(el().h(10.0))
         .child(
-            col()
-                .w_full()
-                .gap(8.0)
-                .padding(10.0)
-                .radius(12.0)
-                .fill(theme::PANEL)
-                .child(seek_bar(position, duration))
-                .child(render_transport(app)),
+            col().w_full().px(PANE_PAD).child(
+                col()
+                    .w_full()
+                    .gap(8.0)
+                    .padding(10.0)
+                    .radius(12.0)
+                    .fill(theme::PANEL)
+                    .child(seek_bar(position, duration))
+                    .child(render_transport(app)),
+            ),
         )
         .child(
             if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
                 row()
                     .w_full()
+                    .px(PANE_PAD)
                     .pt(6.0)
                     .justify_end()
                     .child(render_quality_menu(app))
@@ -616,6 +618,8 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
         .child(
             row()
                 .w_full()
+                .px(PANE_PAD)
+                .pt(10.0)
                 .gap(6.0)
                 .items_center()
                 .child(render_actions(app))
