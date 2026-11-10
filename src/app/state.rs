@@ -1179,6 +1179,35 @@ mod tests {
         assert_eq!(episode_scroll_offset(&app), 0.0);
     }
 
+    /// The speed is the app's, not the player's: setting it once holds across videos.
+    ///
+    /// This is the thing `poll` used to undo — it wrote mpv's reported speed back into
+    /// `app.speed`, and a new stream reports 1.0, so a 2x setting lasted exactly until the next
+    /// video loaded.
+    #[test]
+    fn the_speed_survives_a_new_video() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.speed = 2.0;
+        app.play_video(super::demo_video(3));
+        assert_eq!(app.speed, 2.0, "opening a video does not reset the rate");
+        app.close_player();
+        assert_eq!(app.speed, 2.0, "nor does closing one");
+    }
+
+    /// Cycling steps through the table and wraps, so one setting is always reachable.
+    #[test]
+    fn cycling_the_speed_visits_every_step() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.speed = 1.0;
+        let mut seen = Vec::new();
+        for _ in 0..SPEED_OPTIONS.len() {
+            app.cycle_speed();
+            seen.push(app.speed);
+        }
+        assert_eq!(seen.len(), SPEED_OPTIONS.len());
+        assert_eq!(app.speed, 1.0, "a full cycle comes back to where it started");
+    }
+
     /// A clip with no siblings has no list: opening one is not offered.
     #[test]
     fn a_standalone_clip_has_no_episode_index() {

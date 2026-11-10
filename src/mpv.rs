@@ -160,6 +160,10 @@ pub struct MpvPlayer {
     presented: Option<FramePixels>,
     /// The viewport the worker is already decoding for, so a still window sends nothing.
     viewport_sent: Option<(usize, usize)>,
+    /// The volume and speed the worker was last told, so a correction the app did not make is
+    /// sent once rather than on every frame until the worker catches up.
+    volume_sent: Option<f64>,
+    speed_sent: Option<f64>,
     current_status: MpvStatus,
 }
 
@@ -186,6 +190,8 @@ impl MpvPlayer {
             frame_targets: target_rx,
             presented: None,
             viewport_sent: None,
+            volume_sent: None,
+            speed_sent: None,
             current_status: MpvStatus::default(),
         }
     }
@@ -232,7 +238,12 @@ impl MpvPlayer {
         let _ = self.commands.send(command);
     }
 
-    pub fn load(&self, url: String, audio_url: Option<String>, volume: f64, speed: f64) {
+    pub fn load(&mut self, url: String, audio_url: Option<String>, volume: f64, speed: f64) {
+        // `Load` itself carries both, so nothing has to be corrected after it — but what was
+        // sent for the *previous* stream must be forgotten, or the correction in `poll` would
+        // think the worker already had this value and skip it.
+        self.volume_sent = None;
+        self.speed_sent = None;
         self.start_worker();
         self.send(PlayerCommand::Load {
             url,
@@ -259,6 +270,8 @@ impl MpvPlayer {
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
         self.viewport_sent = None;
+        self.volume_sent = None;
+        self.speed_sent = None;
         self.presented = None;
     }
 
@@ -266,11 +279,25 @@ impl MpvPlayer {
         self.send(PlayerCommand::SetPause(paused));
     }
 
-    pub fn set_volume(&self, volume: f64) {
+    /// Sends the volume, unless the worker is already at it.
+    ///
+    /// The deduplication matters because `poll` corrects the worker back to the app's setting
+    /// whenever the two disagree — a new stream starts at mpv's defaults — and without this the
+    /// correction would be a command per frame until the worker caught up.
+    pub fn set_volume(&mut self, volume: f64) {
+        if self.volume_sent.is_some_and(|sent| (sent - volume).abs() < 0.01) {
+            return;
+        }
+        self.volume_sent = Some(volume);
         self.send(PlayerCommand::SetVolume(volume));
     }
 
-    pub fn set_speed(&self, speed: f64) {
+    /// [`Self::set_volume`]'s other half: the speed the app has chosen, sent once per change.
+    pub fn set_speed(&mut self, speed: f64) {
+        if self.speed_sent.is_some_and(|sent| (sent - speed).abs() < 0.001) {
+            return;
+        }
+        self.speed_sent = Some(speed);
         self.send(PlayerCommand::SetSpeed(speed));
     }
 

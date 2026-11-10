@@ -84,13 +84,16 @@ pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
             app.last_position = status.time_pos;
             changed = true;
         }
+        // Volume and speed are the app's to decide, not mpv's to report back. They are read
+        // here only to notice a change the app did not make — mpv resets both when a stream is
+        // replaced — and that change is *undone*: a new video plays at the rate the viewer
+        // chose, not at mpv's default of 1.0. Synchronising the other way round used to make a
+        // 2x setting last exactly until the next video loaded.
         if status.volume.is_finite() && (status.volume - app.volume).abs() > 0.5 {
-            app.volume = status.volume.clamp(0., 100.);
-            changed = true;
+            app.player.set_volume(app.volume);
         }
         if status.speed.is_finite() && (status.speed - app.speed).abs() > 0.001 {
-            app.speed = status.speed.max(0.1);
-            changed = true;
+            app.player.set_speed(app.speed);
         }
         // The one seek a stream gets: apply it as soon as the stream knows its own duration,
         // which is what says whether the position is somewhere inside it.
