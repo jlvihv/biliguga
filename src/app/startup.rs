@@ -92,20 +92,29 @@ pub(crate) fn seed_signed_out(app: &mut BiliGuga) {
 /// A clip that belongs to a collection, so the episode picker has something to show.
 pub(crate) fn seed_episodes(app: &mut BiliGuga) {
     seed_player(app);
-    let episodes = demo_videos(12);
+    // 120 episodes with the 50th playing: long enough that the list has to scroll to reach it,
+    // which is the case the picker has to get right.
+    let episodes: Vec<Video> = (0..120)
+        .map(|index| {
+            let mut episode = demo_video(index);
+            episode.title = format!("第 {} 集 · {}", index + 1, episode.title);
+            episode
+        })
+        .collect();
     app.collection = Some(VideoCollection {
         id: 9001,
         title: "从零写一个窗口管理器".into(),
         episodes: episodes.clone(),
     });
-    // The third episode is the one playing, so the list has something above and below it.
-    app.playing_video = Some(Arc::new(episodes[2].clone()));
+    app.playing_video = Some(Arc::new(episodes[49].clone()));
 }
 
 /// The same, with the episode list already open.
 pub(crate) fn seed_episodes_open(app: &mut BiliGuga) {
     seed_episodes(app);
     app.episode_menu_open = true;
+    // What pressing the button does: the list still has to be scrolled to the playing episode.
+    app.episode_scroll_pending = true;
 }
 
 /// The OS-level full screen, with its floating control strip.

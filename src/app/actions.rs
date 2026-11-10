@@ -76,26 +76,4 @@ impl BiliGuga {
         };
         self.play_episode(episode);
     }
-
-    /// Jump to the next or previous episode of the collection the player is in.
-    pub(crate) fn play_collection_step(&mut self, forward: bool) {
-        let Some(collection) = &self.collection else {
-            return;
-        };
-        let Some(current) = &self.playing_video else {
-            return;
-        };
-        let index = collection
-            .episodes
-            .iter()
-            .position(|episode| episode.bvid == current.bvid);
-        let target = match (index, forward) {
-            (Some(index), true) => collection.episodes.get(index + 1),
-            (Some(index), false) if index > 0 => collection.episodes.get(index - 1),
-            _ => None,
-        };
-        if let Some(episode) = target.cloned() {
-            self.play_episode(episode);
-        }
-    }
 }

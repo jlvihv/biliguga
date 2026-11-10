@@ -144,6 +144,10 @@ pub(crate) fn collection_marker(app: &BiliGuga) -> El {
             app.quality_menu_open = false;
             // Opening the list is using the controls: keep them up while it is open.
             app.show_controls();
+            // The list opens on the episode that is playing, not on the first one: at episode
+            // 50 of 120 the viewer is looking for their place in it. The scroll itself happens
+            // on the list's first layout — see `episode_scroll_pending`.
+            app.episode_scroll_pending = app.episode_menu_open;
         })
 }
 
@@ -155,6 +159,22 @@ pub(crate) fn current_episode_index(app: &BiliGuga) -> Option<usize> {
         .episodes
         .iter()
         .position(|episode| episode.bvid == playing.bvid)
+}
+
+/// How far the episode list has to be scrolled to bring the playing episode into view.
+///
+/// Computed rather than measured: each row is a constant [`EPISODE_ROW_HEIGHT`] plus the gap,
+/// so the offset is arithmetic and needs no layout pass — a scroll asked for during the press
+/// would otherwise be clamped against a viewport that does not exist yet. The list is centred
+/// on the playing row where it can be, so the episodes before and after it are both visible.
+pub(crate) fn episode_scroll_offset(app: &BiliGuga) -> f32 {
+    let Some(index) = current_episode_index(app) else {
+        return 0.0;
+    };
+    let row = EPISODE_ROW_HEIGHT + EPISODE_ROW_GAP;
+    let playing_centre = index as f32 * row + EPISODE_ROW_HEIGHT / 2.0;
+    let viewport = EPISODE_MENU_HEIGHT - EPISODE_HEADER_HEIGHT;
+    (playing_centre - viewport / 2.0).max(0.0)
 }
 
 /// The episode list, scrolled to the playing one and marking it. Same shape as the quality
@@ -169,7 +189,7 @@ pub(crate) fn render_episode_menu(app: &BiliGuga) -> El {
     let rows = col()
         .key("episode-rows")
         .w_full()
-        .gap(2.0)
+        .gap(EPISODE_ROW_GAP)
         .children(collection.episodes.iter().enumerate().map(|(index, episode)| {
             let is_current = playing == Some(index);
             // The playing one is washed and its number in the accent: the list opens on the
@@ -177,7 +197,7 @@ pub(crate) fn render_episode_menu(app: &BiliGuga) -> El {
             row()
                 .key(format!("episode-{}-{}", collection.id, episode.bvid))
                 .w_full()
-                .h(34.0)
+                .h(EPISODE_ROW_HEIGHT)
                 .px(8.0)
                 .gap(8.0)
                 .items_center()
@@ -229,7 +249,7 @@ pub(crate) fn render_episode_menu(app: &BiliGuga) -> El {
     col()
         .key("episode-menu")
         .w(320.0)
-        .h(320.0)
+        .h(EPISODE_MENU_HEIGHT)
         .shrink()
         .padding(6.0)
         .gap(4.0)
@@ -338,12 +358,54 @@ pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
     // them nothing to do but cover the video. A press, the quality menu or a paused picture
     // holds them — see `controls_visible`.
     if app.controls_visible() {
-        stage = stage
-            .child(episode_overlay(app))
-            .child(quality_overlay(app))
-            .child(controls_overlay(app));
+        stage = stage.child(controls_overlay(app));
     }
     stage
+}
+
+/// The episode button, with its list hanging above it when the list is open.
+///
+/// The popup is a child of the button's own box, pinned to the box's top-right, so it opens
+/// where the button is — a menu at the far corner of the stage would be a menu the viewer has
+/// to hunt for. `bottom: 34` is the button's own height, so the list sits just clear of it.
+fn episode_anchor(app: &BiliGuga) -> El {
+    let mut anchor = row().key("episode-anchor").shrink().items_center();
+    anchor = anchor.child(collection_marker(app));
+    if app.episode_menu_open && app.collection.is_some() {
+        anchor = anchor.child(
+            el().pin(None, None, Some(0.0), Some(36.0))
+                .shrink()
+                .child(render_episode_menu(app)),
+        );
+    }
+    anchor
+}
+
+/// The quality button, with its menu in the same place relative to it.
+fn quality_anchor(app: &BiliGuga) -> El {
+    let mut anchor = row().key("quality-anchor").shrink().items_center();
+    anchor = anchor.child(
+        icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
+            app.quality_menu_open = !app.quality_menu_open;
+            // One popup at a time: both hang over the picture.
+            app.episode_menu_open = false;
+            app.show_controls();
+        })
+            .child(
+                text(crate::api::quality_label(app.quality))
+                    .font(TextStyle::new(11.0, 500.0))
+                    .color(theme::TEXT_FAINT)
+                    .single_line(),
+            ),
+    );
+    if app.quality_menu_open && !app.quality_options.is_empty() {
+        anchor = anchor.child(
+            el().pin(None, None, Some(0.0), Some(36.0))
+                .shrink()
+                .child(render_quality_menu(app)),
+        );
+    }
+    anchor
 }
 
 /// The player's own controls, laid over the bottom of the picture: the seek bar and the
@@ -366,49 +428,12 @@ fn controls_overlay(app: &BiliGuga) -> El {
         .child(render_transport(app))
 }
 
-/// The quality menu, when it is open, pinned just above [`controls_overlay`].
-fn quality_overlay(app: &BiliGuga) -> El {
-    if app.quality_menu_open && !app.quality_options.is_empty() {
-        // Above the controls, aligned with the right end of the transport row, where the
-        // quality button sits.
-        row()
-            .pin(Some(0.0), None, Some(0.0), Some(78.0))
-            .w_full()
-            .px(PANE_PAD)
-            .justify_end()
-            .child(render_quality_menu(app))
-    } else {
-        el()
-    }
-}
-
-/// The episode list, pinned above the controls and aligned with the left end of the transport
-/// row, where its own button sits. The two menus never open together — opening one closes the
-/// other — so they cannot overlap.
-fn episode_overlay(app: &BiliGuga) -> El {
-    if app.episode_menu_open && app.collection.is_some() {
-        row()
-            .pin(Some(0.0), None, Some(0.0), Some(78.0))
-            .w_full()
-            .px(PANE_PAD)
-            .child(render_episode_menu(app))
-    } else {
-        el()
-    }
-}
-
 /// The transport bar: the play button, then the switches that change how it plays.
 ///
 /// One row for both layouts: the windowed player owns the window beside the rail, and the
 /// full-screen strip floats over the picture — same width to spend either way.
 pub(crate) fn render_transport(app: &BiliGuga) -> El {
     let playing = app.playback == PlaybackState::Playing;
-    let quality = icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
-        app.quality_menu_open = !app.quality_menu_open;
-        // One popup at a time: they occupy the same space above the controls.
-        app.episode_menu_open = false;
-        app.show_controls();
-    });
     row()
         .key("transport")
         .w_full()
@@ -431,15 +456,8 @@ pub(crate) fn render_transport(app: &BiliGuga) -> El {
                 )),
         )
         .child(el().grow(1.0).min_w(4.0))
-        .child(collection_marker(app))
-        .child(
-            quality.child(
-                text(crate::api::quality_label(app.quality))
-                    .font(TextStyle::new(11.0, 500.0))
-                    .color(theme::TEXT_FAINT)
-                    .single_line(),
-            ),
-        )
+        .child(episode_anchor(app))
+        .child(quality_anchor(app))
         .child(
             square_button(
                 "mute",
@@ -482,9 +500,8 @@ pub(crate) fn render_transport(app: &BiliGuga) -> El {
 }
 
 /// Like, coin, watch later, favourite and the episode steppers: the things you do *to* a video.
-pub(crate) fn render_actions(app: &BiliGuga) -> El {
-    let has_collection = app.collection.is_some();
-    let mut actions = row()
+pub(crate) fn render_actions() -> El {
+    row()
         .key("actions")
         .shrink()
         .gap(6.0)
@@ -504,19 +521,7 @@ pub(crate) fn render_actions(app: &BiliGuga) -> El {
         .child(
             pill("watch-later", Some(&icons::CLOCK), "稍后看", Tone::Raised)
                 .on_press(|app: &mut BiliGuga| app.save_to_watch_later()),
-        );
-    if has_collection {
-        actions = actions
-            .child(
-                pill("prev-episode", Some(&icons::PREV), "上一集", Tone::Quiet)
-                    .on_press(|app: &mut BiliGuga| app.play_collection_step(false)),
-            )
-            .child(
-                pill("next-episode", Some(&icons::NEXT), "下一集", Tone::Quiet)
-                    .on_press(|app: &mut BiliGuga| app.play_collection_step(true)),
-            );
-    }
-    actions
+        )
 }
 
 /// The quality popup, drawn under the transport bar while it is open.
@@ -792,7 +797,7 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
                 .w_full()
                 .gap(6.0)
                 .items_center()
-                .child(render_actions(app))
+                .child(render_actions())
                 .child(el().grow(1.0))
                 .child(
                     pill("close-player", Some(&icons::CLOSE), "关闭", Tone::Quiet)

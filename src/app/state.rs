@@ -82,6 +82,10 @@ pub(crate) struct BiliGuga {
     pub(crate) quality_menu_open: bool,
     /// The episode list is open, when the clip belongs to a collection.
     pub(crate) episode_menu_open: bool,
+    /// The list has just opened and still has to be scrolled to the playing episode. It is done
+    /// from the list's own first layout — a scroll requested in the press would fire before the
+    /// rows exist, and the offset would be clamped against a zero-height viewport.
+    pub(crate) episode_scroll_pending: bool,
     pub(crate) seek_dragging: bool,
     pub(crate) volume_dragging: bool,
     pub(crate) controls_until: Option<Instant>,
@@ -247,6 +251,7 @@ impl BiliGuga {
             quality_options: Vec::new(),
             quality_menu_open: false,
             episode_menu_open: false,
+            episode_scroll_pending: false,
             seek_dragging: false,
             volume_dragging: false,
             controls_until: None,
@@ -770,6 +775,7 @@ impl BiliGuga {
         self.playback_error = None;
         self.quality_menu_open = false;
         self.episode_menu_open = false;
+        self.episode_scroll_pending = false;
         self.selected = None;
     }
 
@@ -1128,6 +1134,44 @@ mod tests {
         assert!(app.collection.is_some(), "the list survives the switch");
         assert_eq!(current_episode_index(&app), Some(2), "and follows the new episode");
         assert!(!app.episode_menu_open, "picking one closes the list");
+    }
+
+    /// The list opens on the playing episode, not on the first one: at episode 50 of 120 the
+    /// offset centres the playing row in the viewport.
+    #[test]
+    fn the_list_opens_on_the_playing_episode() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.collection = Some(VideoCollection {
+            id: 1,
+            title: "合集".into(),
+            episodes: super::demo_videos(120),
+        });
+        let playing = app.collection.as_ref().unwrap().episodes[49].clone();
+        app.playing_video = Some(Arc::new(playing));
+
+        let offset = episode_scroll_offset(&app);
+        let row = EPISODE_ROW_HEIGHT + EPISODE_ROW_GAP;
+        let playing_top = 49.0 * row;
+        let viewport = EPISODE_MENU_HEIGHT - EPISODE_HEADER_HEIGHT;
+        assert!(offset > 0.0, "the list has to scroll to reach episode 50");
+        assert!(
+            playing_top >= offset && playing_top + EPISODE_ROW_HEIGHT <= offset + viewport,
+            "the playing row must land inside the viewport: row {playing_top}, offset {offset}, viewport {viewport}"
+        );
+    }
+
+    /// The first episode needs no scroll, and a clip with no list has no offset at all.
+    #[test]
+    fn the_top_of_the_list_needs_no_scroll() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.collection = Some(VideoCollection {
+            id: 1,
+            title: "合集".into(),
+            episodes: super::demo_videos(3),
+        });
+        let first = app.collection.as_ref().unwrap().episodes[0].clone();
+        app.playing_video = Some(Arc::new(first));
+        assert_eq!(episode_scroll_offset(&app), 0.0);
     }
 
     /// A clip with no siblings has no list: opening one is not offered.

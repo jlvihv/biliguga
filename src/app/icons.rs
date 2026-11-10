@@ -58,16 +58,6 @@ pub(super) static PAUSE: Icon = Icon {
     view: 16.0,
     body: r#"<rect x="4.6" y="3.4" width="2.5" height="9.2" rx="0.8" fill="currentColor"/><rect x="8.9" y="3.4" width="2.5" height="9.2" rx="0.8" fill="currentColor"/>"#,
 };
-pub(super) static PREV: Icon = Icon {
-    name: "bg-prev",
-    view: 16.0,
-    body: r#"<path d="M11.6 3.7 5.7 8l5.9 4.3z" fill="currentColor"/><rect x="3.5" y="3.6" width="1.5" height="8.8" rx="0.7" fill="currentColor"/>"#,
-};
-pub(super) static NEXT: Icon = Icon {
-    name: "bg-next",
-    view: 16.0,
-    body: r#"<path d="M4.4 3.7 10.3 8l-5.9 4.3z" fill="currentColor"/><rect x="11" y="3.6" width="1.5" height="8.8" rx="0.7" fill="currentColor"/>"#,
-};
 pub(super) static VOLUME: Icon = Icon {
     name: "bg-volume",
     view: 16.0,

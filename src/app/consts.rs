@@ -64,6 +64,15 @@ pub(crate) const RUNE_WHEEL_NOTCH: f32 = 40.0;
 /// player's transport row runs out of room.
 pub(crate) const MIN_WINDOW_WIDTH: f32 = 820.0;
 
+/// The episode list: the height of one row, the gap between rows, and the box they scroll in.
+/// The scroll offset that brings the playing episode into view is arithmetic over these, so the
+/// list opens where the viewer is instead of at episode one.
+pub(crate) const EPISODE_ROW_HEIGHT: f32 = 34.0;
+pub(crate) const EPISODE_ROW_GAP: f32 = 2.0;
+pub(crate) const EPISODE_MENU_HEIGHT: f32 = 320.0;
+/// The title row above the list plus the menu's own padding.
+pub(crate) const EPISODE_HEADER_HEIGHT: f32 = 26.0;
+
 /// How long the player's controls stay up after the pointer moves, in full screen.
 pub(crate) const CONTROLS_LINGER: Duration = Duration::from_millis(2400);
 

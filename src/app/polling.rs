@@ -7,6 +7,14 @@ pub(crate) use super::*;
 pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
 
+    // The episode list opens on the episode that is playing. Done here rather than in the press
+    // because the request is clamped against the viewport, and the viewport is drawn by the
+    // commit that press causes — during the press its height is still zero.
+    if app.episode_scroll_pending && app.episode_menu_open {
+        app.episode_scroll_pending = false;
+        tx.scroll_to_instant("episode-scroll", 0.0, episode_scroll_offset(app));
+    }
+
     // Keep the next page in hand before the reader reaches the end of this one.
     //
     // This runs *before* this frame's events, and that order is the whole point. A page that
