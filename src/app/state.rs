@@ -2,6 +2,23 @@
 
 pub(crate) use super::*;
 
+/// The first seek of a new stream: back to where the viewer left it.
+///
+/// Three flags and two `Option<f64>` used to express this, and their combinations were the real
+/// state machine: "asked for nothing yet", "waiting for the cloud answer", "have a cloud
+/// position", "have a position from a quality switch", "already seeked". Written out here,
+/// `poll` reads it instead of reconstructing it from four fields every frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Resume {
+    /// Nothing to seek: this stream plays from wherever mpv starts it.
+    Nothing,
+    /// A new stream is loading and the cloud position has not answered yet.
+    Waiting,
+    /// Seek here once the stream reports a duration: the cloud's position, or the playhead the
+    /// viewer was at when they changed quality.
+    To(f64),
+}
+
 pub(crate) struct BiliGuga {
     // Identity and navigation.
     pub(crate) search_edit: TextEdit,
@@ -25,7 +42,16 @@ pub(crate) struct BiliGuga {
     /// The row the keyboard and the highlight are on, `None` until the user picks one: an
     /// unplayed feed should not claim its first row is chosen.
     pub(crate) selected: Option<usize>,
-    pub(crate) loading: bool,
+    /// Bumped whenever any feed's rows change — a page landed, a tab was reloaded, the trim
+    /// dropped rows. The virtual list's key function is only called when this changes, so a
+    /// frame that merely scrolls or ticks the clock no longer builds a `String` per visible row
+    /// just to find out that the row is the one it was.
+    pub(crate) feed_revision: u64,
+    /// A search is in flight. Every other feed has its own flag (`home_loading`,
+    /// `author_loading`, and the four inside [`SignedInFeed`]); this one field used to be set
+    /// by the home feed too, where it duplicated `home_loading` and [`Self::is_loading`] had to
+    /// guess which of the two meanings it was being read with.
+    pub(crate) search_loading: bool,
     pub(crate) history_loading: bool,
     pub(crate) watch_later_loading: bool,
     pub(crate) favorites_loading: bool,
@@ -40,7 +66,6 @@ pub(crate) struct BiliGuga {
     pub(crate) account_avatar: Option<Image>,
     pub(crate) login_qr: Option<Image>,
     pub(crate) login_key: Option<String>,
-    pub(crate) login_loading: bool,
     /// What the login panel tells the viewer. Almost every value is a fixed sentence, so this
     /// is a `Cow`: the seven static messages cost no allocation, and only an error from the
     /// API is a `String`.
@@ -48,36 +73,41 @@ pub(crate) struct BiliGuga {
     pub(crate) login_generation: u64,
     // Player.
     pub(crate) playback: PlaybackState,
-    pub(crate) pending_pause: Option<bool>,
     pub(crate) volume: f64,
     pub(crate) speed: f64,
     pub(crate) quality: u32,
     pub(crate) quality_options: Vec<PlayQuality>,
-    pub(crate) open_menu: Option<PlayerMenu>,
+    /// The quality menu is open. It was `Option<PlayerMenu>` with a one-variant enum: a menu
+    /// that can only be one menu is a `bool` wearing a type's clothes.
+    pub(crate) quality_menu_open: bool,
     pub(crate) seek_dragging: bool,
     pub(crate) volume_dragging: bool,
     pub(crate) controls_until: Option<Instant>,
     pub(crate) player_fullscreen: bool,
-    pub(crate) playing_video: Option<Video>,
+    /// The video on the stage. Shared rather than copied: a play, a quality change and a
+    /// detail call all need it at once, and each `clone` was a fresh handful of `String`s.
+    pub(crate) playing_video: Option<Arc<Video>>,
+    /// Bumped for every stream the player starts loading — a play, or a quality switch on the
+    /// same video. Every answer about that stream comes back tagged with the number it was
+    /// asked under, and a mismatch is dropped: see [`Event`].
+    pub(crate) playback_generation: u64,
+    /// Where the first seek of a new stream stands. One value instead of the three fields it
+    /// replaces (`pending_seek`, `cloud_resume_progress`, `cloud_resume_applied`), whose
+    /// combinations were a state machine nobody had written down.
+    pub(crate) resume: Resume,
     /// The stage size the view last drew at.
     ///
     /// `view` gets `&self`, so it publishes the measurement here and `poll` — which owns the
     /// command channel to mpv — is what acts on it. mpv remembers the size it is already
     /// decoding for, so nothing has to mirror it here.
     pub(crate) stage_size: std::cell::Cell<Option<(usize, usize)>>,
-    /// The clip's own numbers, once the detail call lands. `None` means "not loaded yet", which
-    /// is what the four `String` fields this replaces expressed by holding a sentinel `"—"`:
-    /// a placeholder that a real API value could collide with, and four fields that always
-    /// moved together.
+    /// The clip's own numbers, once the detail call lands. `None` means "not loaded yet".
     pub(crate) stats: Option<VideoStats>,
     pub(crate) playback_error: Option<String>,
     /// Why the last feed request failed. Separate from `playback_error`: a search that fails
     /// used to write its error there, where only the player column shows it, so the viewer saw
     /// an empty feed and no reason for it.
     pub(crate) feed_error: Option<String>,
-    pub(crate) cloud_resume_progress: Option<f64>,
-    pub(crate) cloud_resume_applied: bool,
-    pub(crate) pending_seek: Option<f64>,
     pub(crate) collection: Option<VideoCollection>,
     pub(crate) history_report_at: Instant,
     pub(crate) history_report_in_flight: bool,
@@ -94,7 +124,8 @@ pub(crate) struct BiliGuga {
     pub(crate) player: mpv::MpvPlayer,
     /// The cancel flag this app's covers share. Nothing flips it: a cover that arrives late for
     /// a card that scrolled away is stored and reused, so cancelling would only throw the work
-    /// away. `queue_cover_download` takes one, and one flag for the process is the honest value.
+    /// away. It stays a parameter of [`queue_cover_download`] because that function is written
+    /// to be cancellable; the app hands it a flag it never sets.
     pub(crate) covers_cancelled: Arc<AtomicBool>,
     /// Covers asked for and not yet arrived, by bvid. Without this, every page load asked for
     /// every missing cover again: a 20-row feed could fire 20 identical downloads per page.
@@ -109,9 +140,6 @@ pub(crate) struct BiliGuga {
     pub(crate) last_position: f64,
     /// The last thing an action (like, coin, favourite) told the user.
     pub(crate) action_note: Option<String>,
-    /// Set by any `Event` that added rows, so `poll` looks for missing covers once per frame
-    /// rather than once per answer.
-    pub(crate) new_rows: bool,
     /// How many cards the browse grid fits across, and how wide each one is. `view` gets
     /// `&self`, so — as with `stage_size` — it measures the pane and leaves the numbers here
     /// for the grid it is building in the same pass.
@@ -191,7 +219,8 @@ impl BiliGuga {
             author_loading: false,
             author_generation: 0,
             selected: None,
-            loading: false,
+            feed_revision: 0,
+            search_loading: false,
             history_loading: false,
             watch_later_loading: false,
             favorites_loading: false,
@@ -207,28 +236,25 @@ impl BiliGuga {
             account_avatar: None,
             login_qr: None,
             login_key: None,
-            login_loading: false,
             login_status,
             login_generation: 0,
             playback: PlaybackState::Idle,
-            pending_pause: None,
             volume,
             speed,
             quality: 64,
             quality_options: Vec::new(),
-            open_menu: None,
+            quality_menu_open: false,
             seek_dragging: false,
             volume_dragging: false,
             controls_until: None,
             player_fullscreen: false,
             playing_video: None,
+            playback_generation: 0,
+            resume: Resume::Nothing,
             stage_size: std::cell::Cell::new(None),
             stats: None,
             playback_error: None,
             feed_error: None,
-            cloud_resume_progress: None,
-            cloud_resume_applied: false,
-            pending_seek: None,
             collection: None,
             history_report_at: Instant::now(),
             history_report_in_flight: false,
@@ -252,7 +278,6 @@ impl BiliGuga {
             cover_images: std::collections::HashMap::new(),
             last_position: 0.,
             action_note: None,
-            new_rows: false,
             card_columns: std::cell::Cell::new(2),
             card_width: std::cell::Cell::new(CARD_MIN_WIDTH),
             stage_box: std::cell::Cell::new((320.0, 180.0)),
@@ -302,6 +327,11 @@ impl BiliGuga {
         }
     }
 
+    /// Says the feed's rows changed, so the virtual lists rebuild their keys.
+    pub(crate) fn rows_changed(&mut self) {
+        self.feed_revision = self.feed_revision.wrapping_add(1);
+    }
+
     /// Drops the oldest rows once the home feed grows past [`HOME_KEEP_ROWS`].
     ///
     /// Nothing the reader can reach goes: the cap is far more rows than anyone scrolls back
@@ -337,6 +367,7 @@ impl BiliGuga {
         // place in the whole feed. Rune's virtual list anchors the commit to the row the reader
         // is on and moves the viewport itself, so nothing else has to be corrected here.
         self.trimmed_rows += remove_count / per_row;
+        self.rows_changed();
     }
 
     /// One row of the browse grid or of the list, as the last frame laid it out. Turns a scroll
@@ -344,31 +375,43 @@ impl BiliGuga {
     /// three more rows has moved on, whatever the pixel height of a row happens to be.
     pub(crate) fn feed_row_height(&self) -> f32 {
         if self.card_columns.get() >= 2 {
-            (self.card_width.get() * 9.0 / 16.0 + 78.0).round()
+            grid_row_height(self.card_width.get())
         } else {
             LIST_ROW_HEIGHT
         }
     }
 
+    /// The seven lists a feed column can be showing. Every one of these is loaded, kept and
+    /// walked for covers, and they used to be listed out three times by hand — once here, once
+    /// in [`Self::bvids_on_screen`] and once in [`Self::request_missing_covers`] — so adding a
+    /// feed meant remembering all three.
+    pub(crate) fn feed_columns(&self) -> impl Iterator<Item = &Vec<Video>> {
+        [
+            &self.videos,
+            &self.search_results,
+            &self.dynamic_videos,
+            &self.watch_later,
+            &self.favorites,
+            &self.history,
+            &self.author_videos,
+        ]
+        .into_iter()
+    }
+
     /// Every bvid any feed column, the player or the open collection can still show. A cover
     /// for one of these is in use; anything else is a candidate for eviction.
     pub(crate) fn bvids_on_screen(&self) -> impl Iterator<Item = &str> {
-        self.videos
-            .iter()
-            .chain(&self.search_results)
-            .chain(&self.dynamic_videos)
-            .chain(&self.watch_later)
-            .chain(&self.favorites)
-            .chain(&self.history)
-            .chain(&self.author_videos)
-            .chain(self.playing_video.as_ref())
+        self.feed_columns()
+            .flatten()
+            .map(|video| video.bvid.as_str())
+            .chain(self.playing_video.as_deref().map(|video| video.bvid.as_str()))
             .chain(
                 self.collection
                     .as_ref()
                     .into_iter()
-                    .flat_map(|collection| &collection.episodes),
+                    .flat_map(|collection| &collection.episodes)
+                    .map(|video| video.bvid.as_str()),
             )
-            .map(|video| video.bvid.as_str())
     }
 
     /// Releases a cover nothing is showing any more.
@@ -392,8 +435,8 @@ impl BiliGuga {
             // away: the first row of the new one is a new approach to its end.
             self.asked_row = None;
             self.trimmed_rows = 0;
-            self.loading = true;
             self.videos.clear();
+            self.rows_changed();
             self.feed_error = None;
             self.selected = None;
         }
@@ -463,7 +506,7 @@ impl BiliGuga {
             return;
         }
         self.active_tab = AppTab::Search;
-        self.loading = true;
+        self.search_loading = true;
         self.search_results.clear();
         self.feed_error = None;
         self.selected = None;
@@ -483,7 +526,8 @@ impl BiliGuga {
         match result {
             Ok(videos) => {
                 *feed.videos_mut(self) = videos;
-                self.new_rows = true;
+                self.rows_changed();
+                self.request_missing_covers();
             }
             Err(error) => self.feed_error = Some(error),
         }
@@ -525,6 +569,7 @@ impl BiliGuga {
             self.author_page = 0;
             self.author_has_more = true;
             self.author_videos.clear();
+            self.rows_changed();
         }
         let page = self.author_page + 1;
         let generation = self.author_generation;
@@ -573,45 +618,59 @@ impl BiliGuga {
 
     // ---- Playback ------------------------------------------------------------------------
 
+    /// Opens `video` on the stage and asks for everything it needs to play.
     pub(crate) fn play_video(&mut self, video: Video) {
         // Release the previous stream first: its decoder, its audio track and its frame buffer
         // all belong to the video being replaced. Without this a quality change left the old
         // session decoding until the new one started.
         self.stop_playback();
-        // One clone serves both requests below; the state keeps the original.
-        let requested = video.clone();
-        self.playing_video = Some(video);
+        let video = Arc::new(video);
+        self.playing_video = Some(video.clone());
         self.playback = PlaybackState::Buffering;
         self.playback_error = None;
         self.comments.clear();
         self.comments_page = 0;
-        self.cloud_resume_applied = false;
-        self.pending_seek = None;
         self.collection = None;
         self.stats = None;
+        // A fresh stream has its own generation, and its own first seek: the cloud position,
+        // asked for below.
+        self.resume = Resume::Waiting;
+        let generation = self.next_generation();
+        self.request_stream(video, self.quality, generation);
+        self.load_comments(true);
+    }
 
+    /// Asks the two calls a stream needs, tagged with the generation they answer under.
+    fn request_stream(&mut self, video: Arc<Video>, quality: u32, generation: u64) {
         let cookie = self.cookie();
-        let quality = self.quality;
-        let for_context = requested.clone();
+        let for_context = video.clone();
+        let context_generation = generation;
         self.worker().spawn(
             async move { fetch_video_context(&for_context, cookie.as_deref()).await },
             move |result| match result {
-                Ok(context) => Event::VideoContext(Box::new(context)),
+                Ok(context) => Event::VideoContext(Box::new(context), context_generation),
                 Err(_) => Event::Silent,
             },
         );
         let play_cookie = self.cookie();
         self.worker().spawn(
-            async move { resolve_play_url(&requested, play_cookie.as_deref(), quality).await },
-            Event::PlayUrl,
+            async move { resolve_play_url(&video, play_cookie.as_deref(), quality).await },
+            move |result| Event::PlayUrl(result, generation),
         );
-        self.load_comments(true);
+    }
+
+    /// The generation the next stream is asked under, and the one [`Event`] answers are
+    /// checked against.
+    fn next_generation(&mut self) -> u64 {
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+        self.playback_generation
     }
 
     pub(crate) fn finish_play(&mut self, result: api::PlayUrlResult) {
         // The play URL call resolved the ids it needed; keep them on the video so the history
         // report and the detail call stop resolving them again.
         if let Some(video) = self.playing_video.as_mut() {
+            let video = Arc::make_mut(video);
             if video.aid <= 0 {
                 video.aid = result.aid;
             }
@@ -619,7 +678,7 @@ impl BiliGuga {
                 video.cid = result.cid;
             }
         }
-        self.quality_options = result.qualities.clone();
+        self.quality_options = result.qualities;
         self.quality = result.actual_quality;
         self.player
             .load(result.url, result.audio_url, self.volume, self.speed);
@@ -627,6 +686,7 @@ impl BiliGuga {
         let Some(video) = self.playing_video.clone() else {
             return;
         };
+        let generation = self.playback_generation;
         let play_cookie = self.cookie();
         self.worker().spawn(
             async move {
@@ -634,13 +694,18 @@ impl BiliGuga {
                     .await
                     .map(|progress| progress as f64)
             },
-            Event::Resume,
+            move |progress| Event::Resume(progress, generation),
         );
     }
 
     pub(crate) fn toggle_pause(&mut self) {
-        let paused = self.playback == PlaybackState::Playing;
-        self.pending_pause = Some(paused);
+        // Pausing while the stream is still buffering would claim a state mpv has not reached:
+        // the seek bar would show a pause button for a video with no picture yet.
+        let paused = match self.playback {
+            PlaybackState::Playing => true,
+            PlaybackState::Paused => false,
+            PlaybackState::Idle | PlaybackState::Buffering => return,
+        };
         self.player.set_pause(paused);
         self.playback = if paused {
             PlaybackState::Paused
@@ -652,10 +717,9 @@ impl BiliGuga {
     pub(crate) fn stop_playback(&mut self) {
         self.player.stop_playback();
         self.playback = PlaybackState::Idle;
-        self.pending_pause = None;
-        self.pending_seek = None;
-        self.cloud_resume_progress = None;
-        self.cloud_resume_applied = true;
+        self.resume = Resume::Nothing;
+        // Answers still in flight for the stream just stopped are now stale.
+        self.playback_generation = self.playback_generation.wrapping_add(1);
         self.power_inhibitor.set_active(false);
     }
 
@@ -670,7 +734,7 @@ impl BiliGuga {
         self.comments_error = None;
         self.action_note = None;
         self.playback_error = None;
-        self.open_menu = None;
+        self.quality_menu_open = false;
         self.selected = None;
     }
 
@@ -682,7 +746,6 @@ impl BiliGuga {
         save_player_settings(self.volume, self.speed);
     }
 
-    /// Selects a feed row and plays it.
     /// Reloads the current video at another quality, keeping the playhead.
     pub(crate) fn select_quality(&mut self, quality: u32) {
         let Some(video) = self.playing_video.clone() else {
@@ -690,19 +753,17 @@ impl BiliGuga {
         };
         let position = self.player.status().time_pos;
         self.quality = quality;
-        self.open_menu = None;
+        self.quality_menu_open = false;
         self.playback = PlaybackState::Buffering;
-        let cookie = self.cookie();
-        self.worker().spawn(
-            async move { resolve_play_url(&video, cookie.as_deref(), quality).await },
-            Event::PlayUrl,
-        );
-        // Resume where the viewer was, once the new stream reports its own duration.
-        if position.is_finite() && position > 1. {
-            self.pending_seek = Some(position);
-            self.cloud_resume_applied = false;
-            self.cloud_resume_progress = None;
-        }
+        // Resume where the viewer was, once the new stream reports its own duration. This
+        // overrides the cloud position: the viewer is further along than it.
+        self.resume = if position.is_finite() && position > 1. {
+            Resume::To(position)
+        } else {
+            Resume::Nothing
+        };
+        let generation = self.next_generation();
+        self.request_stream(video, quality, generation);
     }
 
     pub(crate) fn select(&mut self, index: usize) {
@@ -723,16 +784,19 @@ impl BiliGuga {
             return feed.loading(self);
         }
         match self.active_tab {
-            AppTab::Home => self.loading && self.videos.is_empty(),
+            AppTab::Home => self.home_loading,
             AppTab::Author => self.author_loading,
-            _ => self.loading,
+            AppTab::Search => self.search_loading,
+            // Login has its own status line, and the other tabs are signed-in feeds, handled
+            // above.
+            _ => false,
         }
     }
 
     pub(crate) fn controls_visible(&self) -> bool {
         self.controls_until
             .is_some_and(|until| Instant::now() < until)
-            || self.open_menu.is_some()
+            || self.quality_menu_open
             || self.seek_dragging
             || self.volume_dragging
             || self.playback == PlaybackState::Paused
@@ -804,12 +868,11 @@ impl BiliGuga {
     pub(crate) fn start_login(&mut self) {
         self.login_generation = self.login_generation.wrapping_add(1);
         let generation = self.login_generation;
-        self.login_loading = true;
         self.login_status = "正在获取登录二维码…".into();
         self.login_qr = None;
         self.login_key = None;
         self.active_tab = AppTab::Login;
-        self.worker().spawn(fetch_qr_code_event(), move |result| {
+        self.worker().spawn(login::fetch_qr_code(), move |result| {
             Event::QrCode(result, generation)
         });
     }
@@ -885,6 +948,55 @@ impl BiliGuga {
 
     pub(crate) fn cover_for(&self, video: &Video) -> Option<&Image> {
         self.cover_images.get(&video.bvid)
+    }
+
+    pub(crate) fn refresh_feed(&mut self) {
+        match self.active_tab {
+            AppTab::Home => self.load_home_page(true),
+            AppTab::Author => self.load_author_page(true),
+            AppTab::Search => self.load_search(),
+            AppTab::Login => self.start_login(),
+            tab => {
+                if let Some(feed) = tab.signed_in() {
+                    self.load_signed_in(feed);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cycle_speed(&mut self) {
+        let index = SPEED_OPTIONS
+            .iter()
+            .position(|speed| (*speed - self.speed).abs() < 0.01)
+            .unwrap_or(1);
+        self.speed = SPEED_OPTIONS[(index + 1) % SPEED_OPTIONS.len()];
+        self.player.set_speed(self.speed);
+        self.persist_player_settings();
+    }
+
+    pub(crate) fn sync_power(&mut self) {
+        self.power_inhibitor
+            .set_active(self.playback == PlaybackState::Playing);
+    }
+
+    /// Asks for the covers the current feed is missing, skipping ones already downloaded or in
+    /// flight for that bvid.
+    pub(crate) fn request_missing_covers(&mut self) {
+        let mut missing: Vec<(String, String)> = Vec::new();
+        for videos in self.feed_columns() {
+            for video in videos {
+                if video.cover.is_empty()
+                    || self.cover_images.contains_key(&video.bvid)
+                    || self.covers_in_flight.contains(&video.bvid)
+                {
+                    continue;
+                }
+                missing.push((video.bvid.clone(), video.cover.clone()));
+            }
+        }
+        for (bvid, url) in missing {
+            self.request_cover(bvid, url);
+        }
     }
 }
 

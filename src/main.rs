@@ -7,6 +7,7 @@ mod login;
 mod model;
 mod mpv;
 mod network;
+mod paths;
 mod power;
 
 fn main() {

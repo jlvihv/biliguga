@@ -189,4 +189,28 @@ pub(crate) fn poster(
     frame
 }
 
-// ---- The rail -------------------------------------------------------------------------------
+/// A one-point divider across the pane, the hairline that separates a header from its content.
+/// The feed, the login panel and the player's own top bar each drew this as the same three
+/// calls.
+pub(crate) fn hairline() -> El {
+    el().w_full().h(1.0).shrink().fill(theme::HAIRLINE)
+}
+
+/// How tall one grid row is for a card `width` points wide: the 16:9 cover plus the caption
+/// under it. The virtual list's estimate and the paging arithmetic both read this, so the two
+/// cannot disagree about where a row ends.
+pub(crate) fn grid_row_height(width: f32) -> f32 {
+    (width * 9.0 / 16.0 + CARD_CAPTION_HEIGHT).round()
+}
+
+/// A count the way the detail strip shows it: "1.2万", "128.4万", "9.8亿". A plain number with
+/// no unit until it is worth one, so a new upload does not read as "0.0万".
+pub(crate) fn count_label(value: i64) -> String {
+    if value >= 100_000_000 {
+        format!("{:.1}亿", value as f64 / 100_000_000.0)
+    } else if value >= 10_000 {
+        format!("{:.1}万", value as f64 / 10_000.0)
+    } else {
+        value.to_string()
+    }
+}

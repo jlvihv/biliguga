@@ -23,17 +23,21 @@
 //! * [`settings`] — the player's volume and speed, on disk.
 //! * [`icons`] — the glyphs.
 //! * [`ui`] — pills, buttons, poster art: what every pane draws with.
-//! * [`browse`] — the rail, the feed column and its cards.
+//! * [`browse`] — the navigation row, the feed column and its cards.
+//! * [`actions`] — like, coin, favourite: what the viewer does to a video.
 //! * [`player`] — the stage, transport, actions, detail and comments.
 //! * [`shell`] — [`view`], the window's sizes, and the one-time `setup`.
-//! * [`polling`] — the frame loop: events, the player's clock, paging.
+//! * [`polling`] — the frame loop: the player's clock, paging, and folding each event in.
 //! * [`keys`] — keyboard handling.
+//! * [`login_view`] — the QR-code panel and the signed-in account card.
 //! * [`startup`] — the scenes `--snap` renders, and `main`'s entry into Rune.
 
+mod actions;
 mod browse;
 mod consts;
 mod icons;
 mod keys;
+mod login_view;
 mod player;
 mod polling;
 mod settings;
@@ -49,7 +53,7 @@ use crate::{
         self, Clock, PlayQuality, add_to_favorites, add_to_watch_later, coin_video,
         download_avatar, fetch_author_videos, fetch_comments, fetch_dynamic_feed, fetch_favorites,
         fetch_history, fetch_last_play_progress, fetch_recommendations, fetch_search_results,
-        fetch_video_context, fetch_watch_later, format_publish_date, like_video,
+        fetch_video_context, fetch_watch_later, like_video,
         queue_cover_download, report_video_heartbeat, report_video_progress, resolve_play_url,
     },
     login::{self, PollResult, UserSession},
@@ -74,12 +78,12 @@ use std::{
 pub(crate) use browse::*;
 pub(crate) use consts::*;
 pub(crate) use keys::*;
+pub(crate) use login_view::*;
 pub(crate) use player::*;
-pub(crate) use polling::*;
 pub(crate) use settings::{load_player_settings, save_player_settings};
 #[allow(unused_imports)] // used by startup itself, through `super::*`
 pub(crate) use startup::{SCENES, Scene, demo_video, demo_videos};
-pub(crate) use state::BiliGuga;
+pub(crate) use state::{BiliGuga, Resume};
 pub(crate) use types::*;
 pub(crate) use ui::*;
 

@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::{fs, path::PathBuf, sync::Arc};
 use url::Url;
 
+use crate::paths;
+
 pub(crate) struct QrCodeData {
     pub(crate) key: String,
     pub(crate) image: Arc<crate::model::Rgba8>,
@@ -194,34 +196,8 @@ pub(crate) async fn fetch_user(cookie: String) -> Result<UserSession, String> {
     })
 }
 
-fn config_base_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Library")
-        .join("Application Support");
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    base
-}
-
 fn session_path() -> PathBuf {
-    config_base_dir().join("biliguga").join("session")
+    paths::app_dir().join("session")
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]

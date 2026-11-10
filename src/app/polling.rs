@@ -25,12 +25,11 @@ pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
     app.page_home_if_near_end();
 
     while let Ok(event) = app.events.try_recv() {
-        changed = true;
-        app.apply(event);
-    }
-
-    if std::mem::take(&mut app.new_rows) {
-        app.request_missing_covers();
+        // Only an event that changes what is on screen is a redraw: `Silent` and
+        // `HistoryReported` exist precisely because the work behind them is not something the
+        // viewer can see, and reporting them would commit a view for a frame that looks
+        // exactly like the last one.
+        changed |= app.apply(event);
     }
 
     // Player state. Only while something is playing, and only a changed value counts as a
@@ -84,18 +83,16 @@ pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
             app.speed = status.speed.max(0.1);
             changed = true;
         }
-        if !app.cloud_resume_applied {
-            if let Some(target) = app.pending_seek.take() {
-                app.player.seek_seconds(target);
-                app.cloud_resume_applied = true;
-            } else if let Some(progress) = app.cloud_resume_progress.take() {
-                if status.duration.is_finite() && progress < status.duration - 3. {
-                    app.player.seek_seconds(progress);
-                }
-                app.cloud_resume_applied = true;
-            } else {
-                app.cloud_resume_applied = true;
+        // The one seek a stream gets: apply it as soon as the stream knows its own duration,
+        // which is what says whether the position is somewhere inside it.
+        if let Resume::To(position) = app.resume
+            && status.duration.is_finite()
+            && status.duration > 0.
+        {
+            if position < status.duration - 3. {
+                app.player.seek_seconds(position);
             }
+            app.resume = Resume::Nothing;
         }
         if app.playback == PlaybackState::Playing
             && app.history_report_at.elapsed() >= Duration::from_secs(15)
@@ -119,19 +116,21 @@ pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
 }
 
 impl BiliGuga {
-    /// Takes one answer from background work and folds it into the state.
+    /// Takes one answer from background work and folds it into the state, saying whether what
+    /// is on screen changed.
     ///
     /// This was the body of `poll`'s drain loop, which made every case reachable only
-    /// through a frame. It is a plain method so a test can drive one event.
-    pub(crate) fn apply(&mut self, event: Event) {
+    /// through a frame. It is a plain method so a test can drive one event. The boolean is what
+    /// keeps a frame that only carried bookkeeping from committing a view: the drain loop used
+    /// to treat every event as a change, including the two that are explicitly not.
+    pub(crate) fn apply(&mut self, event: Event) -> bool {
         let app = self;
         match event {
             Event::Home(result, generation) => {
                 if generation != app.home_generation || app.active_tab != AppTab::Home {
-                    return;
+                    return false;
                 }
                 app.home_loading = false;
-                app.loading = false;
                 match result {
                     Ok(page) => {
                         let first_page = app.videos.is_empty();
@@ -144,7 +143,8 @@ impl BiliGuga {
                         let added = app.videos.len().saturating_sub(old_len);
                         app.home_has_more = page.has_more && (first_page || added > 0);
                         app.trim_home_items();
-                        app.new_rows = true;
+                        app.rows_changed();
+                        app.request_missing_covers();
                     }
                     Err(error) => {
                         // Put the page number back so a retry asks for this page again.
@@ -155,12 +155,13 @@ impl BiliGuga {
                 }
             }
             Event::Search(result) => {
-                app.loading = false;
+                app.search_loading = false;
                 match result {
                     Ok(videos) => {
                         app.search_results = videos;
                         app.selected = None;
-                        app.new_rows = true;
+                        app.rows_changed();
+                        app.request_missing_covers();
                     }
                     Err(error) => app.feed_error = Some(error),
                 }
@@ -173,7 +174,7 @@ impl BiliGuga {
             Event::Favorites(result) => app.land_signed_in(SignedInFeed::Favorites, result),
             Event::Author(result, generation) => {
                 if generation != app.author_generation {
-                    return;
+                    return false;
                 }
                 app.author_loading = false;
                 match result {
@@ -181,57 +182,65 @@ impl BiliGuga {
                         app.author_page = page.page;
                         app.author_has_more = page.has_more;
                         app.author_videos.extend(page.videos);
-                        app.new_rows = true;
+                        app.rows_changed();
+                        app.request_missing_covers();
                     }
                     Err(error) => app.feed_error = Some(error),
                 }
             }
-            Event::VideoContext(context) => {
-                // An answer that lands after the viewer moved on would put the previous video's
-                // collection in the next video's menu.
-                let still_current = app
-                    .playing_video
-                    .as_ref()
-                    .is_some_and(|video| video.aid == context.aid || video.aid <= 0);
-                if !still_current {
-                    return;
+            Event::VideoContext(context, generation) => {
+                if generation != app.playback_generation {
+                    return false;
                 }
                 app.stats = Some(VideoStats {
-                    view_count: context.view_count,
-                    danmaku_count: context.danmaku_count,
-                    like_count: context.like_count,
-                    published_at: format_publish_date(context.pubdate),
+                    views: context.views,
+                    danmaku: context.danmaku,
+                    likes: context.likes,
+                    published: context.pubdate,
                 });
                 app.collection = context.collection;
                 if let Some(video) = app.playing_video.as_mut() {
+                    let video = Arc::make_mut(video);
                     if video.aid == 0 {
                         video.aid = context.aid;
                     }
                     if video.cid == 0 {
                         video.cid = context.cid;
                     }
-                    // A collection episode carries the collection's owner, which is not always the
-                    // uploader of this part; the detail endpoint knows the right one.
+                    // A collection episode carries the collection's owner, which is not always
+                    // the uploader of this part; the detail endpoint knows the right one.
                     if !context.uploader.is_empty() {
-                        video.uploader = context.uploader.clone();
+                        video.uploader = context.uploader;
                         video.uploader_mid = context.uploader_mid;
                     }
                 }
             }
-            Event::PlayUrl(result) => match result {
-                Ok(play) => app.finish_play(play),
-                Err(error) => {
-                    app.playback = PlaybackState::Idle;
-                    app.playback_error = Some(error);
+            Event::PlayUrl(result, generation) => {
+                if generation != app.playback_generation {
+                    return false;
                 }
-            },
-            Event::Resume(progress) => {
-                app.cloud_resume_progress = progress.filter(|progress| *progress > 3.);
-                app.cloud_resume_applied = app.cloud_resume_progress.is_none();
+                match result {
+                    Ok(play) => app.finish_play(play),
+                    Err(error) => {
+                        app.playback = PlaybackState::Idle;
+                        app.playback_error = Some(error);
+                    }
+                }
+            }
+            Event::Resume(progress, generation) => {
+                if generation != app.playback_generation {
+                    return false;
+                }
+                // Answered after the viewer already switched quality: their own playhead wins.
+                app.resume = match (app.resume, progress) {
+                    (Resume::To(position), _) => Resume::To(position),
+                    (_, Some(position)) if position > 3. => Resume::To(position),
+                    _ => Resume::Nothing,
+                };
             }
             Event::Comments(result, generation) => {
                 if generation != app.comments_generation {
-                    return;
+                    return false;
                 }
                 app.comments_loading = false;
                 match result {
@@ -257,9 +266,8 @@ impl BiliGuga {
             }
             Event::QrCode(result, generation) => {
                 if generation != app.login_generation {
-                    return;
+                    return false;
                 }
-                app.login_loading = false;
                 match result {
                     Ok(data) => {
                         app.login_key = Some(data.key);
@@ -278,7 +286,7 @@ impl BiliGuga {
             }
             Event::QrPoll(result, generation) => {
                 if generation != app.login_generation {
-                    return;
+                    return false;
                 }
                 match result {
                     Ok(PollResult::Waiting) => app.poll_login(),
@@ -317,74 +325,16 @@ impl BiliGuga {
             }
             Event::CoverFailed(bvid) => {
                 app.covers_in_flight.remove(&bvid);
+                return false;
             }
-            Event::HistoryReported => app.history_report_in_flight = false,
-            Event::Silent => {}
+            Event::HistoryReported => {
+                app.history_report_in_flight = false;
+                return false;
+            }
+            Event::Silent => return false,
             Event::Cover(bvid, pixels) => app.attach_cover(bvid, pixels),
         }
+        true
     }
 }
 
-impl BiliGuga {
-    pub(crate) fn refresh_feed(&mut self) {
-        match self.active_tab {
-            AppTab::Home => self.load_home_page(true),
-            AppTab::Author => self.load_author_page(true),
-            AppTab::Search => self.load_search(),
-            AppTab::Login => self.start_login(),
-            tab => {
-                if let Some(feed) = tab.signed_in() {
-                    self.load_signed_in(feed);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn cycle_speed(&mut self) {
-        let index = SPEED_OPTIONS
-            .iter()
-            .position(|speed| (*speed - self.speed).abs() < 0.01)
-            .unwrap_or(1);
-        self.speed = SPEED_OPTIONS[(index + 1) % SPEED_OPTIONS.len()];
-        self.player.set_speed(self.speed);
-        self.persist_player_settings();
-    }
-
-    pub(crate) fn sync_power(&mut self) {
-        self.power_inhibitor
-            .set_active(self.playback == PlaybackState::Playing);
-    }
-
-    /// Asks for the covers the current feed is missing, skipping ones already downloaded or in
-    /// flight for that bvid.
-    pub(crate) fn request_missing_covers(&mut self) {
-        let mut missing: Vec<(String, String)> = Vec::new();
-        for videos in [
-            &self.videos,
-            &self.search_results,
-            &self.dynamic_videos,
-            &self.watch_later,
-            &self.favorites,
-            &self.history,
-            &self.author_videos,
-        ] {
-            for video in videos {
-                if video.cover.is_empty()
-                    || self.cover_images.contains_key(&video.bvid)
-                    || self.covers_in_flight.contains(&video.bvid)
-                {
-                    continue;
-                }
-                missing.push((video.bvid.clone(), video.cover.clone()));
-            }
-        }
-        for (bvid, url) in missing {
-            self.request_cover(bvid, url);
-        }
-    }
-}
-
-pub(crate) fn fetch_qr_code_event()
--> impl std::future::Future<Output = Result<login::QrCodeData, String>> + Send {
-    login::fetch_qr_code()
-}

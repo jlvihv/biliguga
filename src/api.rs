@@ -124,16 +124,6 @@ pub(crate) fn number(value: Option<&Value>) -> i64 {
         .unwrap_or_default()
 }
 
-fn compact_number(value: i64) -> String {
-    if value >= 100_000_000 {
-        format!("{:.1}亿", value as f64 / 100_000_000.0)
-    } else if value >= 10_000 {
-        format!("{:.1}万", value as f64 / 10_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
 /// A clip's length as `mm:ss`, from a JSON seconds count.
 ///
 /// Same shape as [`Clock`], and it now goes through it: this used to be a second copy of the
@@ -645,9 +635,9 @@ fn media_key(url: Option<&Value>) -> String {
 pub(crate) struct VideoContext {
     pub(crate) aid: i64,
     pub(crate) cid: i64,
-    pub(crate) view_count: String,
-    pub(crate) danmaku_count: String,
-    pub(crate) like_count: String,
+    pub(crate) views: i64,
+    pub(crate) danmaku: i64,
+    pub(crate) likes: i64,
     pub(crate) pubdate: i64,
     pub(crate) uploader: String,
     pub(crate) uploader_mid: i64,
@@ -780,9 +770,9 @@ pub(crate) async fn fetch_video_context(
     Ok(VideoContext {
         aid: number(data.get("aid")).max(video.aid),
         cid: number(data.get("cid")).max(video.cid),
-        view_count: compact_number(number(stat.get("view"))),
-        danmaku_count: compact_number(number(stat.get("danmaku"))),
-        like_count: compact_number(number(stat.get("like"))),
+        views: number(stat.get("view")),
+        danmaku: number(stat.get("danmaku")),
+        likes: number(stat.get("like")),
         pubdate: number(data.get("pubdate")),
         uploader: owner_name.clone(),
         uploader_mid: owner_mid,

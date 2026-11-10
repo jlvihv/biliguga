@@ -18,6 +18,33 @@ pub(crate) fn track(fraction: f32, height: f32, fill: Color) -> El {
         )
 }
 
+/// The playhead and the length, cleaned up for the bar: a stream that has not reported either
+/// yet gives `0.0`, and the position never reads past the end. Both layouts asked for this the
+/// same way, in two copies of six lines.
+pub(crate) fn clock_of(status: &mpv::MpvStatus) -> (f64, f64) {
+    let duration = if status.duration.is_finite() && status.duration > 0.0 {
+        status.duration
+    } else {
+        0.0
+    };
+    let position = if status.time_pos.is_finite() {
+        status.time_pos.clamp(0.0, duration)
+    } else {
+        0.0
+    };
+    (position, duration)
+}
+
+/// Where in the track a drag is, as a fraction: `drag.x` is the pointer in the element's own
+/// points, so a press at 30% is 30%. The two sliders computed this the same way.
+pub(crate) fn drag_fraction(drag: &Drag) -> f32 {
+    if drag.w > 0.0 {
+        (drag.x / drag.w).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// The seek bar: presses and drags anywhere on the track jump the video there. The hit area is
 /// taller than the drawn line, so it is easy to grab.
 pub(crate) fn seek_bar(position: f64, duration: f64) -> El {
@@ -56,13 +83,7 @@ pub(crate) fn seek_track(position: f64, duration: f64) -> El {
         .justify_center()
         .cursor(rune::Cursor::Pointer)
         .on_drag(move |app: &mut BiliGuga, drag: &mut Drag, _: &mut Tx| {
-            // `drag.x` is the pointer in the element's own points, so a press at 30% is 30%.
-            let fraction = if drag.w > 0.0 {
-                (drag.x / drag.w).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            app.seek_percent(fraction as f64);
+            app.seek_percent(drag_fraction(drag) as f64);
             app.seek_dragging = drag.phase != Phase::Up;
             app.show_controls();
         })
@@ -78,12 +99,7 @@ pub(crate) fn volume_bar(volume: f64, width: f32) -> El {
         .cursor(rune::Cursor::Pointer)
         .help("音量")
         .on_drag(move |app: &mut BiliGuga, drag: &mut Drag, _: &mut Tx| {
-            let fraction = if drag.w > 0.0 {
-                (drag.x / drag.w).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            app.volume = (fraction as f64 * 100.0).clamp(0.0, 100.0);
+            app.volume = (drag_fraction(drag) as f64 * 100.0).clamp(0.0, 100.0);
             app.player.set_volume(app.volume);
             app.volume_dragging = drag.phase != Phase::Up;
             if !app.volume_dragging {
@@ -139,10 +155,13 @@ pub(crate) fn render_stage(app: &BiliGuga, size: Option<(f32, f32)>) -> El {
         .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
     stage = match size {
         // The windowed player is handed the box it may use, so the frame is letterboxed inside
-        // a known rectangle: the layout never depends on what mpv happens to be decoding. The
-        // picture runs edge to edge — no side margin, no rounding, no border — while everything
-        // under it keeps the pane's own margin.
-        Some((width, height)) => stage.w(width).h(height),
+        // a known rectangle: the layout never depends on what mpv happens to be decoding.
+        Some((width, height)) => stage
+            .w(width)
+            .h(height)
+            .radius(12.0)
+            .clip_rounded(12.0)
+            .border(1.0, theme::BORDER),
         // Full screen: everything, edge to edge.
         None => stage.grow(1.0).w_full().h_full().min_h(0.0),
     };
@@ -194,11 +213,7 @@ pub(crate) fn render_stage(app: &BiliGuga, size: Option<(f32, f32)>) -> El {
 pub(crate) fn render_transport(app: &BiliGuga) -> El {
     let playing = app.playback == PlaybackState::Playing;
     let quality = icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
-        app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
-            None
-        } else {
-            Some(PlayerMenu::Quality)
-        };
+        app.quality_menu_open = !app.quality_menu_open;
     });
     row()
         .key("transport")
@@ -436,10 +451,10 @@ pub(crate) fn render_detail_stats(app: &BiliGuga) -> El {
     };
     row().gap(12.0).items_center().shrink().children(
         [
-            ("播放", &stats.view_count),
-            ("弹幕", &stats.danmaku_count),
-            ("点赞", &stats.like_count),
-            ("发布", &stats.published_at),
+            ("播放", count_label(stats.views)),
+            ("弹幕", count_label(stats.danmaku)),
+            ("点赞", count_label(stats.likes)),
+            ("发布", api::format_publish_date(stats.published)),
         ]
         .into_iter()
         .map(|(caption, value)| {
@@ -569,45 +584,33 @@ pub(crate) fn render_comments(app: &BiliGuga) -> El {
 pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
     let (stage_width, stage_height) = app.stage_box.get();
     let status = app.player.status();
-    let duration = if status.duration.is_finite() && status.duration > 0.0 {
-        status.duration
-    } else {
-        0.0
-    };
-    let position = if status.time_pos.is_finite() {
-        status.time_pos.clamp(0.0, duration.max(0.0))
-    } else {
-        0.0
-    };
+    let (position, duration) = clock_of(&status);
     // The stage is the one block with no side margin: it starts at the pane's left edge and ends
     // at its right, and only the rows under it are inset by `PANE_PAD`.
     let mut stage_block = col()
         .key("stage-block")
         .w_full()
         .shrink()
-        .pt(PANE_PAD)
-        .child(render_stage(app, Some((stage_width, stage_height))))
-        .child(el().h(PANE_PAD));
+        .padding(PANE_PAD)
+        .child(render_stage(app, Some((stage_width, stage_height))));
     // The windowed layout always shows its controls: there is nothing underneath to reveal
     // them over, and hiding them would only hide the way to act on the video.
     stage_block = stage_block
+        .child(el().h(10.0))
         .child(
-            col().w_full().px(PANE_PAD).child(
-                col()
-                    .w_full()
-                    .gap(8.0)
-                    .padding(10.0)
-                    .radius(12.0)
-                    .fill(theme::PANEL)
-                    .child(seek_bar(position, duration))
-                    .child(render_transport(app)),
-            ),
+            col()
+                .w_full()
+                .gap(8.0)
+                .padding(10.0)
+                .radius(12.0)
+                .fill(theme::PANEL)
+                .child(seek_bar(position, duration))
+                .child(render_transport(app)),
         )
         .child(
-            if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
+            if app.quality_menu_open && !app.quality_options.is_empty() {
                 row()
                     .w_full()
-                    .px(PANE_PAD)
                     .pt(6.0)
                     .justify_end()
                     .child(render_quality_menu(app))
@@ -618,8 +621,6 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
         .child(
             row()
                 .w_full()
-                .px(PANE_PAD)
-                .pt(10.0)
                 .gap(6.0)
                 .items_center()
                 .child(render_actions(app))
@@ -676,16 +677,7 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
 /// out with the pointer.
 pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
     let status = app.player.status();
-    let duration = if status.duration.is_finite() && status.duration > 0.0 {
-        status.duration
-    } else {
-        0.0
-    };
-    let position = if status.time_pos.is_finite() {
-        status.time_pos.clamp(0.0, duration.max(0.0))
-    } else {
-        0.0
-    };
+    let (position, duration) = clock_of(&status);
     // The picture keeps the whole window; the title and the controls ride over it, pinned to
     // the edges, so showing them never resizes the video or re-times mpv's decode.
     let mut root = col()
@@ -722,7 +714,7 @@ pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
                 ),
         );
     }
-    if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
+    if app.quality_menu_open && !app.quality_options.is_empty() {
         root = root.child(
             row()
                 .pin(Some(0.0), None, Some(0.0), Some(78.0))

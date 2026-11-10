@@ -51,15 +51,18 @@ pub(crate) const WHEEL_NOTCH: f32 = 100.0;
 /// The list layout's row: a 74-point cover plus the padding around it.
 pub(crate) const LIST_ROW_HEIGHT: f32 = 88.0;
 
+/// The parts of a grid card that sit under its cover: the gaps, the two title lines and the
+/// uploader row. A grid row's height used to be spelled out as `* 9.0 / 16.0 + 78.0` in two
+/// places — the virtual list's estimate and the paging arithmetic's row count — which had to
+/// agree or paging would ask for a page at the wrong moment.
+pub(crate) const CARD_CAPTION_HEIGHT: f32 = 78.0;
+
 /// What Rune itself moves for a notch, so the handler below can scale rather than assume.
 pub(crate) const RUNE_WHEEL_NOTCH: f32 = 40.0;
 
 /// How long the player's controls stay up after the pointer moves, in full screen.
 pub(crate) const CONTROLS_LINGER: Duration = Duration::from_millis(2400);
 
-/// Builds a feed of placeholder videos, so `--snap feed` can check the layout without a
-/// network round trip. Only reachable from a named scene.
-/// Demo rows that carry a cover URL, for the tests that exercise the cover queue.
 /// Placeholder rows so `--snap` can check the layout without a network round trip. Only
 /// reachable from a named scene, never from the running app.
 pub(crate) const DEMO_TITLES: [&str; 8] = [

@@ -39,7 +39,7 @@ pub(crate) type Scene = (&'static str, fn(&mut BiliGuga));
 
 pub(crate) fn seed_loaded(app: &mut BiliGuga) {
     app.videos = demo_videos(12);
-    app.loading = false;
+    app.search_loading = false;
     app.home_loading = false;
 }
 
@@ -49,14 +49,14 @@ pub(crate) fn seed_feed(app: &mut BiliGuga) {
 
 pub(crate) fn seed_player(app: &mut BiliGuga) {
     seed_loaded(app);
-    app.playing_video = Some(demo_video(0));
+    app.playing_video = Some(Arc::new(demo_video(0)));
     app.playback = PlaybackState::Buffering;
     app.show_controls();
     app.stats = Some(VideoStats {
-        view_count: "128.4万".into(),
-        danmaku_count: "1.2万".into(),
-        like_count: "9.8万".into(),
-        published_at: "2026-11-02 18:20".into(),
+        views: 1_284_000,
+        danmaku: 12_000,
+        likes: 98_000,
+        published: 1_793_619_600,
     });
     app.comments = (0..6)
         .map(|index| Comment {
@@ -72,7 +72,7 @@ pub(crate) fn seed_player(app: &mut BiliGuga) {
 
 /// The first frame a fresh install shows: nothing loaded, nothing playing.
 pub(crate) fn seed_empty(app: &mut BiliGuga) {
-    app.loading = false;
+    app.search_loading = false;
     app.home_loading = false;
 }
 

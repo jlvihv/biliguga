@@ -485,7 +485,6 @@ dependencies = [
  "reqwest",
  "rune",
  "serde_json",
- "smallvec",
  "tokio",
  "url",
 ]

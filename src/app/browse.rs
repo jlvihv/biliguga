@@ -1,39 +1,31 @@
-//! The browse column: the rail, the search bar, the feed and its cards.
+//! The browse column: the navigation row, the search bar, the feed and its cards.
 
 pub(crate) use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RailItem {
-    Home,
-    Dynamic,
-    History,
-    WatchLater,
-    Favorites,
-}
+/// The tabs the navigation row offers, in the order it offers them.
+///
+/// This was an enum of its own (`RailItem`) with a `tab_of` function turning it into an
+/// [`AppTab`] and an `owns` function mapping it back: a bijection, spelled out three times, to
+/// say that the rail had the same five entries as the app has tabs.
+const NAV_TABS: [(AppTab, &rune::Icon, &str); 5] = [
+    (AppTab::Home, &icons::HOME, "首页"),
+    (AppTab::Dynamic, &icons::PULSE, "动态"),
+    (AppTab::History, &icons::HISTORY, "历史"),
+    (AppTab::WatchLater, &icons::CLOCK, "稍后"),
+    (AppTab::Favorites, &icons::STAR, "收藏"),
+];
 
-impl RailItem {
-    /// The tabs this item stands for. Search and author pages are reached from the home rail.
-    fn owns(self, tab: AppTab) -> bool {
-        matches!(
-            (self, tab),
-            (
-                RailItem::Home,
-                AppTab::Home | AppTab::Search | AppTab::Author
-            ) | (RailItem::Dynamic, AppTab::Dynamic)
-                | (RailItem::History, AppTab::History)
-                | (RailItem::WatchLater, AppTab::WatchLater)
-                | (RailItem::Favorites, AppTab::Favorites)
-        )
+/// Which nav entry stands for this tab. Search results and an author's uploads are reached from
+/// the home entry, so they keep it lit: the row shows where you came from.
+pub(crate) fn nav_tab_for(tab: AppTab) -> AppTab {
+    match tab {
+        AppTab::Search | AppTab::Author => AppTab::Home,
+        tab => tab,
     }
 }
 
 /// One entry in the top navigation bar: a glyph and its caption, with the current tab washed.
-pub(crate) fn nav_entry(
-    item: RailItem,
-    icon: &'static rune::Icon,
-    caption: &str,
-    active: bool,
-) -> El {
+pub(crate) fn nav_entry(tab: AppTab, icon: &'static rune::Icon, caption: &str, active: bool) -> El {
     let icon_color = if active {
         theme::ACCENT
     } else {
@@ -49,7 +41,7 @@ pub(crate) fn nav_entry(
         .press(theme::PRESS)
         .cursor(rune::Cursor::Pointer)
         .help(caption)
-        .on_press(move |app: &mut BiliGuga| app.show_tab(tab_of(item)))
+        .on_press(move |app: &mut BiliGuga| app.show_tab(tab))
         .child(glyph(icon, icon_color, 14.0))
         .child(
             text(caption)
@@ -63,16 +55,6 @@ pub(crate) fn nav_entry(
             .border(1.0, theme::ACCENT.alpha(0.22));
     }
     entry
-}
-
-pub(crate) fn tab_of(item: RailItem) -> AppTab {
-    match item {
-        RailItem::Home => AppTab::Home,
-        RailItem::Dynamic => AppTab::Dynamic,
-        RailItem::History => AppTab::History,
-        RailItem::WatchLater => AppTab::WatchLater,
-        RailItem::Favorites => AppTab::Favorites,
-    }
 }
 
 /// The account: an avatar when signed in, the sign-in door when not. It sits at the far end of
@@ -137,32 +119,30 @@ pub(crate) fn render_nav(app: &BiliGuga) -> El {
                 .child(glyph(&icons::LOGO, theme::ACCENT, 21.0)),
         )
         .child(el().w(6.0));
-    for (item, icon, caption) in [
-        (RailItem::Home, &icons::HOME, "首页"),
-        (RailItem::Dynamic, &icons::PULSE, "动态"),
-        (RailItem::History, &icons::HISTORY, "历史"),
-        (RailItem::WatchLater, &icons::CLOCK, "稍后"),
-        (RailItem::Favorites, &icons::STAR, "收藏"),
-    ] {
-        nav = nav.child(nav_entry(item, icon, caption, item.owns(app.active_tab)));
+    let current = nav_tab_for(app.active_tab);
+    for &(tab, icon, caption) in &NAV_TABS {
+        nav = nav.child(nav_entry(tab, icon, caption, tab == current));
     }
     nav.child(el().grow(1.0)).child(account_button(app))
 }
 
 // ---- The browse pane ------------------------------------------------------------------------
 
-/// The feed column's heading: a fixed sentence for every tab but one, which borrows the
-/// uploader's name. Returning a `Cow` keeps the seven fixed cases allocation-free.
-pub(crate) fn feed_title<'a>(tab: AppTab, author_name: &'a str) -> std::borrow::Cow<'a, str> {
+/// The feed column's heading: a fixed sentence for every tab. The author page is the one case
+/// with a name in it, and its caller has the name to hand — which is why this returns a
+/// `&'static str` and not the `Cow` it used to: every fixed case was borrowed and still got
+/// `into_owned()`, so the `Cow` bought an allocation, not saved one.
+pub(crate) fn feed_title(tab: AppTab) -> &'static str {
     match tab {
-        AppTab::Home => "为你推荐".into(),
-        AppTab::Search => "搜索".into(),
-        AppTab::Dynamic => "动态".into(),
-        AppTab::WatchLater => "稍后再看".into(),
-        AppTab::Favorites => "收藏夹".into(),
-        AppTab::History => "观看历史".into(),
-        AppTab::Author => author_name.into(),
-        AppTab::Login => "登录".into(),
+        AppTab::Home => "为你推荐",
+        AppTab::Search => "搜索",
+        AppTab::Dynamic => "动态",
+        AppTab::WatchLater => "稍后再看",
+        AppTab::Favorites => "收藏夹",
+        AppTab::History => "观看历史",
+        AppTab::Login => "登录",
+        // The author page's heading is the uploader's name, which the caller has.
+        AppTab::Author => "",
     }
 }
 
@@ -209,7 +189,7 @@ pub(crate) fn render_topbar(app: &BiliGuga) -> El {
         .w_full()
         .shrink()
         .child(render_nav(app))
-        .child(el().w_full().h(1.0).shrink().fill(theme::HAIRLINE))
+        .child(hairline())
         .child(render_title_row(app));
     if app.active_tab != AppTab::Login {
         header = header.child(render_search(app));
@@ -220,8 +200,8 @@ pub(crate) fn render_topbar(app: &BiliGuga) -> El {
 /// The title, the refresh button, and "load more" when an author page has another batch.
 pub(crate) fn render_title_row(app: &BiliGuga) -> El {
     let title = match app.active_tab {
-        AppTab::Author => app.author_name().to_string(),
-        tab => feed_title(tab, app.author_name()).into_owned(),
+        AppTab::Author => app.author_name().to_owned(),
+        tab => feed_title(tab).to_owned(),
     };
     let busy = app.is_loading();
     let mut title_row = row()
@@ -423,7 +403,6 @@ pub(crate) fn pulse_dot() -> El {
         .looping(rune::LoopSpec::opacity(1.4, 0.0, 0.22, 1.0))
 }
 
-/// A centred message for the empty, loading and error states.
 /// A centred message for the empty, loading and error states, with an optional action under it.
 /// The action lives in the same centred column: as a sibling of a grown panel it was pushed to
 /// the bottom of the pane, a screen away from the sentence it belonged to.
@@ -542,7 +521,7 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
             .py(6.0)
             .virtual_rows(
                 rows,
-                (width * 9.0 / 16.0 + 78.0).round(),
+                grid_row_height(width),
                 // Keyed by the first video of the row, not by its index. An index stays the same
                 // when a page lands and the oldest rows are trimmed off the top, so every row
                 // kept its key while showing a different video: layout saw no change at all, the
@@ -569,6 +548,7 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
                     line
                 },
             )
+            .virtual_rows_version(app.feed_revision)
     } else {
         col()
             .key("video-list")
@@ -591,16 +571,18 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
                     None => el(),
                 },
             )
+            .virtual_rows_version(app.feed_revision)
     };
 
     // Paging hangs off the list itself: it reports the range of rows it has mounted, once per
     // change rather than per frame, and the feed asks for more when that range gets close to the
     // end. Nothing here depends on how tall the loaded page happens to be.
-    let scroll_read = app.scroll_pos.clone();
-    let scroll_wheel_read = app.scroll_pos.clone();
-    let scroll_wheel = app.scroll_pos.clone();
-    let reader_row = app.reader_row.clone();
-    let wheel_row = app.reader_row.clone();
+    // One `Rc` per closure that needs one (`Rc` is not `Copy`, so a shared name is not enough):
+    // the offset handler and the wheel handler both read and write the same two cells.
+    let offset_read = app.scroll_pos.clone();
+    let offset_wheel = app.scroll_pos.clone();
+    let row_read = app.reader_row.clone();
+    let row_wheel = app.reader_row.clone();
     // One row of the browse grid, as this frame lays it out: turns a scroll offset into the row
     // count paging is about. A plain value, not a `Cell`: it cannot change under a handler.
     let row_height = app.feed_row_height();
@@ -618,10 +600,9 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
         // and not in the wheel handler.
         .on_scroll_offset(move |at| {
             let at = (at.offset[1], at.max[1]);
-            scroll_read.set(Some(at));
-            scroll_wheel_read.set(Some(at));
+            offset_read.set(Some(at));
             if row_height > 0.0 {
-                reader_row.set(Some((at.0 / row_height).floor() as usize));
+                row_read.set(Some((at.0 / row_height).floor() as usize));
             }
         })
         // A notched wheel takes the feed further per click than Rune's flat 40 points. Taking
@@ -632,7 +613,7 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
                 if ev.precise || ev.dy == 0.0 || ev.dx != 0.0 || ev.momentum {
                     return false;
                 }
-                let Some((offset, max)) = scroll_wheel.get() else {
+                let Some((offset, max)) = offset_wheel.get() else {
                     // Not laid out yet: nothing to place the viewport at, so let Rune scroll.
                     return false;
                 };
@@ -646,12 +627,12 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
                 // off, not where the last frame's offset was. Clamped here as well as by the
                 // viewport, so holding the wheel at the end cannot build up an offset past it
                 // for the next page's growth to spring to.
-                scroll_wheel.set(Some((to, max)));
+                offset_wheel.set(Some((to, max)));
                 // This handler places the viewport itself, so the offset handler that counts
                 // rows hears about it a frame later; count it now so a reader scrolling faster
                 // than a page a frame still pages as fast as they read.
                 if row_height > 0.0 {
-                    wheel_row.set(Some((to / row_height).floor() as usize));
+                    row_wheel.set(Some((to / row_height).floor() as usize));
                 }
                 tx.scroll_to_instant("feed-scroll", 0.0, to);
                 true
@@ -683,154 +664,6 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
         .grow(1.0)
         .fill(theme::BG)
         .child(render_topbar(app))
-        .child(el().w_full().h(1.0).shrink().fill(theme::HAIRLINE))
+        .child(hairline())
         .child(viewport.child(body).child(footer))
 }
-
-pub(crate) fn render_login(app: &BiliGuga) -> El {
-    let body = if let Some(session) = &app.session {
-        let initial: String = session
-            .username
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().collect())
-            .unwrap_or_else(|| "B".into());
-        let mut card = col()
-            .w(320.0)
-            .shrink()
-            .gap(14.0)
-            .padding(24.0)
-            .items_center()
-            .radius(16.0)
-            .fill(theme::CARD)
-            .border(1.0, theme::BORDER)
-            .shadow(12.0, 40.0, Color::BLACK.alpha(0.35))
-            .child(match app.account_avatar.as_ref() {
-                Some(avatar) => el().size(64.0, 64.0).radius(32.0).clip_rounded(32.0).child(
-                    el().w_full()
-                        .h_full()
-                        .pixels_fit(avatar.pixels(), SurfaceFit::Fill),
-                ),
-                None => el()
-                    .size(64.0, 64.0)
-                    .center()
-                    .radius(32.0)
-                    .fill(theme::ACCENT_DIM)
-                    .child(
-                        text(initial)
-                            .font(TextStyle::new(24.0, 650.0))
-                            .color(theme::ACCENT_SOFT),
-                    ),
-            })
-            .child(
-                text(&session.username)
-                    .font(TextStyle::new(17.0, 600.0))
-                    .color(theme::TEXT),
-            )
-            .child(
-                text(if session.is_vip {
-                    "大会员 · 已登录"
-                } else {
-                    "已登录"
-                })
-                .font(TextStyle::new(12.0, 400.0))
-                .color(theme::TEXT_FAINT),
-            )
-            .child(pill("sign-out", None, "退出登录", Tone::Raised).on_press(
-                |app: &mut BiliGuga| {
-                    login::clear_session();
-                    app.session = None;
-                    app.account_avatar = None;
-                    app.login_status = "使用哔哩哔哩 App 扫码登录".into();
-                    app.active_tab = AppTab::Home;
-                },
-            ));
-        if app.session.is_some() {
-            card = card.child(
-                row()
-                    .gap(8.0)
-                    .child(
-                        pill("to-history", Some(&icons::HISTORY), "观看历史", Tone::Quiet)
-                            .on_press(|app: &mut BiliGuga| app.show_tab(AppTab::History)),
-                    )
-                    .child(
-                        pill("to-favs", Some(&icons::STAR), "我的收藏", Tone::Quiet)
-                            .on_press(|app: &mut BiliGuga| app.show_tab(AppTab::Favorites)),
-                    ),
-            );
-        }
-        card
-    } else {
-        let mut card = col()
-            .w(320.0)
-            .shrink()
-            .gap(14.0)
-            .padding(24.0)
-            .items_center()
-            .radius(16.0)
-            .fill(theme::CARD)
-            .border(1.0, theme::BORDER)
-            .shadow(12.0, 40.0, Color::BLACK.alpha(0.35))
-            .child(
-                text("扫码登录")
-                    .font(TextStyle::new(17.0, 600.0))
-                    .color(theme::TEXT),
-            )
-            .child(
-                text("用哔哩哔哩 App 扫一扫，收藏和历史就会出现在这里")
-                    .font(TextStyle::new(12.0, 400.0))
-                    .color(theme::TEXT_FAINT)
-                    .max_w(240.0)
-                    .align(rune::Align::Center),
-            );
-        // The code sits on a white plate whatever the theme: scanners need the quiet zone.
-        let plate = el()
-            .size(196.0, 196.0)
-            .center()
-            .radius(10.0)
-            .fill(Color::WHITE)
-            .clip_rounded(10.0);
-        card = card.child(match &app.login_qr {
-            Some(qr) => plate.child(
-                el().size(172.0, 172.0)
-                    .pixels_fit(qr.pixels(), SurfaceFit::Fit),
-            ),
-            None => plate.child(el().size(172.0, 172.0).center().child(glyph(
-                &icons::REFRESH,
-                theme::TEXT_FAINT,
-                26.0,
-            ))),
-        });
-        card = card
-            .child(
-                text(app.login_status.as_ref())
-                    .font(TextStyle::new(12.0, 400.0))
-                    .color(if app.login_qr.is_some() {
-                        theme::TEXT_DIM
-                    } else {
-                        theme::TEXT_FAINT
-                    })
-                    .align(rune::Align::Center),
-            )
-            .child(
-                pill(
-                    "refresh-qr",
-                    Some(&icons::REFRESH),
-                    "刷新二维码",
-                    Tone::Accent,
-                )
-                .on_press(|app: &mut BiliGuga| app.start_login()),
-            );
-        card
-    };
-    col()
-        .w_full()
-        .h_full()
-        .grow(1.0)
-        .fill(theme::BG)
-        .child(render_topbar(app))
-        .child(el().w_full().h(1.0).shrink().fill(theme::HAIRLINE))
-        .child(col().w_full().grow(1.0).center().child(body))
-}
-
-// ---- The player -----------------------------------------------------------------------------

@@ -35,21 +35,20 @@ pub(crate) enum PlaybackState {
     Paused,
 }
 
-/// Which popup the player has open. Only one kind exists: speed cycles in place and the
-/// collection is reached with previous/next, so neither ever needed a menu.
 /// Whose uploads the Author tab is showing.
 pub(crate) struct Author {
     pub(crate) mid: i64,
     pub(crate) name: String,
 }
 
-/// The numbers the detail call brings back. They always arrive together, so they are one value
-/// rather than four fields that a caller has to remember to set in step.
+/// The numbers the detail call brings back, as the API gave them. They always arrive together,
+/// so they are one value rather than four fields a caller has to set in step; the numbers stay
+/// numbers because formatting them is the view's job, not the parser's.
 pub(crate) struct VideoStats {
-    pub(crate) view_count: String,
-    pub(crate) danmaku_count: String,
-    pub(crate) like_count: String,
-    pub(crate) published_at: String,
+    pub(crate) views: i64,
+    pub(crate) danmaku: i64,
+    pub(crate) likes: i64,
+    pub(crate) published: i64,
 }
 
 /// The feeds that need a session. Each one used to own a `load_..` method, a `.._loading` flag
@@ -92,7 +91,7 @@ impl SignedInFeed {
 
     /// The event that lands this feed's answer. `Event` has no payload for the feed itself, so
     /// the arm is picked here rather than at the call site.
-    pub(crate) fn event(self) -> impl FnOnce(Result<Vec<Video>, String>) -> Event + Copy + 'static {
+    pub(crate) fn event(self) -> fn(Result<Vec<Video>, String>) -> Event {
         match self {
             SignedInFeed::Dynamic => Event::Dynamic,
             SignedInFeed::History => Event::History,
@@ -102,12 +101,13 @@ impl SignedInFeed {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlayerMenu {
-    Quality,
-}
-
 /// One answer from background work, drained by `poll` at the top of a frame.
+///
+/// Everything that answers about *the video being watched* carries the playback generation it
+/// was asked under. A play URL, a detail call and a resume position all describe the stream
+/// that was loading when they were asked for, and by the time they land the viewer may have
+/// opened another one: without the number, the previous video's answer was applied to the new
+/// one — its stream loaded, its playhead seeked, its collection put in the menu.
 pub(crate) enum Event {
     Home(Result<api::RecommendationPage, String>, u64),
     Search(Result<Vec<Video>, String>),
@@ -116,9 +116,9 @@ pub(crate) enum Event {
     WatchLater(Result<Vec<Video>, String>),
     Favorites(Result<Vec<Video>, String>),
     Author(Result<api::AuthorVideoPage, String>, u64),
-    VideoContext(Box<api::VideoContext>),
-    PlayUrl(Result<api::PlayUrlResult, String>),
-    Resume(Option<f64>),
+    VideoContext(Box<api::VideoContext>, u64),
+    PlayUrl(Result<api::PlayUrlResult, String>, u64),
+    Resume(Option<f64>, u64),
     Comments(Result<(usize, Vec<Comment>, i64, bool), String>, u64),
     Avatar(Option<Arc<Rgba8>>),
     QrCode(Result<login::QrCodeData, String>, u64),
@@ -128,12 +128,12 @@ pub(crate) enum Event {
     ActionDone(&'static str, Result<(), String>),
     /// A cover arrived, keyed by bvid, with its pixels.
     Cover(String, Arc<Rgba8>),
-    /// A cover download failed or was cancelled, so its bvid may be asked for again.
+    /// A cover download failed, so its bvid may be asked for again. Nothing on screen changes.
     CoverFailed(String),
     /// A history report finished, freeing the next one. Carries nothing: it is a gate, not
     /// news for the UI.
     HistoryReported,
-    /// Work finished with nothing to show. `poll` counts it as activity but changes no state.
+    /// Work finished with nothing to show, and nothing to redraw.
     Silent,
 }
 

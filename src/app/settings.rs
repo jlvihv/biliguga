@@ -2,24 +2,14 @@
 
 pub(crate) use super::*;
 
-pub(crate) fn player_settings_path() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    let config_dir = std::env::var_os("APPDATA").map(PathBuf::from);
-
-    #[cfg(not(target_os = "windows"))]
-    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-
-    config_dir.map(|dir| dir.join("biliguga").join("settings.json"))
+/// Where the player's volume and speed live.
+pub(crate) fn player_settings_path() -> PathBuf {
+    crate::paths::app_dir().join("settings.json")
 }
 
 pub(crate) fn load_player_settings() -> (f64, f64) {
     let defaults = (DEFAULT_VOLUME, DEFAULT_SPEED);
-    let Some(path) = player_settings_path() else {
-        return defaults;
-    };
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = fs::read_to_string(player_settings_path()) else {
         return defaults;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -40,9 +30,7 @@ pub(crate) fn load_player_settings() -> (f64, f64) {
 }
 
 pub(crate) fn save_player_settings(volume: f64, speed: f64) {
-    let Some(path) = player_settings_path() else {
-        return;
-    };
+    let path = player_settings_path();
     let Some(parent) = path.parent() else {
         return;
     };

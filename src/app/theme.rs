@@ -1,6 +1,7 @@
 //! The app's colours, in Rune's linear-sRGB `Color`.
-
-/// The app's colours, in Rune's linear-sRGB `Color`.
+///
+/// Precomputed constants rather than functions over `oklch(..)`: the conversion ran thousands
+/// of times a frame (each `theme::HOVER` in each row) to produce the same numbers every time.
 ///
 /// These used to be functions calling `oklch(..)` on every access, so the OKLCH to linear-sRGB
 /// conversion ran thousands of times a frame (each `theme::HOVER` in each row) and produced the
@@ -47,11 +48,32 @@ pub(crate) const DANGER: Color = c(1.0, 0.147_027, 0.147_027);
 pub(crate) const TRACK: Color = c(0.023_153, 0.027_321, 0.040_915);
 /// The pointer resting on something that can be pressed.
 pub(crate) const HOVER: Color = c(0.008_023, 0.009_134, 0.014_000);
-/// The pointer holding it down.
-pub(crate) const PRESS: Color = c(0.013_000, 0.015_209, 0.024_158);
+/// The pointer holding it down. A press and a hover are the same shade on a card: the press
+/// already reads as "this happened" from the click itself, so the palette spent no extra value
+/// on it. Kept as its own name because it is a different state, not a different colour.
+pub(crate) const PRESS: Color = CARD_HOVER;
 
-/// The placeholder a cover shows before its pixels arrive: the row's own accent, which
-/// `api` assigns per position so a feed of half-loaded covers still looks intentional.
+/// The placeholder a cover shows before its pixels arrive: the row's own accent, which `api`
+/// assigns per position so a feed of half-loaded covers still looks intentional.
+///
+/// A lookup rather than a conversion. This used to run once per card per frame as
+/// `rune::color::hex(&format!("#{accent:06x}"))`: a heap allocation and a hex parse to turn
+/// three bytes into three floats, for one of six values. The whole set is precomputed, so the
+/// frame loop only copies three floats.
 pub(crate) fn cover_placeholder(accent: u32) -> Color {
-    rune::color::hex(&format!("#{accent:06x}")).unwrap_or(Color::BLACK)
+    /// `api::accent_for`'s six colours in linear sRGB, in its order, each commented with the
+    /// sRGB hex it came from.
+    const ACCENTS: [Color; 6] = [
+        c(0.048_172, 0.061_246, 0.088_656), // #3E4654
+        c(0.040_915, 0.059_511, 0.102_242), // #39455A
+        c(0.070_360, 0.054_480, 0.051_269), // #4B4240
+        c(0.072_272, 0.054_480, 0.090_842), // #4C4255
+        c(0.035_601, 0.072_272, 0.068_478), // #354C4A
+        c(0.061_246, 0.080_220, 0.046_665), // #46503D
+    ];
+    // The accumulator in `api::accent_for` is `index % 6` over the same table, so the packed
+    // value is what identifies the entry; an unknown accent falls back to the first.
+    const PACKED: [u32; 6] = [0x3e_4654, 0x39_455a, 0x4b_4240, 0x4c_4255, 0x35_4c4a, 0x46_503d];
+    let index = PACKED.iter().position(|packed| *packed == accent);
+    ACCENTS[index.unwrap_or(0)]
 }
