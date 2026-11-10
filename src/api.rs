@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -334,44 +334,38 @@ struct CoverRequest {
     reply: oneshot::Sender<Option<Arc<Rgba8>>>,
 }
 
-struct CoverWorkers {
-    senders: Vec<async_mpsc::UnboundedSender<CoverRequest>>,
-    next: AtomicUsize,
-}
+/// How many covers are fetched at once. The point of the limit is to keep a feed of twenty
+/// thumbnails from opening twenty TLS handshakes at once; spreading them over several channels
+/// (which is what this did) bought nothing, since the concurrency was already bounded here.
+const COVER_CONCURRENCY: usize = 8;
 
-const COVER_WORKER_COUNT: usize = 2;
-const COVER_REQUESTS_PER_WORKER: usize = 4;
+/// The queue every cover goes through, and the one task that drains it.
+fn cover_queue() -> Option<&'static async_mpsc::UnboundedSender<CoverRequest>> {
+    static QUEUE: OnceLock<Option<async_mpsc::UnboundedSender<CoverRequest>>> = OnceLock::new();
 
-fn cover_workers() -> Option<&'static CoverWorkers> {
-    static WORKERS: OnceLock<Option<CoverWorkers>> = OnceLock::new();
-
-    WORKERS
+    QUEUE
         .get_or_init(|| {
-            let mut senders = Vec::with_capacity(COVER_WORKER_COUNT);
-            for _ in 0..COVER_WORKER_COUNT {
-                let (sender, receiver) = async_mpsc::unbounded::<CoverRequest>();
-                network::detach(async move {
-                    let mut results = receiver
-                        .map(|request| async move {
-                            // The shared client keeps its connection pool warm across covers,
-                            // so a feed of twenty thumbnails reuses one TLS session per CDN
-                            // host instead of shaking hands twenty times.
-                            let image =
-                                download_cover_async(client(), &request.url, &request.cancelled)
-                                    .await;
-                            (request.reply, image)
-                        })
-                        .buffer_unordered(COVER_REQUESTS_PER_WORKER);
-                    while let Some((reply, image)) = results.next().await {
-                        let _ = reply.send(image);
-                    }
-                });
-                senders.push(sender);
-            }
-            Some(CoverWorkers {
-                senders,
-                next: AtomicUsize::new(0),
-            })
+            let (sender, receiver) = async_mpsc::unbounded::<CoverRequest>();
+            network::detach(async move {
+                let mut results = receiver
+                    .map(|request| async move {
+                        // The shared client keeps its connection pool warm across covers, so a
+                        // feed of twenty thumbnails reuses one TLS session per CDN host instead
+                        // of shaking hands twenty times.
+                        let image = download_cover_async(
+                            client(),
+                            &request.url,
+                            &request.cancelled,
+                        )
+                        .await;
+                        (request.reply, image)
+                    })
+                    .buffer_unordered(COVER_CONCURRENCY);
+                while let Some((reply, image)) = results.next().await {
+                    let _ = reply.send(image);
+                }
+            });
+            Some(sender)
         })
         .as_ref()
 }
@@ -380,10 +374,9 @@ pub(crate) fn queue_cover_download(
     url: String,
     cancelled: Arc<AtomicBool>,
 ) -> Option<oneshot::Receiver<Option<Arc<Rgba8>>>> {
-    let workers = cover_workers()?;
+    let queue = cover_queue()?;
     let (reply, receiver) = oneshot::channel();
-    let index = workers.next.fetch_add(1, Ordering::Relaxed) % workers.senders.len();
-    workers.senders[index]
+    queue
         .unbounded_send(CoverRequest {
             url,
             cancelled,
