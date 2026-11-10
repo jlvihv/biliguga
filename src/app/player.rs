@@ -192,27 +192,17 @@ pub(crate) fn render_stage(app: &BiliGuga, size: Option<(f32, f32)>) -> El {
 
 /// The transport bar: the play button, then the switches that change how it plays.
 ///
-/// `compact` is the windowed player, whose column is a share of the window and can be as
-/// narrow as 390 points. There the quality is its icon alone and the volume slider is short,
-/// so the row fits on one line; full screen has the room to spell the quality out.
-pub(crate) fn render_transport(app: &BiliGuga, fullscreen: bool) -> El {
+/// One row for both layouts: the windowed player owns the window beside the rail, and the
+/// full-screen strip floats over the picture — same width to spend either way.
+pub(crate) fn render_transport(app: &BiliGuga) -> El {
     let playing = app.playback == PlaybackState::Playing;
-    let mut quality =
-        icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
-            app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
-                None
-            } else {
-                Some(PlayerMenu::Quality)
-            };
-        });
-    if fullscreen {
-        quality = quality.child(
-            text(crate::api::quality_label(app.quality))
-                .font(TextStyle::new(11.0, 500.0))
-                .color(theme::TEXT_FAINT)
-                .single_line(),
-        );
-    }
+    let quality = icon_button("quality", &icons::QUALITY, "画质").on_press(|app: &mut BiliGuga| {
+        app.open_menu = if app.open_menu == Some(PlayerMenu::Quality) {
+            None
+        } else {
+            Some(PlayerMenu::Quality)
+        };
+    });
     row()
         .key("transport")
         .w_full()
@@ -235,12 +225,15 @@ pub(crate) fn render_transport(app: &BiliGuga, fullscreen: bool) -> El {
                 )),
         )
         .child(el().grow(1.0).min_w(4.0))
-        .child(if fullscreen {
-            collection_marker(app)
-        } else {
-            el()
-        })
-        .child(quality)
+        .child(collection_marker(app))
+        .child(
+            quality.child(
+                text(crate::api::quality_label(app.quality))
+                    .font(TextStyle::new(11.0, 500.0))
+                    .color(theme::TEXT_FAINT)
+                    .single_line(),
+            ),
+        )
         .child(
             square_button(
                 "mute",
@@ -257,7 +250,7 @@ pub(crate) fn render_transport(app: &BiliGuga, fullscreen: bool) -> El {
                 app.persist_player_settings();
             }),
         )
-        .child(volume_bar(app.volume, if fullscreen { 96.0 } else { 62.0 }))
+        .child(volume_bar(app.volume, 96.0))
         .child(
             pill("speed", None, &format!("{:.2}x", app.speed), Tone::Quiet)
                 .h(28.0)
@@ -265,24 +258,6 @@ pub(crate) fn render_transport(app: &BiliGuga, fullscreen: bool) -> El {
                 .help("倍速")
                 .on_press(|app: &mut BiliGuga| app.cycle_speed()),
         )
-        .child(if fullscreen {
-            el()
-        } else {
-            square_button(
-                "theater",
-                if app.theater {
-                    &icons::COLLAPSE
-                } else {
-                    &icons::EXPAND
-                },
-                if app.theater {
-                    "还原分栏"
-                } else {
-                    "影院模式"
-                },
-            )
-            .on_press(|app: &mut BiliGuga| app.theater = !app.theater)
-        })
         .child(
             square_button(
                 "fullscreen",
@@ -395,8 +370,8 @@ pub(crate) fn render_quality_menu(app: &BiliGuga) -> El {
 }
 
 /// The clip's title, uploader and numbers, under the stage. Three lines rather than one: a
-/// title, then who made it, then the counts — the player column is narrow enough that a single
-/// row of all three ran off the right edge.
+/// title, then who made it, then the counts. The player has the whole window beside the rail
+/// now, but the title is the one thing here that grows, so it gets a line of its own.
 pub(crate) fn render_detail(app: &BiliGuga, video: &Video) -> El {
     let mut block = col()
         .key("player-detail")
@@ -613,8 +588,8 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
         .shrink()
         .padding(PANE_PAD)
         .child(render_stage(app, Some((stage_width, stage_height))));
-    // The windowed layout always shows its controls: hiding them would hide the only way to
-    // act on the video, since the pointer is usually over the feed.
+    // The windowed layout always shows its controls: there is nothing underneath to reveal
+    // them over, and hiding them would only hide the way to act on the video.
     stage_block = stage_block
         .child(el().h(10.0))
         .child(
@@ -625,7 +600,7 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
                 .radius(12.0)
                 .fill(theme::PANEL)
                 .child(seek_bar(position, duration))
-                .child(render_transport(app, false)),
+                .child(render_transport(app)),
         )
         .child(
             if app.open_menu == Some(PlayerMenu::Quality) && !app.quality_options.is_empty() {
@@ -651,14 +626,14 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
                 ),
         );
 
+    // No side border: the rail already draws the hairline the player sits against.
     let column = col()
         .key("player")
         .grow(1.0)
         .h_full()
         .min_w(0.0)
         .min_h(0.0)
-        .fill(theme::PANEL)
-        .border_sides([0.0, 0.0, 0.0, 1.0], theme::HAIRLINE);
+        .fill(theme::PANEL);
     column.child(
         col()
             .key("player-scroll")
@@ -725,7 +700,7 @@ pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
                 .pb(14.0)
                 .fill(Color::BLACK.alpha(0.82))
                 .child(seek_bar(position, duration))
-                .child(render_transport(app, true)),
+                .child(render_transport(app)),
         );
     } else {
         root = root.child(

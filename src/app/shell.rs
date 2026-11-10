@@ -37,12 +37,6 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     if let Some([_, _, _, pane_height]) = cx.layout("feed-scroll") {
         app.pane_height.set(pane_height);
     }
-    // The window's own width, which the feed's share beside the player is worked out from.
-    // Reading the root is safe: its size is the window's, not something the view decides.
-    if let Some([_, _, window_width, _]) = cx.layout("window") {
-        app.feed_pane_width
-            .set((window_width * FEED_PANE_SHARE).clamp(FEED_PANE_MIN, FEED_PANE_MAX));
-    }
     let mut root = row().key("window").w_full().h_full().fill(theme::BG);
     if app.player_fullscreen {
         return match &app.playing_video {
@@ -50,27 +44,12 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
             None => root,
         };
     }
-    root = root.child(render_rail(app));
-    // What the browse pane is depends on whether something is open: with a video playing the
-    // feed becomes a list beside it, so the two never fight over the window's width.
-    let watching = app.playing_video.is_some();
-    if watching && app.theater {
-        if let Some(video) = &app.playing_video {
-            root = root.child(render_player(app, video));
-        }
-    } else if watching {
-        let feed = col()
-            .key("feed-pane")
-            .w(app.feed_pane_width.get())
-            .h_full()
-            .shrink()
-            .child(render_feed(app));
-        root = root.child(feed);
-        if let Some(video) = &app.playing_video {
-            root = root.child(render_player(app, video));
-        }
-    } else {
-        root = root.child(render_feed(app));
+    // The two panes never share the window: the feed is what the window shows when nothing is
+    // open, and a video takes the whole of it. There is no rail down the side either — the tabs
+    // are a row across the feed's own top, and the player has no tabs at all.
+    match &app.playing_video {
+        Some(video) => root = root.child(render_player(app, video)),
+        None => root = root.child(render_feed(app)),
     }
     root
 }

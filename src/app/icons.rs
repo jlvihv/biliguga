@@ -113,18 +113,6 @@ pub(super) static LOGO: Icon = Icon {
     view: 16.0,
     body: r##"<rect x="1.4" y="3.6" width="13.2" height="9.2" rx="2.6" fill="currentColor"/><path d="M5.2 2.1 6.9 4.4M10.8 2.1 9.1 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/><circle cx="5.6" cy="7.4" r="0.95" fill="#0A0B0F"/><circle cx="10.4" cy="7.4" r="0.95" fill="#0A0B0F"/><path d="M6.6 10.2h2.8" stroke="#0A0B0F" stroke-width="0.9" fill="none" stroke-linecap="round"/>"##,
 };
-/// Theater mode: the video alone, no feed beside it.
-pub(super) static EXPAND: Icon = Icon {
-    name: "bg-expand",
-    view: 16.0,
-    body: r#"<rect x="1.6" y="3.4" width="12.8" height="9.2" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/><rect x="4.2" y="5.8" width="4.6" height="4.4" rx="1" fill="currentColor" opacity="0.55"/>"#,
-};
-/// Back to the split layout: video with its feed beside it.
-pub(super) static COLLAPSE: Icon = Icon {
-    name: "bg-collapse",
-    view: 16.0,
-    body: r#"<rect x="1.6" y="3.4" width="12.8" height="9.2" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M9.6 3.4v9.2" stroke="currentColor" stroke-width="1.4"/><path d="M4.4 6h2.8M4.4 8h2.8M4.4 10h2.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
-};
 pub(super) static CHECK: Icon = Icon {
     name: "bg-check",
     view: 16.0,

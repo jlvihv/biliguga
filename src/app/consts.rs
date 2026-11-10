@@ -29,17 +29,6 @@ pub(crate) const DEFAULT_VOLUME: f64 = 100.;
 
 pub(crate) const DEFAULT_SPEED: f64 = 1.;
 
-/// The left navigation rail.
-pub(crate) const RAIL_WIDTH: f32 = 88.;
-
-/// The feed pane's width while a video is open beside it: a share of the window, held between
-/// these bounds, so the player beside it keeps the room a 16:9 frame needs.
-pub(crate) const FEED_PANE_MIN: f32 = 300.;
-
-pub(crate) const FEED_PANE_MAX: f32 = 460.;
-
-pub(crate) const FEED_PANE_SHARE: f32 = 0.32;
-
 /// Padding inside every pane.
 pub(crate) const PANE_PAD: f32 = 20.;
 

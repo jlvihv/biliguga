@@ -17,9 +17,7 @@ const fn c(r: f32, g: f32, b: f32) -> Color {
 
 /// #0A0B0F — the page behind everything.
 pub(crate) const BG: Color = c(0.003_035, 0.003_347, 0.004_777);
-/// #0E1015 — the navigation rail, one step up from the page.
-pub(crate) const RAIL: Color = c(0.004_391, 0.005_182, 0.007_499);
-/// #111319 — the player column and control bars.
+/// #111319 — the player pane and control bars.
 pub(crate) const PANEL: Color = c(0.005_605, 0.006_512, 0.009_721);
 /// #16181F — anything raised: cards, fields, chips.
 pub(crate) const CARD: Color = c(0.008_023, 0.009_134, 0.013_702);

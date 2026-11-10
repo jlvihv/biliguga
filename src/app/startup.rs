@@ -32,7 +32,6 @@ pub(crate) const SCENES: &[Scene] = &[
     ("login", seed_login),
     ("history", seed_history),
     ("signed-out", seed_signed_out),
-    ("theater", seed_theater),
     ("fullscreen", seed_fullscreen),
 ];
 
@@ -86,12 +85,6 @@ pub(crate) fn seed_signed_out(app: &mut BiliGuga) {
     app.account_avatar = None;
     app.active_tab = AppTab::Dynamic;
     app.dynamic_loading = false;
-}
-
-/// Theater mode: the player alone in the window, no feed beside it.
-pub(crate) fn seed_theater(app: &mut BiliGuga) {
-    seed_player(app);
-    app.theater = true;
 }
 
 /// The OS-level full screen, with its floating control strip.

@@ -58,10 +58,6 @@ pub(crate) struct BiliGuga {
     pub(crate) volume_dragging: bool,
     pub(crate) controls_until: Option<Instant>,
     pub(crate) player_fullscreen: bool,
-    /// Windowed, the player can take the whole window instead of sharing it with the feed: a
-    /// video that wants the room does not need the OS-level full screen (which hides the rail
-    /// and the title bar) to get it.
-    pub(crate) theater: bool,
     pub(crate) playing_video: Option<Video>,
     /// The stage size the view last drew at.
     ///
@@ -165,8 +161,6 @@ pub(crate) struct BiliGuga {
     /// The browse pane's height, measured in `view`, so paging knows how much of the feed is
     /// on screen without guessing from a row count.
     pub(crate) pane_height: std::cell::Cell<f32>,
-    /// The width the feed gets while the player shares the window with it.
-    pub(crate) feed_pane_width: std::cell::Cell<f32>,
     /// The box `view` gives the stage, worked out from the player column's own size: the video
     /// keeps its 16:9 shape without ever growing taller than the room it has.
     pub(crate) stage_box: std::cell::Cell<(f32, f32)>,
@@ -227,7 +221,6 @@ impl BiliGuga {
             volume_dragging: false,
             controls_until: None,
             player_fullscreen: false,
-            theater: false,
             playing_video: None,
             stage_size: std::cell::Cell::new(None),
             stats: None,
@@ -263,7 +256,6 @@ impl BiliGuga {
             card_columns: std::cell::Cell::new(2),
             card_width: std::cell::Cell::new(CARD_MIN_WIDTH),
             stage_box: std::cell::Cell::new((320.0, 180.0)),
-            feed_pane_width: std::cell::Cell::new(FEED_PANE_MAX),
             scroll_pos: std::rc::Rc::new(std::cell::Cell::new(None)),
             // `None` until the viewport has been laid out once: the first frame is what turns
             // the offset into a row.
@@ -679,7 +671,6 @@ impl BiliGuga {
         self.action_note = None;
         self.playback_error = None;
         self.open_menu = None;
-        self.theater = false;
         self.selected = None;
     }
 

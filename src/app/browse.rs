@@ -27,7 +27,8 @@ impl RailItem {
     }
 }
 
-pub(crate) fn rail_entry(
+/// One entry in the top navigation bar: a glyph and its caption, with the current tab washed.
+pub(crate) fn nav_entry(
     item: RailItem,
     icon: &'static rune::Icon,
     caption: &str,
@@ -38,32 +39,25 @@ pub(crate) fn rail_entry(
     } else {
         theme::TEXT_DIM
     };
-    let text_color = if active {
-        theme::TEXT
-    } else {
-        theme::TEXT_FAINT
-    };
-    let mut entry = col()
-        .w_full()
-        .h(56.0)
-        .center()
-        .gap(4.0)
-        .radius(12.0)
+    let mut entry = row()
+        .h(32.0)
+        .px(11.0)
+        .gap(6.0)
+        .items_center()
+        .radius(9.0)
         .hover(theme::CARD_HOVER)
         .press(theme::PRESS)
         .cursor(rune::Cursor::Pointer)
         .help(caption)
         .on_press(move |app: &mut BiliGuga| app.show_tab(tab_of(item)))
-        .child(glyph(icon, icon_color, 19.0))
+        .child(glyph(icon, icon_color, 14.0))
         .child(
             text(caption)
-                .font(TextStyle::new(10.5, 500.0))
-                .color(text_color)
+                .font(TextStyle::new(12.0, 500.0))
+                .color(if active { theme::TEXT } else { theme::TEXT_FAINT })
                 .single_line(),
         );
     if active {
-        // A wash plus a bar down the inner edge: the bar is a child with `.h(..)` and its own
-        // offset rather than an absolute overlay, so it needs no ancestor positioning.
         entry = entry
             .fill(theme::CARD)
             .border(1.0, theme::ACCENT.alpha(0.22));
@@ -81,48 +75,16 @@ pub(crate) fn tab_of(item: RailItem) -> AppTab {
     }
 }
 
-pub(crate) fn render_rail(app: &BiliGuga) -> El {
-    let mut rail = col()
-        .key("rail")
-        .w(RAIL_WIDTH)
-        .h_full()
-        .shrink()
-        .items_center()
-        .py(14.0)
-        .gap(6.0)
-        .fill(theme::RAIL)
-        .border_sides([0.0, 1.0, 0.0, 0.0], theme::HAIRLINE)
-        .child(col().w_full().items_center().pb(10.0).child(
-            el().size(36.0, 36.0).center().radius(11.0).child(glyph(
-                &icons::LOGO,
-                theme::ACCENT,
-                24.0,
-            )),
-        ));
-    for (item, icon, caption) in [
-        (RailItem::Home, &icons::HOME, "首页"),
-        (RailItem::Dynamic, &icons::PULSE, "动态"),
-        (RailItem::History, &icons::HISTORY, "历史"),
-        (RailItem::WatchLater, &icons::CLOCK, "稍后"),
-        (RailItem::Favorites, &icons::STAR, "收藏"),
-    ] {
-        rail = rail.child(el().w(RAIL_WIDTH - 20.0).child(rail_entry(
-            item,
-            icon,
-            caption,
-            item.owns(app.active_tab),
-        )));
-    }
-    rail = rail.child(el().grow(1.0));
-    // The account is the last thing in the rail, always in the same place: an avatar when
-    // signed in, the sign-in door when not.
+/// The account: an avatar when signed in, the sign-in door when not. It sits at the far end of
+/// the navigation row, where it always was in the rail.
+pub(crate) fn account_button(app: &BiliGuga) -> El {
     let has_session = app.session.is_some();
     let mut account = el()
         .key("account")
-        .size(40.0, 40.0)
+        .size(32.0, 32.0)
         .center()
-        .radius(20.0)
-        .clip_rounded(20.0)
+        .radius(16.0)
+        .clip_rounded(16.0)
         .cursor(rune::Cursor::Pointer)
         .hover(theme::CARD_HOVER)
         .press(theme::PRESS)
@@ -140,17 +102,51 @@ pub(crate) fn render_rail(app: &BiliGuga) -> El {
             account = account.fill(theme::ACCENT_DIM).child(glyph(
                 &icons::USER,
                 theme::ACCENT_SOFT,
-                18.0,
+                15.0,
             ));
         }
         (false, _) => {
             account = account
                 .fill(theme::CARD)
                 .border(1.0, theme::BORDER)
-                .child(glyph(&icons::USER, theme::TEXT_DIM, 17.0));
+                .child(glyph(&icons::USER, theme::TEXT_DIM, 14.0));
         }
     }
-    rail.child(account)
+    account
+}
+
+/// The navigation row across the top of the window: the brand, the tabs, and the account.
+///
+/// This was a rail down the left edge. A column is what a window tall enough to hold five
+/// entries and a logo can afford; a row costs one 46-point band and gives the width back to
+/// whatever is on screen, which — with no split layout left to shrink it — is worth more.
+pub(crate) fn render_nav(app: &BiliGuga) -> El {
+    let mut nav = row()
+        .key("nav")
+        .w_full()
+        .shrink()
+        .px(PANE_PAD)
+        .pt(12.0)
+        .pb(10.0)
+        .gap(6.0)
+        .items_center()
+        .child(
+            el().size(30.0, 30.0)
+                .center()
+                .radius(9.0)
+                .child(glyph(&icons::LOGO, theme::ACCENT, 21.0)),
+        )
+        .child(el().w(6.0));
+    for (item, icon, caption) in [
+        (RailItem::Home, &icons::HOME, "首页"),
+        (RailItem::Dynamic, &icons::PULSE, "动态"),
+        (RailItem::History, &icons::HISTORY, "历史"),
+        (RailItem::WatchLater, &icons::CLOCK, "稍后"),
+        (RailItem::Favorites, &icons::STAR, "收藏"),
+    ] {
+        nav = nav.child(nav_entry(item, icon, caption, item.owns(app.active_tab)));
+    }
+    nav.child(el().grow(1.0)).child(account_button(app))
 }
 
 // ---- The browse pane ------------------------------------------------------------------------
@@ -212,6 +208,8 @@ pub(crate) fn render_topbar(app: &BiliGuga) -> El {
         .key("feed-header")
         .w_full()
         .shrink()
+        .child(render_nav(app))
+        .child(el().w_full().h(1.0).shrink().fill(theme::HAIRLINE))
         .child(render_title_row(app));
     if app.active_tab != AppTab::Login {
         header = header.child(render_search(app));
@@ -531,8 +529,8 @@ pub(crate) fn render_feed(app: &BiliGuga) -> El {
         // The grid takes as many equal columns as the pane allows, so the same view is two
         // columns in a narrow window and five in a wide one, without a measurement pass: the
         // view is handed the pane's width by `card_columns`. One column is a list, not a grid:
-        // a poster card as wide as the pane is a billboard, and the pane is this narrow only
-        // when the player has taken the rest of the window.
+        // a poster card as wide as the pane is a billboard, and the pane only gets this narrow
+        // in a window squeezed to its minimum width.
         let columns = app.card_columns.get();
         let width = app.card_width.get();
         let rows = videos.len().div_ceil(columns);
