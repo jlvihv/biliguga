@@ -444,12 +444,22 @@ fn run_mpv_session(
             "Referer: https://www.bilibili.com/",
         );
         set_option(handle, "aid", "auto");
-        // mpv starts a thread per built-in Lua script (console, stats, context menu,
-        // positioning, select, commands, ytdl_hook — seven of them), and a thread pool for
-        // yt-dlp. None of that applies here: the URLs come from Bilibili's API already
-        // resolved, and the UI is ours. Turning both off removes most of what libmpv adds
-        // to the process's thread count.
+        // mpv starts a thread per built-in Lua script — console, stats, context menu,
+        // positioning, select, commands — plus a thread pool for yt-dlp. None of it applies
+        // here: the URLs come from Bilibili's API already resolved, and the UI is ours.
+        //
+        // `load-scripts=no` is NOT what turns those off, however much it looks like it: it
+        // governs the user script directory, and left every built-in running. Measured against
+        // this libmpv with a bare `mpv_create` + `idle`: 10 threads by default, 10 with
+        // `load-scripts=no`, 6 with the four switches below. Each script has its own.
         set_option(handle, "load-scripts", "no");
+        set_option(handle, "load-console", "no");
+        set_option(handle, "load-stats-overlay", "no");
+        set_option(handle, "load-select", "no");
+        set_option(handle, "load-positioning", "no");
+        set_option(handle, "load-commands", "no");
+        set_option(handle, "load-context-menu", "no");
+        set_option(handle, "load-auto-profiles", "no");
         set_option(handle, "ytdl", "no");
         // Decoding threads. Two numbers matter and only one of them is obvious:
         //
