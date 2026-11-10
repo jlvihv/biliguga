@@ -47,25 +47,31 @@ pub(crate) fn drag_fraction(drag: &Drag) -> f32 {
 
 /// The seek bar: presses and drags anywhere on the track jump the video there. The hit area is
 /// taller than the drawn line, so it is easy to grab.
+/// A clock, in tabular figures and a fixed width.
+///
+/// Both matter while it is ticking. `'tnum' 1` gives every digit the same advance, so `11:11`
+/// is the same width as `00:00` and the seek bar does not twitch as the seconds count; the
+/// fixed width means the label does not resize with its glyphs at all — `CLOCK_WIDTH` holds the
+/// widest a `mm:ss` can be, and the text is right-aligned inside it so the digits stay put.
+pub(crate) fn clock_label(seconds: f64, color: Color) -> El {
+    let clock = Clock::new(seconds);
+    row().w(CLOCK_WIDTH).shrink().justify_end().child(
+        text(clock.as_str())
+            .font(TextStyle::new(11.5, 500.0).features("'tnum' 1"))
+            .color(color)
+            .single_line(),
+    )
+}
+
 pub(crate) fn seek_bar(position: f64, duration: f64) -> El {
     row()
         .key("seek-row")
         .w_full()
         .gap(10.0)
         .items_center()
-        .child(
-            text(Clock::new(position).as_str())
-                .font(TextStyle::new(11.5, 500.0))
-                .color(theme::TEXT_DIM)
-                .shrink(),
-        )
+        .child(clock_label(position, theme::TEXT_DIM))
         .child(seek_track(position, duration))
-        .child(
-            text(Clock::new(duration).as_str())
-                .font(TextStyle::new(11.5, 500.0))
-                .color(theme::TEXT_FAINT)
-                .shrink(),
-        )
+        .child(clock_label(duration, theme::TEXT_FAINT))
 }
 
 /// The track itself: presses and drags anywhere on it jump the video there. The hit area is
@@ -133,6 +139,12 @@ pub(crate) fn collection_marker(app: &BiliGuga) -> El {
     let open = app.episode_menu_open;
     icon_button("episodes", &icons::TV, &text)
         .key(format!("collection-{}", collection.id))
+        // A fixed width, and the title inside it truncated: this label is the one thing in the
+        // transport row whose text comes from the clip, so without a bound a long collection
+        // name would push the quality, volume and speed controls off the end — and the row
+        // would resize itself again when the episode number went from `9/12` to `10/12`.
+        .w(EPISODE_CHIP_WIDTH)
+        .max_w(EPISODE_CHIP_WIDTH)
         .fill(if open {
             theme::CARD_HOVER
         } else {
@@ -392,10 +404,15 @@ fn quality_anchor(app: &BiliGuga) -> El {
             app.show_controls();
         })
             .child(
+                // The labels run from `8K` to `1080P 高码率`, so this is the widest of them
+                // plus a little: a row that re-flows every time the quality changes would move
+                // the volume slider under the pointer.
                 text(crate::api::quality_label(app.quality))
                     .font(TextStyle::new(11.0, 500.0))
                     .color(theme::TEXT_FAINT)
-                    .single_line(),
+                    .single_line()
+                    .w(QUALITY_WIDTH)
+                    .truncate(),
             ),
     );
     if app.quality_menu_open && !app.quality_options.is_empty() {
@@ -476,9 +493,14 @@ pub(crate) fn render_transport(app: &BiliGuga) -> El {
         )
         .child(volume_bar(app.volume, 96.0))
         .child(
+            // A fixed width for the same reason as the clock: `0.50x` through `2.00x` are all
+            // five characters, and a width that follows the glyphs lets the row shift when the
+            // rate changes.
             pill("speed", None, &format!("{:.2}x", app.speed), Tone::Quiet)
                 .h(28.0)
                 .px(8.0)
+                .w(SPEED_WIDTH)
+                .justify_center()
                 .help("倍速")
                 .on_press(|app: &mut BiliGuga| app.cycle_speed()),
         )

@@ -73,6 +73,23 @@ pub(crate) const EPISODE_MENU_HEIGHT: f32 = 320.0;
 /// The title row above the list plus the menu's own padding.
 pub(crate) const EPISODE_HEADER_HEIGHT: f32 = 26.0;
 
+/// The width of one clock in the transport row. `mm:ss` is five characters of an 11.5-point
+/// face, and the widest digits at that size are about 6.7 points, so this holds `88:88` with a
+/// little to spare. Stated rather than measured: a label sized by its own glyphs shifts the
+/// seek bar every second as the figures change.
+pub(crate) const CLOCK_WIDTH: f32 = 38.0;
+
+/// The width of the quality label in the transport row: `1080P 高码率` is the longest label the
+/// API hands out, at 11 points. Stated so switching quality does not re-flow the row.
+pub(crate) const QUALITY_WIDTH: f32 = 74.0;
+
+/// The width of the episode chip in the transport row. Its text is the collection's own title,
+/// so it needs a bound for the row to keep its shape whatever a clip calls its series.
+pub(crate) const EPISODE_CHIP_WIDTH: f32 = 200.0;
+
+/// The width of the speed chip: `0.50x` to `2.00x` are five characters at 12 points.
+pub(crate) const SPEED_WIDTH: f32 = 56.0;
+
 /// How long the player's controls stay up after the pointer moves, in full screen.
 pub(crate) const CONTROLS_LINGER: Duration = Duration::from_millis(2400);
 

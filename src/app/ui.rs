@@ -99,7 +99,12 @@ pub(crate) fn icon_button(key: &'static str, icon: &'static rune::Icon, caption:
         text(caption)
             .font(TextStyle::new(12.0, 500.0))
             .color(theme::TEXT_DIM)
-            .single_line(),
+            .single_line()
+            // Truncates rather than overflows, for the callers that bound it: the episode chip's
+            // caption is a collection title, and a title with no room left has to end in an
+            // ellipsis inside the chip instead of running over the controls beside it.
+            .truncate()
+            .grow(1.0),
     );
     body
 }
