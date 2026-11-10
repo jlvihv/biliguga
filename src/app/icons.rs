@@ -108,6 +108,12 @@ pub(super) static CHECK: Icon = Icon {
     view: 16.0,
     body: r#"<path d="m3.4 8.4 3 3 6.2-6.8" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+/// An arrow to the left: the way back out of a page.
+pub(super) static BACK: Icon = Icon {
+    name: "bg-back",
+    view: 16.0,
+    body: r#"<path d="M9.6 3.4 5 8l4.6 4.6" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 pub(super) static CLOSE: Icon = Icon {
     name: "bg-close",
     view: 16.0,

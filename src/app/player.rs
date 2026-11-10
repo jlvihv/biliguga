@@ -830,12 +830,7 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
                 .w_full()
                 .gap(6.0)
                 .items_center()
-                .child(render_actions())
-                .child(el().grow(1.0))
-                .child(
-                    pill("close-player", Some(&icons::CLOSE), "关闭", Tone::Quiet)
-                        .on_press(|app: &mut BiliGuga| app.close_player()),
-                ),
+                .child(render_actions()),
         )
         .child(render_detail(app, video))
         .child(render_comments(app));

@@ -26,6 +26,7 @@
 //! * [`browse`] — the navigation row, the feed column and its cards.
 //! * [`actions`] — like, coin, favourite: what the viewer does to a video.
 //! * [`player`] — the stage, transport, actions, detail and comments.
+//! * [`titlebar`] — the bar the app draws in place of the window's native one.
 //! * [`shell`] — [`view`], the window's sizes, and the one-time `setup`.
 //! * [`polling`] — the frame loop: the player's clock, paging, and folding each event in.
 //! * [`keys`] — keyboard handling.
@@ -43,6 +44,7 @@ mod polling;
 mod settings;
 mod shell;
 mod startup;
+mod titlebar;
 mod state;
 mod theme;
 mod types;
@@ -84,6 +86,7 @@ pub(crate) use settings::{load_player_settings, save_player_settings};
 #[allow(unused_imports)] // used by startup itself, through `super::*`
 pub(crate) use startup::{SCENES, Scene, demo_video, demo_videos};
 pub(crate) use state::{BiliGuga, Resume};
+pub(crate) use titlebar::*;
 pub(crate) use types::*;
 pub(crate) use ui::*;
 

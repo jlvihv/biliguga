@@ -145,12 +145,17 @@ pub(crate) fn seed_search(app: &mut BiliGuga) {
 }
 
 pub(crate) fn launch() {
-    rune::run(AppSpec {
+    // The window's titlebar is the app's own, but only while a video is open: the feed keeps
+    // its navigation row and the native frame. `titlebar_height` in the view does the switching
+    // — this is the height the window is allowed to draw at.
+    rune::App::new(AppSpec {
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
         scenes: SCENES,
         min_size: Some((MIN_WINDOW_WIDTH, 560.0)),
         ..AppSpec::new("哔哩咕嘎", (1360.0, 820.0), BiliGuga::new, view)
-    });
+    })
+    .titlebar(rune::Titlebar::new(TITLEBAR_HEIGHT))
+    .run();
 }

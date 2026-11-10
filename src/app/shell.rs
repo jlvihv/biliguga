@@ -35,8 +35,21 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     // open, and a video takes the whole of it. There is no rail down the side either — the tabs
     // are a row across the feed's own top, and the player has no tabs at all.
     match &app.playing_video {
-        Some(video) => root = root.child(render_player(app, video)),
-        None => root = root.child(render_feed(app)),
+        Some(video) => {
+            // A video is the one screen with a titlebar: it has a title worth showing, and a way
+            // back out. The feed keeps its own row instead, so it takes the whole window.
+            cx.titlebar_height(TITLEBAR_HEIGHT);
+            root = row()
+                .key("window-with-titlebar")
+                .w_full()
+                .h_full()
+                .child(col().w_full().h_full().child(render_titlebar(app, cx)).child(root.child(render_player(app, video))));
+        }
+        None => {
+            // The window goes back to the native frame, and to the whole of the viewport.
+            cx.titlebar_height(0.0);
+            root = root.child(render_feed(app));
+        }
     }
     root
 }
