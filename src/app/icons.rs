@@ -98,11 +98,6 @@ pub(super) static COMMENT: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M13.6 9.1a2 2 0 0 1-2 2H6.2l-3 2.3V5.1a2 2 0 0 1 2-2h6.4a2 2 0 0 1 2 2z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
-pub(super) static LOGO: Icon = Icon {
-    name: "bg-logo",
-    view: 16.0,
-    body: r##"<rect x="1.4" y="3.6" width="13.2" height="9.2" rx="2.6" fill="currentColor"/><path d="M5.2 2.1 6.9 4.4M10.8 2.1 9.1 4.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/><circle cx="5.6" cy="7.4" r="0.95" fill="#0A0B0F"/><circle cx="10.4" cy="7.4" r="0.95" fill="#0A0B0F"/><path d="M6.6 10.2h2.8" stroke="#0A0B0F" stroke-width="0.9" fill="none" stroke-linecap="round"/>"##,
-};
 pub(super) static CHECK: Icon = Icon {
     name: "bg-check",
     view: 16.0,
