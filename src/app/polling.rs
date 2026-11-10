@@ -107,11 +107,17 @@ pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_millis(100));
     }
 
-    if let Some(until) = app.controls_until
-        && Instant::now() >= until
-    {
-        app.controls_until = None;
-        changed = true;
+    if let Some(until) = app.controls_until {
+        let now = Instant::now();
+        if now >= until {
+            app.controls_until = None;
+            changed = true;
+        } else {
+            // The controls have to come down when the linger ends, and that is a moment nothing
+            // else would wake the window for: a paused or idle player asked for no further
+            // frames, so without this the controls stayed up until the next unrelated event.
+            tx.wake_after(until - now);
+        }
     }
     changed
 }

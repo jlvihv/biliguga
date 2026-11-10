@@ -83,6 +83,9 @@ pub(crate) struct BiliGuga {
     pub(crate) seek_dragging: bool,
     pub(crate) volume_dragging: bool,
     pub(crate) controls_until: Option<Instant>,
+    /// Whether the pointer is over the picture. The controls stay up while it is and fade when
+    /// it leaves, so moving the mouse off the video hides them without waiting out the linger.
+    pub(crate) pointer_on_stage: bool,
     pub(crate) player_fullscreen: bool,
     /// The video on the stage. Shared rather than copied: a play, a quality change and a
     /// detail call all need it at once, and each `clone` was a fresh handful of `String`s.
@@ -244,6 +247,7 @@ impl BiliGuga {
             seek_dragging: false,
             volume_dragging: false,
             controls_until: None,
+            pointer_on_stage: false,
             player_fullscreen: false,
             playing_video: None,
             playback_generation: 0,
@@ -640,6 +644,9 @@ impl BiliGuga {
         // A fresh stream has its own generation, and its own first seek: the cloud position,
         // asked for below.
         self.resume = Resume::Waiting;
+        // Show the controls once, so opening a video says how to pause it. With the pointer
+        // elsewhere they would otherwise never appear: nothing has put it over the picture yet.
+        self.show_controls();
         let generation = self.next_generation();
         self.request_stream(video, self.quality, generation);
         self.load_comments(true);
@@ -782,6 +789,18 @@ impl BiliGuga {
         self.controls_until = Some(Instant::now() + CONTROLS_LINGER);
     }
 
+    /// Called with whether the pointer is over the picture.
+    pub(crate) fn pointer_over_stage(&mut self, inside: bool) {
+        self.pointer_on_stage = inside;
+        if inside {
+            self.show_controls();
+        } else {
+            // Off the picture: gone at once rather than after the linger. Waiting would leave
+            // the controls sitting over a video nobody is pointing at.
+            self.controls_until = None;
+        }
+    }
+
     /// Whether the browse pane is waiting on a request. A signed-in feed knows, the home feed
     /// only while it has nothing to show yet, and a search until its answer lands.
     pub(crate) fn is_loading(&self) -> bool {
@@ -798,9 +817,17 @@ impl BiliGuga {
         }
     }
 
+    /// Whether the controls are on screen.
+    ///
+    /// They follow the pointer the way a video player's do: up while the pointer moves over the
+    /// picture or rests on it, and gone once it leaves and the linger runs out. What they never
+    /// do is disappear while the viewer is using them — a press on a slider holds them, the
+    /// quality menu holds them, and a paused picture holds them, because a paused player with no
+    /// visible controls has no obvious way to resume.
     pub(crate) fn controls_visible(&self) -> bool {
-        self.controls_until
-            .is_some_and(|until| Instant::now() < until)
+        self.pointer_on_stage
+            || self.controls_until
+                .is_some_and(|until| Instant::now() < until)
             || self.quality_menu_open
             || self.seek_dragging
             || self.volume_dragging
@@ -1006,3 +1033,64 @@ impl BiliGuga {
 }
 
 // ---- The view -------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_watching(playback: PlaybackState) -> BiliGuga {
+        let mut app = BiliGuga::new();
+        app.playing_video = Some(Arc::new(super::demo_video(0)));
+        app.playback = playback;
+        app.controls_until = None;
+        app
+    }
+
+    /// A playing picture with the pointer off it shows no controls: that is the whole of
+    /// "auto-hide", and the case the windowed player used to get wrong by always showing them.
+    #[test]
+    fn a_playing_picture_hides_its_controls() {
+        let app = app_watching(PlaybackState::Playing);
+        assert!(!app.controls_visible());
+    }
+
+    /// Moving the pointer onto the picture brings them up, and taking it off drops them at once
+    /// rather than after the linger.
+    #[test]
+    fn the_pointer_shows_and_hides_them() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.pointer_over_stage(true);
+        assert!(app.controls_visible());
+        app.pointer_over_stage(false);
+        assert!(!app.controls_visible());
+    }
+
+    /// Opening a video shows the controls once, so a viewer who is not already pointing at the
+    /// picture can see how to pause it. The linger is what takes them away again.
+    #[test]
+    fn opening_a_video_shows_them_once() {
+        let mut app = app_watching(PlaybackState::Playing);
+        app.play_video(super::demo_video(1));
+        assert!(app.controls_visible(), "opening a video shows its controls");
+        // Expire the linger the way `poll` does when it comes due.
+        app.controls_until = None;
+        assert!(!app.controls_visible(), "and they go when it runs out");
+    }
+
+    /// What holds them up: a paused picture (no other way to resume), a press on a slider, and
+    /// the quality menu. None of these may be taken away by the pointer leaving.
+    #[test]
+    fn use_holds_them_up() {
+        let mut paused = app_watching(PlaybackState::Paused);
+        paused.pointer_over_stage(false);
+        assert!(paused.controls_visible(), "a paused picture keeps its controls");
+
+        let mut dragging = app_watching(PlaybackState::Playing);
+        dragging.seek_dragging = true;
+        assert!(dragging.controls_visible());
+
+        let mut menu = app_watching(PlaybackState::Playing);
+        menu.quality_menu_open = true;
+        assert!(menu.controls_visible());
+    }
+}

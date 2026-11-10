@@ -154,7 +154,12 @@ pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
         .items_center()
         .justify_center()
         .fill(Color::BLACK)
-        .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
+        .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls())
+        // Where the controls' visibility comes from: they rise while the pointer is over the
+        // picture and go once it leaves, in both layouts. `on_hover_change` counts descendants,
+        // so moving from the picture onto the seek bar is not a leave, and a press on a slider
+        // keeps the pointer inside until it is released.
+        .on_hover_change(|app: &mut BiliGuga, inside, _| app.pointer_over_stage(inside));
     stage = if fullscreen {
         // Everything, edge to edge.
         stage.grow(1.0).w_full().h_full().min_h(0.0)
@@ -202,10 +207,10 @@ pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
             );
         }
     }
-    // Full screen hides them with the pointer; the windowed player always shows them, because
-    // there is nothing underneath to reveal them over and hiding them would only hide the way
-    // to act on the video.
-    if !fullscreen || app.controls_visible() {
+    // Both layouts auto-hide: the controls sit over the picture now, so a still pointer leaves
+    // them nothing to do but cover the video. A press, the quality menu or a paused picture
+    // holds them — see `controls_visible`.
+    if app.controls_visible() {
         stage = stage.child(quality_overlay(app)).child(controls_overlay(app));
     }
     stage
@@ -667,8 +672,8 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
         )
 }
 
-/// The player column while the video is in full screen: stage and a control strip that fades
-/// out with the pointer.
+/// The player column while the video is in full screen: the picture, and the title it shows
+/// while the controls are away.
 pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
     // The picture keeps the whole window and its controls ride inside its bottom edge (see
     // `render_stage`), so showing them never resizes the video or re-times mpv's decode.
@@ -679,13 +684,14 @@ pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
         .fill(Color::BLACK)
         .child(render_stage(app, true));
     if !app.controls_visible() {
+        // With the controls gone this is what still says what is playing. No fill behind it
+        // either: the picture is the background everywhere on this screen.
         root = root.child(
             row()
                 .pin(Some(0.0), Some(0.0), Some(0.0), None)
                 .h(44.0)
                 .px(20.0)
                 .items_center()
-                .fill(Color::BLACK.alpha(0.45))
                 .child(
                     text(&video.title)
                         .font(TextStyle::new(12.5, 500.0))
