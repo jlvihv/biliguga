@@ -146,24 +146,22 @@ pub(crate) fn collection_marker(app: &BiliGuga) -> El {
 /// The video stage: the frame letterboxed on black, or a message until one arrives. In the
 /// windowed layout it is one block at the top of the player column; in full screen it takes
 /// everything and the controls float over it.
-pub(crate) fn render_stage(app: &BiliGuga, size: Option<(f32, f32)>) -> El {
+pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
     let mut stage = col()
         .key("player-stage")
         .items_center()
         .justify_center()
         .fill(Color::BLACK)
         .on_pointer_move(|app: &mut BiliGuga, _| app.show_controls());
-    stage = match size {
-        // The windowed player is handed the box it may use, so the frame is letterboxed inside
-        // a known rectangle: the layout never depends on what mpv happens to be decoding.
-        Some((width, height)) => stage
-            .w(width)
-            .h(height)
-            .radius(12.0)
-            .clip_rounded(12.0)
-            .border(1.0, theme::BORDER),
-        // Full screen: everything, edge to edge.
-        None => stage.grow(1.0).w_full().h_full().min_h(0.0),
+    stage = if fullscreen {
+        // Everything, edge to edge.
+        stage.grow(1.0).w_full().h_full().min_h(0.0)
+    } else {
+        // The window's width, and the clip's own shape for the height. No measured box, no
+        // rounding, no border: the picture runs edge to edge, and the layout stretches its
+        // width while the aspect ratio decides how tall it gets. Stretching the window simply
+        // gives the video a wider stage — nothing else on the page has to know its size.
+        stage.w_full().aspect_ratio(app.video_aspect())
     };
     match app.player.presented() {
         Some(pixels) => {
@@ -582,35 +580,39 @@ pub(crate) fn render_comments(app: &BiliGuga) -> El {
 /// everything that acts on it, then the comments. It scrolls as a whole, because a player
 /// column that pinned its controls would leave the comments in a 150-point slot.
 pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
-    let (stage_width, stage_height) = app.stage_box.get();
     let status = app.player.status();
     let (position, duration) = clock_of(&status);
     // The stage is the one block with no side margin: it starts at the pane's left edge and ends
     // at its right, and only the rows under it are inset by `PANE_PAD`.
+    // Not `.shrink()`: the stage's height comes from its aspect ratio and the pane's width, and
+    // a block that may be compressed turns a 16:9 frame into whatever height is left over —
+    // a stretched picture. In the scroll column below, a stage taller than the pane scrolls.
     let mut stage_block = col()
         .key("stage-block")
         .w_full()
-        .shrink()
-        .padding(PANE_PAD)
-        .child(render_stage(app, Some((stage_width, stage_height))));
+        .pt(PANE_PAD)
+        .child(render_stage(app, false))
+        .child(el().h(PANE_PAD));
     // The windowed layout always shows its controls: there is nothing underneath to reveal
     // them over, and hiding them would only hide the way to act on the video.
     stage_block = stage_block
-        .child(el().h(10.0))
         .child(
-            col()
-                .w_full()
-                .gap(8.0)
-                .padding(10.0)
-                .radius(12.0)
-                .fill(theme::PANEL)
-                .child(seek_bar(position, duration))
-                .child(render_transport(app)),
+            col().w_full().px(PANE_PAD).child(
+                col()
+                    .w_full()
+                    .gap(8.0)
+                    .padding(10.0)
+                    .radius(12.0)
+                    .fill(theme::PANEL)
+                    .child(seek_bar(position, duration))
+                    .child(render_transport(app)),
+            ),
         )
         .child(
             if app.quality_menu_open && !app.quality_options.is_empty() {
                 row()
                     .w_full()
+                    .px(PANE_PAD)
                     .pt(6.0)
                     .justify_end()
                     .child(render_quality_menu(app))
@@ -621,6 +623,8 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
         .child(
             row()
                 .w_full()
+                .px(PANE_PAD)
+                .pt(10.0)
                 .gap(6.0)
                 .items_center()
                 .child(render_actions(app))
@@ -685,7 +689,7 @@ pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
         .w_full()
         .h_full()
         .fill(Color::BLACK)
-        .child(render_stage(app, None));
+        .child(render_stage(app, true));
     if app.controls_visible() {
         root = root.child(
             col()

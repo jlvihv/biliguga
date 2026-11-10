@@ -60,6 +60,10 @@ pub(crate) const CARD_CAPTION_HEIGHT: f32 = 78.0;
 /// What Rune itself moves for a notch, so the handler below can scale rather than assume.
 pub(crate) const RUNE_WHEEL_NOTCH: f32 = 40.0;
 
+/// The narrowest the window goes. Below this the 2-column grid stops making sense and the
+/// player's transport row runs out of room.
+pub(crate) const MIN_WINDOW_WIDTH: f32 = 820.0;
+
 /// How long the player's controls stay up after the pointer moves, in full screen.
 pub(crate) const CONTROLS_LINGER: Duration = Duration::from_millis(2400);
 

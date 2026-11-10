@@ -189,9 +189,6 @@ pub(crate) struct BiliGuga {
     /// The browse pane's height, measured in `view`, so paging knows how much of the feed is
     /// on screen without guessing from a row count.
     pub(crate) pane_height: std::cell::Cell<f32>,
-    /// The box `view` gives the stage, worked out from the player column's own size: the video
-    /// keeps its 16:9 shape without ever growing taller than the room it has.
-    pub(crate) stage_box: std::cell::Cell<(f32, f32)>,
 }
 
 impl BiliGuga {
@@ -280,7 +277,6 @@ impl BiliGuga {
             action_note: None,
             card_columns: std::cell::Cell::new(2),
             card_width: std::cell::Cell::new(CARD_MIN_WIDTH),
-            stage_box: std::cell::Cell::new((320.0, 180.0)),
             scroll_pos: std::rc::Rc::new(std::cell::Cell::new(None)),
             // `None` until the viewport has been laid out once: the first frame is what turns
             // the offset into a row.
@@ -295,6 +291,15 @@ impl BiliGuga {
 impl BiliGuga {
     pub(crate) fn worker(&self) -> &Worker {
         self.worker.as_ref().expect("worker is installed in setup")
+    }
+
+    /// The clip's shape, width over height, for the stage to take its height from. 16:9 until mpv
+    /// reports what it is actually showing, so the stage has a sensible size on the first frame.
+    pub(crate) fn video_aspect(&self) -> f32 {
+        self.player
+            .source_size()
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .map_or(16.0 / 9.0, |(width, height)| width as f32 / height as f32)
     }
 
     /// The session cookie for a request that can run logged out.

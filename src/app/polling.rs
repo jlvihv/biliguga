@@ -45,6 +45,7 @@ pub(crate) fn poll(app: &mut BiliGuga, _seconds: f64, tx: &mut Tx) -> bool {
         app.player.set_render_viewport(width, height);
     }
 
+
     if app.playback != PlaybackState::Idle {
         if app.player.poll_frame() {
             changed = true;

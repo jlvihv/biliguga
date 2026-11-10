@@ -120,7 +120,7 @@ pub(crate) fn launch() {
         poll: Some(poll),
         on_key: Some(on_key),
         scenes: SCENES,
-        min_size: Some((820.0, 560.0)),
+        min_size: Some((MIN_WINDOW_WIDTH, 560.0)),
         ..AppSpec::new("哔哩咕嘎", (1360.0, 820.0), BiliGuga::new, view)
     });
 }

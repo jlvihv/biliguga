@@ -20,19 +20,6 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         app.card_columns.set(columns);
         app.card_width.set(slot_width(pane_width, columns));
     }
-    // The player column's size decides the stage: 16:9 across the column, or the height it has
-    // left under the controls, whichever is smaller. Reading the column (not the stage) keeps
-    // the stage's own size out of the measurement, so no read can feed its own output.
-    if let Some([_, _, width, height]) = cx.layout("player") {
-        // The clip's own shape, once mpv reports one: a 4:3 upload keeps its proportions
-        // instead of floating small inside a 16:9 letterbox.
-        let aspect = app
-            .player
-            .source_size()
-            .filter(|(_, height)| *height > 0)
-            .map_or(16.0 / 9.0, |(width, height)| width as f32 / height as f32);
-        app.stage_box.set(stage_box(width, height, aspect));
-    }
     // The browse pane's height, which paging measures its runway against.
     if let Some([_, _, _, pane_height]) = cx.layout("feed-scroll") {
         app.pane_height.set(pane_height);
@@ -52,22 +39,6 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         None => root = root.child(render_feed(app)),
     }
     root
-}
-
-/// The rectangle the video gets inside a player column `width` × `height` points.
-///
-/// The controls under the stage are a fixed strip (seek bar, transport, actions), so the stage
-/// takes what is left, and its frame is fitted to 16:9 inside that: a wide window fills the
-/// stage, a short one letterboxes it instead of pushing the controls off the bottom.
-pub(crate) fn stage_box(column_width: f32, column_height: f32, aspect: f32) -> (f32, f32) {
-    let width = (column_width - 2.0 * PANE_PAD).max(160.0);
-    // Everything under the stage, measured rather than guessed: the block's own padding, the
-    // gap, the controls card (10 + 18 + 8 + 34 + 10), the gap, the actions row, and a little
-    // slack so a rounding point never clips the last row.
-    let reserved = 2.0 * PANE_PAD + 10.0 + 80.0 + 10.0 + 32.0 + 10.0;
-    let room = (column_height - reserved).max(90.0);
-    let height = ((width / aspect.max(0.2)).min(room)).max(90.0);
-    (width, height)
 }
 
 /// `layout_size_with`'s comparison for the browse pane: the view only has to run again when the

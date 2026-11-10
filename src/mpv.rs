@@ -130,6 +130,10 @@ pub struct MpvStatus {
     pub paused: bool,
     pub volume: f64,
     pub speed: f64,
+    /// The clip's own display size, once mpv has decoded enough to know it. `dwidth`/`dheight`
+    /// rather than `width`/`height`: the `d` pair is what mpv *shows*, with rotation and the
+    /// container's display aspect already applied, which is the shape the window should fit.
+    pub source_size: Option<(usize, usize)>,
 }
 
 impl Default for MpvStatus {
@@ -140,6 +144,7 @@ impl Default for MpvStatus {
             paused: true,
             volume: 100.,
             speed: 1.,
+            source_size: None,
         }
     }
 }
@@ -153,9 +158,6 @@ pub struct MpvPlayer {
     /// writing into the one it last sent.
     frame_targets: Receiver<FramePixels>,
     presented: Option<FramePixels>,
-    /// The source video's own pixel size, for the stage's aspect ratio. Not the render
-    /// target's: that one is the letterboxed decode size the viewport asked for.
-    current_source_size: Option<(usize, usize)>,
     /// The viewport the worker is already decoding for, so a still window sends nothing.
     viewport_sent: Option<(usize, usize)>,
     current_status: MpvStatus,
@@ -183,7 +185,6 @@ impl MpvPlayer {
             statuses: status_rx,
             frame_targets: target_rx,
             presented: None,
-            current_source_size: None,
             viewport_sent: None,
             current_status: MpvStatus::default(),
         }
@@ -257,7 +258,6 @@ impl MpvPlayer {
         }
         self.discard_pending_frames();
         self.current_status = MpvStatus::default();
-        self.current_source_size = None;
         self.viewport_sent = None;
         self.presented = None;
     }
@@ -326,8 +326,9 @@ impl MpvPlayer {
         self.presented.clone()
     }
 
+    /// The clip's display size, as of the last status the worker sent.
     pub fn source_size(&self) -> Option<(usize, usize)> {
-        self.current_source_size
+        self.current_status.source_size
     }
 
     pub fn discard_pending_frames(&mut self) {
@@ -667,6 +668,7 @@ fn run_mpv_session(
                     paused: get_flag_property(handle, "pause").unwrap_or(true),
                     volume: get_double_property(handle, "volume").unwrap_or(100.),
                     speed: get_double_property(handle, "speed").unwrap_or(1.),
+                    source_size: source_size(handle),
                 };
                 if status.paused {
                     render_enabled = false;
@@ -715,6 +717,14 @@ unsafe fn run_command(handle: *mut MpvHandle, command: &PlayerCommand) {
             let _ = mpv_command_string(handle, command.as_ptr());
         }
     }
+}
+
+/// The clip's display size, or `None` until mpv has one. Zero is "not known yet" rather than
+/// an error, and a zero would make every ratio downstream infinite.
+unsafe fn source_size(handle: *mut MpvHandle) -> Option<(usize, usize)> {
+    let width = unsafe { get_int64_property(handle, "dwidth") }.unwrap_or(0);
+    let height = unsafe { get_int64_property(handle, "dheight") }.unwrap_or(0);
+    (width > 0 && height > 0).then_some((width as usize, height as usize))
 }
 
 unsafe fn get_double_property(handle: *mut MpvHandle, name: &str) -> Option<f64> {

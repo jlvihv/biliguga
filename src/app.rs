@@ -89,5 +89,5 @@ pub(crate) use ui::*;
 
 // The three entry points `main` and Rune call, by the names they already use.
 pub(crate) use polling::poll;
-pub(crate) use shell::{setup, view};
+pub(crate) use shell::*;
 pub(crate) use startup::launch;
