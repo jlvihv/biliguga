@@ -41,16 +41,29 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     // place it can be dragged from and the only place its controls live. What it carries
     // changes with the screen — the way back and the clip's title, or the app's name.
     cx.titlebar_height(TITLEBAR_HEIGHT);
-    let mut window = col()
+    let window = col()
         .key("window-with-titlebar")
         .w_full()
         .h_full()
         .child(render_titlebar(app, cx));
-    match &app.playing_video {
-        Some(video) => window = window.child(root.child(render_player(app, video))),
-        None => window = window.child(root.child(render_feed(app))),
-    }
-    window
+    // The two screens are two trees, and switching between them is a navigation: the one
+    // leaving goes out to the left and the one arriving comes in from the right, so going back
+    // reads as a step back rather than as a redraw. `push` is that, with a fade.
+    //
+    // The transition is on each screen's own wrapper, keyed by which screen it is: an animation
+    // needs an element that mounts and one that unmounts in the same commit, and a single
+    // wrapper around both would keep its identity while only its child changed.
+    let content = match &app.playing_video {
+        Some(video) => root
+            .key("screen-player")
+            .child(render_player(app, video))
+            .transition(rune::Transition::push(rune::Edge::Trailing)),
+        None => root
+            .key("screen-feed")
+            .child(render_feed(app))
+            .transition(rune::Transition::push(rune::Edge::Trailing)),
+    };
+    window.child(content)
 }
 
 /// `layout_size_with`'s comparison for the browse pane: the view only has to run again when the

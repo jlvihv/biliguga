@@ -31,6 +31,7 @@ fn caption(
     key: &'static str,
     icon: &'static rune::Icon,
     help: &'static str,
+    ink: Color,
     hover: Color,
 ) -> El {
     // Full height, stated: `h_full` in a flex row resolves against the line's content, which
@@ -43,7 +44,7 @@ fn caption(
         .press(theme::PRESS)
         .cursor(rune::Cursor::Pointer)
         .help(help)
-        .child(glyph(icon, theme::TEXT_DIM, 15.0))
+        .child(glyph(icon, ink, 15.0))
 }
 
 /// The bar across the top of the window.
@@ -65,7 +66,9 @@ pub(crate) fn render_titlebar(app: &BiliGuga, cx: &Cx<BiliGuga>) -> El {
             // The way out of the player, flush against the leading edge: the first thing on the
             // band, with nothing beside it to click by mistake.
             .child(
-                caption("titlebar-back", &icons::BACK, "返回首页", theme::HOVER)
+                // In the accent: it is the one control on the band that goes somewhere, and
+                // the only way off this screen.
+                caption("titlebar-back", &icons::BACK, "返回首页", theme::ACCENT, theme::HOVER)
                     .on_press(|app: &mut BiliGuga| app.close_player()),
             )
             .child(
@@ -106,6 +109,7 @@ fn window_controls(app: &BiliGuga) -> El {
                     &icons::FULLSCREEN
                 },
                 "全屏",
+                theme::TEXT_DIM,
                 theme::HOVER,
             )
             .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
@@ -124,6 +128,7 @@ fn window_controls(app: &BiliGuga) -> El {
                     &icons::MAXIMIZE
                 },
                 if maximized { "还原" } else { "最大化" },
+                theme::TEXT_DIM,
                 theme::HOVER,
             )
             .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
@@ -133,7 +138,7 @@ fn window_controls(app: &BiliGuga) -> El {
         )
         .child(
             // Close turns red under the pointer, the way every window's does.
-            caption("titlebar-close", &icons::CLOSE, "关闭窗口", theme::DANGER)
+            caption("titlebar-close", &icons::CLOSE, "关闭窗口", theme::TEXT_DIM, theme::DANGER)
                 .on_press_tx(|_: &mut BiliGuga, tx: &mut Tx| tx.close_window()),
         )
 }
