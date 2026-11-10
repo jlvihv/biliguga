@@ -27,8 +27,13 @@ fn insets(cx: &Cx<BiliGuga>) -> (f32, f32) {
     (chrome.leading, chrome.trailing)
 }
 
-/// The bar across the top of the window while a video is open.
+/// The bar across the top of the window.
+///
+/// While a video is open it carries the way back and the clip's title; over the feed it carries
+/// the app's name. In both cases it is the only place the window can be dragged from and the
+/// only place its own controls live, because on Linux there is no frame left to provide them.
 pub(crate) fn render_titlebar(app: &BiliGuga, cx: &Cx<BiliGuga>) -> El {
+    let watching = app.playing_video.is_some();
     let (leading, trailing) = insets(cx);
     let mut bar = row()
         .key("titlebar")
@@ -43,50 +48,94 @@ pub(crate) fn render_titlebar(app: &BiliGuga, cx: &Cx<BiliGuga>) -> El {
         // Rune guarantees for anything with a press handler.
         .window_drag()
         .child(
-            square_button("titlebar-back", &icons::BACK, "返回首页")
-                .on_press(|app: &mut BiliGuga| app.close_player()),
-        )
-        .child(
-            text(match &app.playing_video {
-                Some(video) => video.title.as_str(),
-                None => "",
-            })
-            .font(TextStyle::new(13.0, 550.0))
-            .color(theme::TEXT)
-            .single_line()
-            .truncate()
-            // The title takes whatever the buttons leave, and is the thing that gives way when
-            // there is not enough of it.
-            .grow(1.0),
+            el().size(30.0, 30.0)
+                .center()
+                .radius(9.0)
+                .child(glyph(&icons::LOGO, theme::ACCENT, 21.0)),
         );
+    // What the band carries between the brand and the window's controls: the way out and the
+    // clip's title while a video is open, the tabs and the account while it is not. The feed's
+    // row used to hold those itself, which would be two navigation rows on one screen.
+    bar = match watching {
+        true => bar
+            .child(
+                square_button("titlebar-back", &icons::BACK, "返回首页")
+                    .on_press(|app: &mut BiliGuga| app.close_player()),
+            )
+            .child(
+                text(app.playing_video.as_ref().map_or("", |video| video.title.as_str()))
+                    .font(TextStyle::new(13.0, 550.0))
+                    .color(theme::TEXT)
+                    .single_line()
+                    .truncate()
+                    // The title takes whatever the buttons leave, and is what gives way.
+                    .grow(1.0),
+            ),
+        false => bar
+            .child(el().w(6.0))
+            .child(render_nav(app))
+            .child(el().grow(1.0))
+            .child(account_button(app)),
+    };
     // On Windows the caption buttons are drawn over the band's trailing edge, so the last
     // control has to stop short of them; `trailing` is their width.
-    bar = bar.child(titlebar_controls(app));
+    bar = bar.child(window_controls(app));
     bar
 }
 
-/// The controls at the right of the titlebar: the app's own, not the window's.
+/// The controls at the right of the titlebar.
 ///
-/// Minimise, maximise and close are the window manager's, and Rune draws them over the band's
-/// trailing edge on the platforms where it replaces the native frame — `insets` is what keeps
-/// this row clear of them. Drawing a second close button next to theirs would be two controls
-/// doing the same thing in the same place.
-fn titlebar_controls(app: &BiliGuga) -> El {
-    let mut controls = row().shrink().items_center().gap(4.0);
-    controls = controls.child(
-        square_button(
-            "titlebar-fullscreen",
-            if app.player_fullscreen {
-                &icons::EXIT_FULLSCREEN
-            } else {
-                &icons::FULLSCREEN
-            },
-            "全屏",
+/// These are the window's, drawn by the app because on Linux a borderless window has no frame
+/// to draw them: `WindowOptions::borderless` is what takes the system titlebar away here, since
+/// Rune's own `Titlebar` only replaces the frame on macOS and Windows.
+///
+/// No minimise button. `Tx::minimize` refuses a borderless window outright — winit would need
+/// the frame's button — so a button for it would be a control that does nothing. Maximise and
+/// close are the two that work, and they are the two the frame offered that still can.
+fn window_controls(app: &BiliGuga) -> El {
+    let maximized = app.window_maximized;
+    let watching = app.playing_video.is_some();
+    row()
+        .shrink()
+        .items_center()
+        .gap(2.0)
+        // Full screen is about the video, so it only exists on the screen that has one.
+        .child(match watching {
+            true => square_button(
+                "titlebar-fullscreen",
+                if app.player_fullscreen {
+                    &icons::EXIT_FULLSCREEN
+                } else {
+                    &icons::FULLSCREEN
+                },
+                "全屏",
+            )
+            .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
+                app.player_fullscreen = !app.player_fullscreen;
+                tx.toggle_full_screen();
+            }),
+            false => el(),
+        })
+        .child(
+            square_button(
+                "titlebar-maximize",
+                if maximized {
+                    &icons::RESTORE
+                } else {
+                    &icons::MAXIMIZE
+                },
+                if maximized { "还原" } else { "最大化" },
+            )
+            .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
+                app.window_maximized = !app.window_maximized;
+                tx.toggle_maximized();
+            }),
         )
-        .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
-            app.player_fullscreen = !app.player_fullscreen;
-            tx.toggle_full_screen();
-        }),
-    );
-    controls
+        .child(
+            square_button("titlebar-close", &icons::CLOSE, "关闭窗口")
+                .on_press_tx(|app: &mut BiliGuga, tx: &mut Tx| {
+                    let _ = app;
+                    tx.close_window();
+                }),
+        )
 }

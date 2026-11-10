@@ -156,6 +156,13 @@ pub(crate) fn launch() {
         min_size: Some((MIN_WINDOW_WIDTH, 560.0)),
         ..AppSpec::new("哔哩咕嘎", (1360.0, 820.0), BiliGuga::new, view)
     })
+    // The native frame goes: `borderless` is what removes it on X11 and Wayland, where Rune's
+    // `Titlebar` alone does not (it only replaces the frame on macOS and Windows). What the
+    // frame did — dragging, minimising, maximising, closing — is drawn and handled by the app.
+    .window_options(rune::WindowOptions {
+        borderless: true,
+        ..Default::default()
+    })
     .titlebar(rune::Titlebar::new(TITLEBAR_HEIGHT))
     .run();
 }

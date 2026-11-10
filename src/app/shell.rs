@@ -24,8 +24,11 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     if let Some([_, _, _, pane_height]) = cx.layout("feed-scroll") {
         app.pane_height.set(pane_height);
     }
-    let mut root = row().key("window").w_full().h_full().fill(theme::BG);
+    let root = row().key("window").w_full().h_full().fill(theme::BG);
     if app.player_fullscreen {
+        // Full screen owns the whole display: no band, nothing to drag it by, and no caption
+        // buttons of ours over the picture.
+        cx.titlebar_height(0.0);
         return match &app.playing_video {
             Some(video) => root.child(render_player_fullscreen(app, video)),
             None => root,
@@ -34,24 +37,20 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
     // The two panes never share the window: the feed is what the window shows when nothing is
     // open, and a video takes the whole of it. There is no rail down the side either — the tabs
     // are a row across the feed's own top, and the player has no tabs at all.
+    // The titlebar is always there: on Linux the window is borderless, so this band is the only
+    // place it can be dragged from and the only place its controls live. What it carries
+    // changes with the screen — the way back and the clip's title, or the app's name.
+    cx.titlebar_height(TITLEBAR_HEIGHT);
+    let mut window = col()
+        .key("window-with-titlebar")
+        .w_full()
+        .h_full()
+        .child(render_titlebar(app, cx));
     match &app.playing_video {
-        Some(video) => {
-            // A video is the one screen with a titlebar: it has a title worth showing, and a way
-            // back out. The feed keeps its own row instead, so it takes the whole window.
-            cx.titlebar_height(TITLEBAR_HEIGHT);
-            root = row()
-                .key("window-with-titlebar")
-                .w_full()
-                .h_full()
-                .child(col().w_full().h_full().child(render_titlebar(app, cx)).child(root.child(render_player(app, video))));
-        }
-        None => {
-            // The window goes back to the native frame, and to the whole of the viewport.
-            cx.titlebar_height(0.0);
-            root = root.child(render_feed(app));
-        }
+        Some(video) => window = window.child(root.child(render_player(app, video))),
+        None => window = window.child(root.child(render_feed(app))),
     }
-    root
+    window
 }
 
 /// `layout_size_with`'s comparison for the browse pane: the view only has to run again when the

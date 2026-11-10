@@ -114,6 +114,18 @@ pub(super) static BACK: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M9.6 3.4 5 8l4.6 4.6" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+/// A single square: the window is at its normal size and this maximises it.
+pub(super) static MAXIMIZE: Icon = Icon {
+    name: "bg-maximize",
+    view: 16.0,
+    body: r#"<rect x="3.6" y="3.6" width="8.8" height="8.8" rx="1.2" stroke="currentColor" stroke-width="1.4" fill="none"/>"#,
+};
+/// Two offset squares: the window is maximised and this restores it.
+pub(super) static RESTORE: Icon = Icon {
+    name: "bg-restore",
+    view: 16.0,
+    body: r#"<rect x="3.2" y="5.6" width="7.2" height="7.2" rx="1.1" stroke="currentColor" stroke-width="1.35" fill="none"/><path d="M5.6 5.6V4.4a1.1 1.1 0 0 1 1.1-1.1h5a1.1 1.1 0 0 1 1.1 1.1v5a1.1 1.1 0 0 1-1.1 1.1h-1.2" stroke="currentColor" stroke-width="1.35" fill="none" stroke-linecap="round"/>"#,
+};
 pub(super) static CLOSE: Icon = Icon {
     name: "bg-close",
     view: 16.0,

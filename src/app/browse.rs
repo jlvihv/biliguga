@@ -103,27 +103,12 @@ pub(crate) fn account_button(app: &BiliGuga) -> El {
 /// entries and a logo can afford; a row costs one 46-point band and gives the width back to
 /// whatever is on screen, which — with no split layout left to shrink it — is worth more.
 pub(crate) fn render_nav(app: &BiliGuga) -> El {
-    let mut nav = row()
-        .key("nav")
-        .w_full()
-        .shrink()
-        .px(PANE_PAD)
-        .pt(12.0)
-        .pb(10.0)
-        .gap(6.0)
-        .items_center()
-        .child(
-            el().size(30.0, 30.0)
-                .center()
-                .radius(9.0)
-                .child(glyph(&icons::LOGO, theme::ACCENT, 21.0)),
-        )
-        .child(el().w(6.0));
+    let mut nav = row().key("nav").shrink().gap(6.0).items_center();
     let current = nav_tab_for(app.active_tab);
     for &(tab, icon, caption) in &NAV_TABS {
         nav = nav.child(nav_entry(tab, icon, caption, tab == current));
     }
-    nav.child(el().grow(1.0)).child(account_button(app))
+    nav
 }
 
 // ---- The browse pane ------------------------------------------------------------------------
@@ -188,7 +173,6 @@ pub(crate) fn render_topbar(app: &BiliGuga) -> El {
         .key("feed-header")
         .w_full()
         .shrink()
-        .child(render_nav(app))
         .child(hairline())
         .child(render_title_row(app));
     if app.active_tab != AppTab::Login {

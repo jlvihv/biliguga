@@ -93,6 +93,10 @@ pub(crate) struct BiliGuga {
     /// it leaves, so moving the mouse off the video hides them without waiting out the linger.
     pub(crate) pointer_on_stage: bool,
     pub(crate) player_fullscreen: bool,
+    /// Whether the window is maximised, as the app's own titlebar keeps track: with the native
+    /// frame gone on Linux there is nothing else to ask, and the button has to know which of
+    /// its two glyphs to show.
+    pub(crate) window_maximized: bool,
     /// The video on the stage. Shared rather than copied: a play, a quality change and a
     /// detail call all need it at once, and each `clone` was a fresh handful of `String`s.
     pub(crate) playing_video: Option<Arc<Video>>,
@@ -257,6 +261,7 @@ impl BiliGuga {
             controls_until: None,
             pointer_on_stage: false,
             player_fullscreen: false,
+            window_maximized: false,
             playing_video: None,
             playback_generation: 0,
             resume: Resume::Nothing,
