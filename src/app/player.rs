@@ -143,9 +143,11 @@ pub(crate) fn collection_marker(app: &BiliGuga) -> El {
         .child(label(text, 11.5, 500.0, theme::TEXT_FAINT))
 }
 
-/// The video stage: the frame letterboxed on black, or a message until one arrives. In the
-/// windowed layout it is one block at the top of the player column; in full screen it takes
-/// everything and the controls float over it.
+/// The video stage: the frame letterboxed on black, or a message until one arrives.
+///
+/// The picture runs edge to edge on all four sides — no margin, no rounding, no border — and the
+/// controls are pinned to the bottom *inside* it, over the black of the frame's letterbox or the
+/// picture itself, with no fill of their own.
 pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
     let mut stage = col()
         .key("player-stage")
@@ -157,10 +159,9 @@ pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
         // Everything, edge to edge.
         stage.grow(1.0).w_full().h_full().min_h(0.0)
     } else {
-        // The window's width, and the clip's own shape for the height. No measured box, no
-        // rounding, no border: the picture runs edge to edge, and the layout stretches its
-        // width while the aspect ratio decides how tall it gets. Stretching the window simply
-        // gives the video a wider stage — nothing else on the page has to know its size.
+        // The window's width, and the clip's own shape for the height. The layout stretches the
+        // width and the aspect ratio derives the height, so a resize is right on the frame it
+        // happens; nothing else on the page has to know the picture's size.
         stage.w_full().aspect_ratio(app.video_aspect())
     };
     match app.player.presented() {
@@ -201,7 +202,47 @@ pub(crate) fn render_stage(app: &BiliGuga, fullscreen: bool) -> El {
             );
         }
     }
+    // Full screen hides them with the pointer; the windowed player always shows them, because
+    // there is nothing underneath to reveal them over and hiding them would only hide the way
+    // to act on the video.
+    if !fullscreen || app.controls_visible() {
+        stage = stage.child(quality_overlay(app)).child(controls_overlay(app));
+    }
     stage
+}
+
+/// The player's own controls, laid over the bottom of the picture: the seek bar and the
+/// transport row. No fill behind them, in either layout — the video is the background.
+///
+/// They are pinned inside the stage rather than placed under it, so the picture owns the whole
+/// window and the controls sit on its lower edge the way a full-screen player's do. The windowed
+/// player used to put them in a card below the stage, which is what pushed the video down and
+/// left a panel-coloured band between the two.
+fn controls_overlay(app: &BiliGuga) -> El {
+    let (position, duration) = clock_of(&app.player.status());
+    col()
+        .key("player-controls")
+        .pin(Some(0.0), None, Some(0.0), Some(0.0))
+        .w_full()
+        .gap(8.0)
+        .px(PANE_PAD)
+        .pb(10.0)
+        .child(seek_bar(position, duration))
+        .child(render_transport(app))
+}
+
+/// The quality menu, when it is open, pinned just above [`controls_overlay`].
+fn quality_overlay(app: &BiliGuga) -> El {
+    if app.quality_menu_open && !app.quality_options.is_empty() {
+        row()
+            .pin(Some(0.0), None, Some(0.0), Some(78.0))
+            .w_full()
+            .px(PANE_PAD)
+            .justify_end()
+            .child(render_quality_menu(app))
+    } else {
+        el()
+    }
 }
 
 /// The transport bar: the play button, then the switches that change how it plays.
@@ -576,55 +617,24 @@ pub(crate) fn render_comments(app: &BiliGuga) -> El {
     section
 }
 
-/// The player column while a video is open: the stage in its 16:9 block, then one card holding
-/// everything that acts on it, then the comments. It scrolls as a whole, because a player
-/// column that pinned its controls would leave the comments in a 150-point slot.
+/// The player column while a video is open: the picture edge to edge with its controls inside
+/// it, then what acts on it, then the comments. It scrolls as a whole, because a player column
+/// that pinned its controls would leave the comments in a 150-point slot.
 pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
-    let status = app.player.status();
-    let (position, duration) = clock_of(&status);
-    // The stage is the one block with no side margin: it starts at the pane's left edge and ends
-    // at its right, and only the rows under it are inset by `PANE_PAD`.
-    // Not `.shrink()`: the stage's height comes from its aspect ratio and the pane's width, and
-    // a block that may be compressed turns a 16:9 frame into whatever height is left over —
-    // a stretched picture. In the scroll column below, a stage taller than the pane scrolls.
-    let mut stage_block = col()
+    // The picture is the first thing in the column and has no margin: it starts at the pane's
+    // top-left corner. Everything below it is inset by `PANE_PAD`.
+    let stage = col()
         .key("stage-block")
         .w_full()
-        .pt(PANE_PAD)
-        .child(render_stage(app, false))
-        .child(el().h(PANE_PAD));
-    // The windowed layout always shows its controls: there is nothing underneath to reveal
-    // them over, and hiding them would only hide the way to act on the video.
-    stage_block = stage_block
-        .child(
-            col().w_full().px(PANE_PAD).child(
-                col()
-                    .w_full()
-                    .gap(8.0)
-                    .padding(10.0)
-                    .radius(12.0)
-                    .fill(theme::PANEL)
-                    .child(seek_bar(position, duration))
-                    .child(render_transport(app)),
-            ),
-        )
-        .child(
-            if app.quality_menu_open && !app.quality_options.is_empty() {
-                row()
-                    .w_full()
-                    .px(PANE_PAD)
-                    .pt(6.0)
-                    .justify_end()
-                    .child(render_quality_menu(app))
-            } else {
-                el()
-            },
-        )
+        .child(render_stage(app, false));
+    let below = col()
+        .w_full()
+        .px(PANE_PAD)
+        .pt(10.0)
+        .gap(10.0)
         .child(
             row()
                 .w_full()
-                .px(PANE_PAD)
-                .pt(10.0)
                 .gap(6.0)
                 .items_center()
                 .child(render_actions(app))
@@ -633,76 +643,42 @@ pub(crate) fn render_player(app: &BiliGuga, video: &Video) -> El {
                     pill("close-player", Some(&icons::CLOSE), "关闭", Tone::Quiet)
                         .on_press(|app: &mut BiliGuga| app.close_player()),
                 ),
-        );
+        )
+        .child(render_detail(app, video))
+        .child(render_comments(app));
 
-    // No side border: the rail already draws the hairline the player sits against.
-    let column = col()
+    col()
         .key("player")
         .grow(1.0)
         .h_full()
         .min_w(0.0)
         .min_h(0.0)
-        .fill(theme::PANEL);
-    column.child(
-        col()
-            .key("player-scroll")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(
-                col()
-                    .w_full()
-                    .gap(14.0)
-                    .child(stage_block)
-                    .child(
-                        col()
-                            .w_full()
-                            .gap(12.0)
-                            .px(PANE_PAD)
-                            .pb(8.0)
-                            .child(render_detail(app, video)),
-                    )
-                    .child(
-                        col()
-                            .w_full()
-                            .gap(10.0)
-                            .px(PANE_PAD)
-                            .pb(28.0)
-                            .child(render_comments(app)),
-                    ),
-            ),
-    )
+        .fill(theme::PANEL)
+        .child(
+            col()
+                .key("player-scroll")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(col().w_full().child(stage).child(below)),
+        )
 }
 
 /// The player column while the video is in full screen: stage and a control strip that fades
 /// out with the pointer.
 pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
-    let status = app.player.status();
-    let (position, duration) = clock_of(&status);
-    // The picture keeps the whole window; the title and the controls ride over it, pinned to
-    // the edges, so showing them never resizes the video or re-times mpv's decode.
+    // The picture keeps the whole window and its controls ride inside its bottom edge (see
+    // `render_stage`), so showing them never resizes the video or re-times mpv's decode.
     let mut root = col()
         .key("player")
         .w_full()
         .h_full()
         .fill(Color::BLACK)
         .child(render_stage(app, true));
-    if app.controls_visible() {
-        root = root.child(
-            col()
-                .pin(Some(0.0), None, Some(0.0), Some(0.0))
-                .gap(8.0)
-                .px(24.0)
-                .pt(14.0)
-                .pb(14.0)
-                .fill(Color::BLACK.alpha(0.82))
-                .child(seek_bar(position, duration))
-                .child(render_transport(app)),
-        );
-    } else {
+    if !app.controls_visible() {
         root = root.child(
             row()
                 .pin(Some(0.0), Some(0.0), Some(0.0), None)
@@ -716,15 +692,6 @@ pub(crate) fn render_player_fullscreen(app: &BiliGuga, video: &Video) -> El {
                         .color(Color::WHITE.alpha(0.78))
                         .truncate(),
                 ),
-        );
-    }
-    if app.quality_menu_open && !app.quality_options.is_empty() {
-        root = root.child(
-            row()
-                .pin(Some(0.0), None, Some(0.0), Some(78.0))
-                .px(24.0)
-                .justify_end()
-                .child(render_quality_menu(app)),
         );
     }
     root
