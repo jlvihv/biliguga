@@ -79,6 +79,9 @@ pub(crate) const EPISODE_HEADER_HEIGHT: f32 = 26.0;
 /// seek bar every second as the figures change.
 pub(crate) const CLOCK_WIDTH: f32 = 38.0;
 
+/// The same for `hh:mm:ss`, which a clip of an hour or more shows at both ends of the bar.
+pub(crate) const CLOCK_WIDTH_HOURS: f32 = 56.0;
+
 /// The width of the quality label in the transport row: `1080P 高码率` is the longest label the
 /// API hands out, at 11 points. Stated so switching quality does not re-flow the row.
 pub(crate) const QUALITY_WIDTH: f32 = 74.0;

@@ -47,15 +47,23 @@ pub(crate) fn drag_fraction(drag: &Drag) -> f32 {
 
 /// The seek bar: presses and drags anywhere on the track jump the video there. The hit area is
 /// taller than the drawn line, so it is easy to grab.
-/// A clock, in tabular figures and a fixed width.
+/// A clock, in tabular figures and a width of its own.
 ///
 /// Both matter while it is ticking. `'tnum' 1` gives every digit the same advance, so `11:11`
-/// is the same width as `00:00` and the seek bar does not twitch as the seconds count; the
-/// fixed width means the label does not resize with its glyphs at all — `CLOCK_WIDTH` holds the
-/// widest a `mm:ss` can be, and the text is right-aligned inside it so the digits stay put.
-pub(crate) fn clock_label(seconds: f64, color: Color) -> El {
-    let clock = Clock::new(seconds);
-    row().w(CLOCK_WIDTH).shrink().justify_end().child(
+/// is the same width as `00:00` and the digits do not shuffle as the seconds count; the width
+/// means the label does not resize with its glyphs at all, and the text is right-aligned inside
+/// it so the digits stay put.
+///
+/// The width follows the shape: `mm:ss` is five characters, and once the clip is an hour long
+/// so is `hh:mm:ss`.
+pub(crate) fn clock_label(seconds: f64, with_hours: bool, color: Color) -> El {
+    let clock = Clock::new(seconds, with_hours);
+    let width = if with_hours {
+        CLOCK_WIDTH_HOURS
+    } else {
+        CLOCK_WIDTH
+    };
+    row().w(width).shrink().justify_end().child(
         text(clock.as_str())
             .font(TextStyle::new(11.5, 500.0).features("'tnum' 1"))
             .color(color)
@@ -64,14 +72,17 @@ pub(crate) fn clock_label(seconds: f64, color: Color) -> El {
 }
 
 pub(crate) fn seek_bar(position: f64, duration: f64) -> El {
+    // One answer for both labels: the playhead's shape has to be the length's, or the two ends
+    // of the bar would disagree about their width the moment the video crossed an hour.
+    let with_hours = Clock::needs_hours(duration);
     row()
         .key("seek-row")
         .w_full()
         .gap(10.0)
         .items_center()
-        .child(clock_label(position, theme::TEXT_DIM))
+        .child(clock_label(position, with_hours, theme::TEXT_DIM))
         .child(seek_track(position, duration))
-        .child(clock_label(duration, theme::TEXT_FAINT))
+        .child(clock_label(duration, with_hours, theme::TEXT_FAINT))
 }
 
 /// The track itself: presses and drags anywhere on it jump the video there. The hit area is

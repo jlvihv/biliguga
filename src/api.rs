@@ -130,42 +130,75 @@ pub(crate) fn number(value: Option<&Value>) -> i64 {
 /// same `format!("{:02}:{:02}")`, which is where the two could drift apart.
 fn duration(value: Option<&Value>) -> String {
     let seconds = number(value);
-    if seconds <= 0 {
+    if seconds < 0 {
         return "--:--".into();
     }
-    Clock::new(seconds as f64).as_str().to_string()
+    // Zero is a real length (an empty upload, a clip that has not been probed yet) and reads as
+    // `00:00`; only a negative one is unknown. It goes through the clock for the same reason the
+    // player does: a poster and a control bar should never disagree about how to write a length.
+    let seconds = seconds as f64;
+    Clock::new(seconds, Clock::needs_hours(seconds))
+        .as_str()
+        .to_string()
 }
 
 /// A clock reading, written into a fixed buffer.
 ///
 /// This runs twice per render of the player's control bar, which is several times a second
-/// while a video plays. As a `String` that was two heap allocations per call; `mm:ss` never
-/// needs more than a handful of bytes, so the caller supplies them.
+/// while a video plays. As a `String` that was two heap allocations per call; a reading never
+/// needs more than eight bytes, so the caller supplies them.
+///
+/// The shape is chosen by the clip, not by the reading: [`Clock::for_duration`] decides once
+/// whether the hours are worth a column, and the playhead and the length are then both written
+/// that way. That is what keeps the two labels the same width and the seek bar between them
+/// still — a clock that grew an hour field when the video crossed 59:59 would move it.
 pub(crate) struct Clock {
     bytes: [u8; 8],
     len: u8,
 }
 
 impl Clock {
-    pub(crate) fn new(seconds: f64) -> Self {
+    /// A reading in the shape `with_hours` picks: `mm:ss` (five characters) or `hh:mm:ss`
+    /// (eight). A clip over an hour gets the second, and everything reading it — the length on
+    /// the poster, the total in the controls — asks [`Clock::needs_hours`] the same question.
+    pub(crate) fn new(seconds: f64, with_hours: bool) -> Self {
         let mut clock = Clock {
             bytes: [0; 8],
             len: 0,
         };
         if !seconds.is_finite() || seconds < 0. {
-            clock.push_bytes("--:--");
+            clock.push_bytes(if with_hours { "--:--:--" } else { "--:--" });
             return clock;
         }
         let total = seconds as u64;
-        // Hours are rare (a stream, a long video) but they do happen; over 100 hours the
-        // minutes stop being meaningful, so print minutes, which is what the old code did too.
-        let (minutes, secs) = ((total / 60).min(99), total % 60);
-        clock.push_u8(b'0' + (minutes / 10) as u8);
-        clock.push_u8(b'0' + (minutes % 10) as u8);
-        clock.push_bytes(":");
-        clock.push_u8(b'0' + (secs / 10) as u8);
-        clock.push_u8(b'0' + (secs % 10) as u8);
+        if with_hours {
+            let (hours, minutes, secs) = (total / 3_600, total % 3_600 / 60, total % 60);
+            clock.push_two(hours.min(99) as u8);
+            clock.push_u8(b':');
+            clock.push_two(minutes as u8);
+            clock.push_u8(b':');
+            clock.push_two(secs as u8);
+        } else {
+            // Minutes are capped at 99 rather than wrapped: only a caller that did not ask
+            // `needs_hours` first reaches this with an hour on the clock.
+            let (minutes, secs) = ((total / 60).min(99), total % 60);
+            clock.push_two(minutes as u8);
+            clock.push_u8(b':');
+            clock.push_two(secs as u8);
+        }
         clock
+    }
+
+    /// Whether a reading of `seconds` needs the hour field, which is the same thing as asking
+    /// whether the whole clip does: the question is asked once per clip so its two labels agree.
+    pub(crate) fn needs_hours(seconds: f64) -> bool {
+        seconds.is_finite() && seconds >= 3_600.
+    }
+
+    fn push_two(&mut self, value: u8) {
+        let value = value.min(99);
+        self.push_u8(b'0' + value / 10);
+        self.push_u8(b'0' + value % 10);
     }
 
     fn push_u8(&mut self, byte: u8) {
@@ -2081,4 +2114,59 @@ pub(crate) fn quality_label(qn: u32) -> String {
         6 => "240P 极速".into(),
         _ => format!("{qn}P"),
     }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::Clock;
+
+    fn read(seconds: f64, with_hours: bool) -> String {
+        Clock::new(seconds, with_hours).as_str().to_string()
+    }
+
+    /// The shape is the caller's decision, and both readings of one clip use it.
+    #[test]
+    fn the_shape_is_the_clips_not_the_readings() {
+        assert_eq!(read(0.0, false), "00:00");
+        assert_eq!(read(59.0, false), "00:59");
+        assert_eq!(read(3_599.0, false), "59:59");
+        assert_eq!(read(3_599.0, true), "00:59:59");
+        assert_eq!(read(3_600.0, true), "01:00:00");
+        assert_eq!(read(7_384.0, true), "02:03:04");
+    }
+
+    /// A clip of an hour or more asks for hours, and one under it does not.
+    #[test]
+    fn hours_are_asked_for_at_an_hour() {
+        assert!(!Clock::needs_hours(0.0));
+        assert!(!Clock::needs_hours(3_599.9));
+        assert!(Clock::needs_hours(3_600.0));
+        assert!(Clock::needs_hours(7_384.0));
+        assert!(!Clock::needs_hours(f64::NAN));
+    }
+
+    /// Every reading of a given shape is the same number of characters, which is what keeps the
+    /// two ends of the seek bar the same width as the numbers change.
+    #[test]
+    fn a_shape_has_one_length() {
+        for seconds in [0.0, 1.0, 9.0, 10.0, 59.0, 60.0, 599.0, 3_599.0] {
+            assert_eq!(read(seconds, false).len(), 5, "mm:ss at {seconds}");
+        }
+        for seconds in [3_600.0, 3_661.0, 86_399.0] {
+            assert_eq!(read(seconds, true).len(), 8, "hh:mm:ss at {seconds}");
+        }
+        assert_eq!(read(f64::NAN, false).len(), 5);
+        assert_eq!(read(f64::NAN, true).len(), 8);
+    }
+
+    /// A very long clip no longer wraps to `00:00`: past 99 hours the hours field caps, so the
+    /// reading is wrong at the far end rather than silently restarting.
+    #[test]
+    fn a_very_long_clip_does_not_wrap() {
+        let hours = read(100.0 * 3_600.0, true);
+        assert_eq!(hours, "99:00:00", "capped, not wrapped");
+        assert_ne!(hours, "00:00:00");
+    }
+
+
 }
