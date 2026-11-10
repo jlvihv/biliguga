@@ -46,19 +46,31 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         .w_full()
         .h_full()
         .child(render_titlebar(app, cx));
-    // The two screens are two trees, and going from one to the other is a departure, not an
-    // arrival: the screen being left slides out to the right and fades, and the one coming in
-    // is simply there behind it. Sliding the new screen in as well made both halves move at
-    // once, which reads as a redraw rather than as leaving something behind.
+    // The two screens are two trees, and only one of them moves: whichever is arriving or
+    // leaving. Opening a video slides the player in over the feed; closing it slides the player
+    // back out and uncovers the feed. The feed never moves — it is what the player came from
+    // and what it goes back to, and moving it too was what made both directions look the same.
     //
-    // `pop_layout` (the default) takes the leaving screen out of layout the frame it goes, so
-    // it animates away in place while the new one has already taken its place underneath.
+    // `pop_layout` (the default) takes a leaving screen out of layout the frame it goes, so it
+    // animates away in place over the one underneath rather than pushing it around.
     //
     // The transition is on each screen's own wrapper, keyed by which screen it is: an animation
-    // needs one element mounting and another unmounting in the same commit, and a single
-    // wrapper around both would keep its identity while only its child changed.
-    let departure = rune::Transition {
+    // needs one element mounting and another unmounting in the same commit.
+    let still = rune::Transition {
         insertion: rune::Effect::IDENTITY,
+        removal: rune::Effect::IDENTITY,
+        ..rune::Transition::opacity()
+    };
+    // A screen's exit is decided by the transition it carried when it was last drawn, not by
+    // the one the view would give it now — it is not in this frame's tree at all. So the player
+    // gets the transition that covers both directions while it is up, and the feed gets one
+    // that never moves: whether the player is arriving or leaving, it is the one that moves.
+    let player_move = rune::Transition {
+        insertion: rune::Effect {
+            offset_fraction: rune::Vec2::new(1.0, 0.0),
+            opacity: 0.0,
+            ..rune::Effect::IDENTITY
+        },
         removal: rune::Effect {
             offset_fraction: rune::Vec2::new(1.0, 0.0),
             opacity: 0.0,
@@ -70,11 +82,11 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         Some(video) => root
             .key("screen-player")
             .child(render_player(app, video))
-            .transition(departure),
+            .transition(player_move),
         None => root
             .key("screen-feed")
             .child(render_feed(app))
-            .transition(departure),
+            .transition(still),
     };
     window.child(content)
 }
