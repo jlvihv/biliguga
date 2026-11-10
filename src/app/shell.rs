@@ -46,22 +46,35 @@ pub(crate) fn view(app: &BiliGuga, cx: &mut Cx<BiliGuga>) -> El {
         .w_full()
         .h_full()
         .child(render_titlebar(app, cx));
-    // The two screens are two trees, and switching between them is a navigation: the one
-    // leaving goes out to the left and the one arriving comes in from the right, so going back
-    // reads as a step back rather than as a redraw. `push` is that, with a fade.
+    // The two screens are two trees, and going from one to the other is a departure, not an
+    // arrival: the screen being left slides out to the right and fades, and the one coming in
+    // is simply there behind it. Sliding the new screen in as well made both halves move at
+    // once, which reads as a redraw rather than as leaving something behind.
+    //
+    // `pop_layout` (the default) takes the leaving screen out of layout the frame it goes, so
+    // it animates away in place while the new one has already taken its place underneath.
     //
     // The transition is on each screen's own wrapper, keyed by which screen it is: an animation
-    // needs an element that mounts and one that unmounts in the same commit, and a single
+    // needs one element mounting and another unmounting in the same commit, and a single
     // wrapper around both would keep its identity while only its child changed.
+    let departure = rune::Transition {
+        insertion: rune::Effect::IDENTITY,
+        removal: rune::Effect {
+            offset_fraction: rune::Vec2::new(1.0, 0.0),
+            opacity: 0.0,
+            ..rune::Effect::IDENTITY
+        },
+        ..rune::Transition::opacity()
+    };
     let content = match &app.playing_video {
         Some(video) => root
             .key("screen-player")
             .child(render_player(app, video))
-            .transition(rune::Transition::push(rune::Edge::Trailing)),
+            .transition(departure),
         None => root
             .key("screen-feed")
             .child(render_feed(app))
-            .transition(rune::Transition::push(rune::Edge::Trailing)),
+            .transition(departure),
     };
     window.child(content)
 }
